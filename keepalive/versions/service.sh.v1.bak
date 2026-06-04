@@ -1,0 +1,84 @@
+#!/system/bin/sh
+# 等系统启动完成再操作 (PackageManager / UsageStatsManager 才 ready)
+until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 2; done
+sleep 15
+
+LOG=/cache/keepalive.log
+echo "=== keepalive start $(date) ===" > $LOG
+
+# 全套保活白名单 (微信/WAuxiliary/HMA/Clash/LSPosed/Magisk/QQ/QStory)
+WHITELIST="com.tencent.mm me.hd.wauxv com.tsng.hidemyapplist com.github.metacubex.clash.meta org.lsposed.manager com.topjohnwu.magisk com.wengui.hook com.tencent.mobileqq lin.xposed"
+
+# 1. 关 Adaptive Battery app standby 学习
+settings put global app_standby_enabled 0 >> $LOG 2>&1
+settings put global adaptive_battery_management_enabled 0 >> $LOG 2>&1
+settings put global data_saver_mode 0 >> $LOG 2>&1
+settings put global wifi_sleep_policy 2 >> $LOG 2>&1
+settings put global wifi_idle_ms 0 >> $LOG 2>&1
+
+# 2. 提桶
+for PKG in $WHITELIST; do
+  am set-standby-bucket $PKG active >> $LOG 2>&1
+done
+
+# 3. deviceidle 白名单
+for PKG in $WHITELIST; do
+  dumpsys deviceidle whitelist +$PKG >> $LOG 2>&1
+done
+
+# 4. 关后台数据限制
+cmd netpolicy set restrict-background false >> $LOG 2>&1
+
+# 4b. 禁 deep doze (保留 light idle) — 改善夜间推送实时性
+dumpsys deviceidle disable deep >> $LOG 2>&1
+
+# 5. PowerManager battery optimization 白名单 (双保险)
+for PKG in $WHITELIST; do
+  cmd appops set $PKG RUN_IN_BACKGROUND allow >> $LOG 2>&1
+  cmd appops set $PKG RUN_ANY_IN_BACKGROUND allow >> $LOG 2>&1
+done
+
+# 6. 每 15 分钟 reapply (桶 + doze 白名单, 防系统清掉)
+(while true; do
+  sleep 900
+  for PKG in $WHITELIST; do
+    am set-standby-bucket $PKG active
+    dumpsys deviceidle whitelist +$PKG > /dev/null 2>&1
+  done
+  dumpsys deviceidle disable deep > /dev/null 2>&1
+  echo "[$(date)] reapplied (bucket + doze + deep-off)" >> $LOG
+  # 日志超过 200KB 截断, 防爆
+  if [ $(wc -c < $LOG) -gt 200000 ]; then
+    tail -200 $LOG > $LOG.tmp && mv $LOG.tmp $LOG
+  fi
+done) &
+
+# 7. 微信定时前台同步 (随机 5-10 分钟, 仅息屏时执行)
+#    根因: 微信客户端非前台不收消息 — 灭屏/切后台约 2 分钟后主动挂起长连接,
+#    回前台才恢复并补拉积压 (经实验确诊: doze/freezer/白名单均已排除)。
+#    对策: 趁用户没用手机(息屏)时, 周期性把微信切前台拉一次消息再灭屏。
+#    随机间隔降低规律性, 仅息屏执行避免打断用户操作。
+(while true; do
+  # 随机 300-600 秒 (用 urandom, 不依赖 $RANDOM)
+  R=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')
+  [ -z "$R" ] && R=0
+  sleep $((300 + R % 301))
+  # 只在息屏(用户没在用)时执行; 亮屏说明在用, 跳过本次
+  case "$(dumpsys power | grep -m1 mWakefulness=)" in
+    *Awake*) echo "[$(date)] wx-sync skip (亮屏/在用)" >> $LOG; continue;;
+  esac
+  # 压低屏幕亮度(夜里不刺眼), 记录原值待恢复
+  OBR=$(settings get system screen_brightness)
+  OBM=$(settings get system screen_brightness_mode)
+  settings put system screen_brightness_mode 0   # 关自动亮度
+  settings put system screen_brightness 4        # 最低亮度
+  input keyevent 224; sleep 1             # 亮屏 (已关锁屏 -> 直接桌面, 无指纹图标)
+  am start -n com.tencent.mm/.ui.LauncherUI > /dev/null 2>&1
+  sleep 30                                # 停留拉积压 (缩短至30s)
+  input keyevent 223                      # 灭屏 (SLEEP; 灭屏后还有 ~2 分钟惯性继续收)
+  settings put system screen_brightness "$OBR"        # 恢复原亮度
+  settings put system screen_brightness_mode "$OBM"
+  echo "[$(date)] wx-sync done (亮度->4, 切前台30s后灭屏)" >> $LOG
+done) &
+
+echo "=== keepalive bootstrap done $(date) ===" >> $LOG

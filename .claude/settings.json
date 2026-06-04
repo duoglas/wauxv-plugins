@@ -1,0 +1,203 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-session-start.js"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "TaskUpdate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "WebSearch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/safety-guard.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/session-logger.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/session-logger.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/session-logger.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/session-logger.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/stage-since-autofill.js"
+          }
+        ],
+        "description": "since sentinel (\"auto\"/\"now\") 自动覆写为真实 ISO (VH-14 Option A, C-HOOK-09)"
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/session-logger.js"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/session-logger.js"
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/harness-stage-guard.js"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D=$(cd \"$(pwd)\" && pwd -P);while [ \"$D\" != / ]&&[ ! -f \"$D/scripts/hooks/find-root.js\" ];do D=$(dirname \"$D\");done;[ -f \"$D/scripts/hooks/find-root.js\" ]&&cd \"$D\"&&node scripts/hooks/session-end.js"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,1 @@
+{"configVersion":92,"detailLog":false,"maxLogSize":512,"forceMountData":true,"aggressiveFilter":false,"templates":{},"scope":{"com.tencent.mm":{"useWhitelist":true,"excludeSystemApps":true,"applyTemplates":[],"extraAppList":["com.tencent.wetype"]},"com.tencent.mobileqq":{"useWhitelist":true,"excludeSystemApps":true,"applyTemplates":[],"extraAppList":["com.tencent.wetype"]}}}

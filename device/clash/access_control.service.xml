@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <set name="access_control_packages">
+        <string>com.ss.android.ugc.aweme</string>
+        <string>com.xingin.xhs</string>
+        <string>com.tencent.mobileqq</string>
+        <string>com.tencent.wetype</string>
+    </set>
+    <string name="access_control_mode">DenySelected</string>
+    <string name="active_profile">bea0d1e6-5b95-4a24-a185-caf1e56e8d0f</string>
+</map>

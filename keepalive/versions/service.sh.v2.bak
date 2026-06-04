@@ -1,0 +1,85 @@
+#!/system/bin/sh
+# 开机入口: 等系统 ready -> 应用配置 -> 起两个后台循环 (reapply / 微信前台同步)
+until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 2; done
+sleep 15
+
+MODDIR=${0%/*}
+DIR="$MODDIR/scripts"
+. "$DIR/common.sh"
+kalog "=== keepalive boot (v2) ==="
+
+# 清理旧的 service.d 脉冲脚本, 避免和本模块双重怼前台
+if [ -f /data/adb/service.d/wechat_keepalive_noscreen.sh ]; then
+  mv /data/adb/service.d/wechat_keepalive_noscreen.sh \
+     /data/adb/service.d/wechat_keepalive_noscreen.sh.disabled 2>/dev/null
+  OLDPID=$(cat /data/local/tmp/wechat_keepalive.pid 2>/dev/null)
+  [ -n "$OLDPID" ] && kill "$OLDPID" 2>/dev/null
+  kalog "legacy service.d pulse disabled"
+fi
+
+# 首次应用
+sh "$DIR/apply.sh"
+
+# 单例: 杀掉上一次的循环, 防重复启动
+if [ -f "$KA_DIR/loops.pid" ]; then
+  for p in $(cat "$KA_DIR/loops.pid" 2>/dev/null); do kill "$p" 2>/dev/null; done
+fi
+
+# 循环1: 周期 reapply (每轮重读配置, WebUI 改了无需重启)
+(
+  while true; do
+    . "$DIR/common.sh"
+    sleep "${REAPPLY_SEC:-900}"
+    sh "$DIR/apply.sh"
+  done
+) &
+RPID=$!
+
+# 循环2: 微信息屏定时前台同步 (根因: 微信非前台约 2 分钟后挂起长连接)
+(
+  while true; do
+    . "$DIR/common.sh"
+    if [ "$ENABLED" != "1" ] || [ "$WXSYNC_ENABLED" != "1" ]; then
+      sleep 120; continue
+    fi
+    # 充电时由"充电常亮"负责保活: 跳过脉冲, 不唤醒更不强制息屏(否则破坏常亮)
+    if [ "$STAY_ON_CHARGING" = "1" ] && dumpsys battery 2>/dev/null | grep -q 'AC powered: true'; then
+      sleep 120; kalog "wx-sync skip (charging→常亮接管)"; continue
+    fi
+    R=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' '); [ -z "$R" ] && R=0
+    SPAN=$((WXSYNC_MAX - WXSYNC_MIN)); [ "$SPAN" -le 0 ] && SPAN=1
+    sleep $((WXSYNC_MIN + R % SPAN))
+
+    # 仅息屏时同步, 亮屏说明在用, 跳过
+    if [ "$WXSYNC_ONLY_SCREENOFF" = "1" ]; then
+      case "$(dumpsys power 2>/dev/null | grep -m1 mWakefulness=)" in
+        *Awake*) kalog "wx-sync skip (awake)"; continue;;
+      esac
+    fi
+
+    # 可选压低亮度, 记录原值
+    DIMMED=0
+    if [ "$WXSYNC_DIM" -ge 0 ] 2>/dev/null; then
+      OBR=$(settings get system screen_brightness 2>/dev/null)
+      OBM=$(settings get system screen_brightness_mode 2>/dev/null)
+      settings put system screen_brightness_mode 0 2>/dev/null
+      settings put system screen_brightness "$WXSYNC_DIM" 2>/dev/null
+      DIMMED=1
+    fi
+
+    input keyevent 224 2>/dev/null; sleep 1            # WAKEUP
+    am start -n "$WX_ACT" >/dev/null 2>&1              # 拉微信前台
+    sleep "${WXSYNC_HOLD:-30}"                         # 停留拉积压
+    input keyevent 223 2>/dev/null                     # SLEEP
+
+    if [ "$DIMMED" = "1" ]; then
+      settings put system screen_brightness "$OBR" 2>/dev/null
+      settings put system screen_brightness_mode "$OBM" 2>/dev/null
+    fi
+    kalog "wx-sync done (hold ${WXSYNC_HOLD}s, dim=$WXSYNC_DIM)"
+  done
+) &
+WPID=$!
+
+echo "$RPID $WPID" > "$KA_DIR/loops.pid"
+kalog "=== bootstrap done (loops: $RPID $WPID) ==="

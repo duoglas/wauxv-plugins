@@ -1,0 +1,11 @@
+# 运行期数据/日志（含 wxid/群id 等隐私，不入版本）
+*.log
+**/plugin.log
+**/config.prop
+**/config.prop.*
+# Harness 运行期产物
+.harness/observations.jsonl
+.harness/session-*.md
+.harness/*.tmp
+# 系统
+.DS_Store

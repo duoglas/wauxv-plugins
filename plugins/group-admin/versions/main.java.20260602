@@ -1,0 +1,2011 @@
+// GroupAdmin v1.12 - 群管理: 踢人 / 拉黑 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// 完整命令清单见 README.md 或 WAuxiliary 主面板插件列表 → 设置 (openSettings)
+// 重要变化历程:
+//   - v1.7: 潜水成员清理 (#潜水 N / #踢潜水) + bot 群管权限自检 (#群权限自检)
+//   - v1.8: 开启群管时即建立潜水基线 + onLoad 兜底已启用群
+//   - v1.9: 群管命令统一收紧到管理员+, 普通成员发命令静默忽略
+//   - v1.10: 实现 openSettings() — WAuxiliary 主面板插件列表点设置弹状态/命令 Dialog
+//   - v1.11: bot 在群里发 `群管设置` 弹本群图形化配置 Dialog (onClickSendBtn 拦截)
+//            含本群启用开关 / 状态摘要 / 黑+保护+警告逐项操作 / 潜水基线重建 / bot 权限重置 / 默认天数
+//   - v1.12: 白名单 (本群+全局, 免警告+免进群检测) / 全局黑名单 (任何启用群进入即踢)
+//            警告详情 (@TA 警告详情) / 清除警告名单 (一键全清, 仅群主) / 严格模式 (仅群主)
+//            doWarn 加时间+来源记录; GUI 主 Dialog 加白名单按钮
+// 不再过滤 isSend() — 机器人账号自己发命令也响应
+
+import java.util.*;
+import android.app.*;
+import android.content.*;
+import android.view.*;
+import android.widget.*;
+import android.graphics.*;
+import android.graphics.drawable.*;
+
+int WARN_AUTO_KICK = 3;   // 警告几次自动踢
+
+// ========== 工具 ==========
+List parseCsv(String csv) {
+    List r = new ArrayList();
+    if (csv == null || csv.isEmpty()) return r;
+    String[] arr = csv.split(",");
+    for (int i = 0; i < arr.length; i++) {
+        String s = arr[i].trim();
+        if (!s.isEmpty()) r.add(s);
+    }
+    return r;
+}
+
+String joinCsv(List list) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < list.size(); i++) {
+        if (i > 0) sb.append(",");
+        sb.append(list.get(i));
+    }
+    return sb.toString();
+}
+
+// 时间戳 CSV: wxid|ts,wxid|ts,...
+Map parseTimeCsv(String csv) {
+    Map m = new HashMap();
+    if (csv == null || csv.isEmpty()) return m;
+    String[] arr = csv.split(",");
+    for (int i = 0; i < arr.length; i++) {
+        String p = arr[i].trim();
+        if (p.isEmpty()) continue;
+        int sep = p.indexOf('|');
+        if (sep <= 0 || sep >= p.length() - 1) continue;
+        try { m.put(p.substring(0, sep), Long.valueOf(p.substring(sep + 1))); } catch (Exception e) {}
+    }
+    return m;
+}
+String buildTimeCsv(Map m) {
+    StringBuilder sb = new StringBuilder();
+    Iterator it = m.entrySet().iterator();
+    boolean first = true;
+    while (it.hasNext()) {
+        Map.Entry e = (Map.Entry) it.next();
+        if (!first) sb.append(',');
+        sb.append(e.getKey()).append('|').append(e.getValue());
+        first = false;
+    }
+    return sb.toString();
+}
+
+// 编号区间解析: "1,3,5-8" → [1,3,5,6,7,8]
+List parseIndexRange(String s, int max) {
+    Set seen = new LinkedHashSet();
+    if (s == null) return new ArrayList();
+    String[] parts = s.split(",");
+    for (int i = 0; i < parts.length; i++) {
+        String p = parts[i].trim();
+        if (p.isEmpty()) continue;
+        int dash = p.indexOf('-');
+        if (dash > 0 && dash < p.length() - 1) {
+            try {
+                int a = Integer.parseInt(p.substring(0, dash).trim());
+                int b = Integer.parseInt(p.substring(dash + 1).trim());
+                if (a > b) { int t = a; a = b; b = t; }
+                if (a < 1) a = 1;
+                if (b > max) b = max;
+                for (int x = a; x <= b; x++) seen.add(Integer.valueOf(x));
+            } catch (Exception e) {}
+        } else {
+            try {
+                int x = Integer.parseInt(p);
+                if (x >= 1 && x <= max) seen.add(Integer.valueOf(x));
+            } catch (Exception e) {}
+        }
+    }
+    return new ArrayList(seen);
+}
+
+List getBlacklist(String groupId) { return parseCsv(getString("bl_" + groupId, "")); }
+void setBlacklist(String groupId, List bl) { putString("bl_" + groupId, joinCsv(bl)); }
+
+// ========== bot 群管权限缓存 (lazy learning) ==========
+// 值: "admin"=已确认有权, "none"=已确认无权, "unknown"=没操作过
+String botPrivState(String groupId) { return getString("bp_" + groupId, "unknown"); }
+void   setBotPriv(String groupId, String state) { putString("bp_" + groupId, state); }
+
+boolean isPermissionError(Exception e) {
+    if (e == null) return false;
+    String m = e.getMessage();
+    if (m == null) return false;
+    String lo = m.toLowerCase();
+    if (lo.indexOf("permission") >= 0 || lo.indexOf("admin") >= 0 ||
+        lo.indexOf("not allowed") >= 0 || lo.indexOf("forbidden") >= 0 ||
+        lo.indexOf("denied") >= 0) return true;
+    if (m.indexOf("权限") >= 0 || m.indexOf("管理") >= 0 || m.indexOf("无权") >= 0) return true;
+    return false;
+}
+
+// 返回: true=成功, false=失败 (调用方决定要不要 sendText)
+// 调用前应自行检查 botPrivState(groupId) != "none"
+boolean tryKickSilent(String groupId, String wxid) {
+    try {
+        delChatroomMember(groupId, wxid);
+        setBotPriv(groupId, "admin");
+        return true;
+    } catch (Exception e) {
+        if (isPermissionError(e)) setBotPriv(groupId, "none");
+        log("kick fail group=" + groupId + " wxid=" + wxid + " err=" + e.getMessage());
+        return false;
+    }
+}
+
+void warnNoBotPriv(String groupId) {
+    sendText(groupId, "❌ 机器人在本群没有群管理员权限，无法执行踢人\n请群主先把机器人在群里提升为管理员\n之后发 #群权限自检 重置检测");
+}
+
+// ========== 潜水追踪 ==========
+// 存: lsg_<groupId> = wxid|ts,...  (last_speak), fsg_<groupId> = wxid|ts,... (first_seen)
+void recordSpeak(String groupId, String wxid) {
+    if (groupId == null || wxid == null || groupId.isEmpty() || wxid.isEmpty()) return;
+    long now = System.currentTimeMillis();
+
+    String lkey = "lsg_" + groupId;
+    Map lm = parseTimeCsv(getString(lkey, ""));
+    lm.put(wxid, Long.valueOf(now));
+    putString(lkey, buildTimeCsv(lm));
+
+    String fkey = "fsg_" + groupId;
+    Map fm = parseTimeCsv(getString(fkey, ""));
+    if (!fm.containsKey(wxid)) {
+        fm.put(wxid, Long.valueOf(now));
+        putString(fkey, buildTimeCsv(fm));
+    }
+}
+
+void recordFirstSeen(String groupId, String wxid) {
+    if (groupId == null || wxid == null) return;
+    String fkey = "fsg_" + groupId;
+    Map fm = parseTimeCsv(getString(fkey, ""));
+    if (!fm.containsKey(wxid)) {
+        fm.put(wxid, Long.valueOf(System.currentTimeMillis()));
+        putString(fkey, buildTimeCsv(fm));
+    }
+}
+
+// 把群里所有当前成员中没 first_seen 的人设为 now (建立基线)
+// 返回新设置的人数
+int initFirstSeenBaseline(String groupId) {
+    if (groupId == null || groupId.isEmpty()) return 0;
+    List members = null;
+    try { members = getGroupMemberList(groupId); } catch (Exception e) { log("baseline: getGroupMemberList fail " + groupId + " " + e); }
+    if (members == null || members.isEmpty()) return 0;
+    String fkey = "fsg_" + groupId;
+    Map fm = parseTimeCsv(getString(fkey, ""));
+    long now = System.currentTimeMillis();
+    int added = 0;
+    for (int i = 0; i < members.size(); i++) {
+        String w = (String) members.get(i);
+        if (w == null || w.isEmpty()) continue;
+        if (!fm.containsKey(w)) { fm.put(w, Long.valueOf(now)); added++; }
+    }
+    if (added > 0) putString(fkey, buildTimeCsv(fm));
+    return added;
+}
+
+// 受保护名单 (手动维护, 用于微信原生群主等无法自动识别的人)
+List getProtected(String groupId) { return parseCsv(getString("protected_" + groupId, "")); }
+
+// ==== 白名单 + 全局配置 + 严格模式 (v1.12) ====
+List getWhitelist(String groupId) { return parseCsv(getString("wt_" + groupId, "")); }
+void setWhitelist(String groupId, List wt) { putString("wt_" + groupId, joinCsv(wt)); }
+
+List getGlobalBlacklist() { return parseCsv(getString("bl_global", "")); }
+void setGlobalBlacklist(List bl) { putString("bl_global", joinCsv(bl)); }
+boolean isGlobalBlacklist(String wxid) { return wxid != null && !wxid.isEmpty() && getGlobalBlacklist().contains(wxid); }
+
+List getGlobalWhitelist() { return parseCsv(getString("wt_global", "")); }
+void setGlobalWhitelist(List wt) { putString("wt_global", joinCsv(wt)); }
+boolean isGlobalWhitelist(String wxid) { return wxid != null && !wxid.isEmpty() && getGlobalWhitelist().contains(wxid); }
+
+// 合并视图: 是否在白名单(本群 OR 全局)
+boolean isWhitelistAny(String groupId, String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    return isGlobalWhitelist(wxid) || getWhitelist(groupId).contains(wxid);
+}
+
+// 严格模式: 开启时所有命令仅群主, 否则管理员+
+boolean isStrictMode() { return "1".equals(getString("strict_mode", "0")); }
+void setStrictMode(boolean on) { putString("strict_mode", on ? "1" : "0"); }
+
+// ==== 微信原生群主 / 管理员保护 (v1.13) ====
+// 由于 WAuxiliary 未暴露查微信群角色 API, 用手动登记: @TA 微信群主 / @TA 微信管理员
+// 登记后, canActOn 拒绝任何人对其执行踢/拉黑/警告
+List getNativeOwners(String groupId)  { return parseCsv(getString("nat_owner_" + groupId, "")); }
+List getNativeAdmins(String groupId)  { return parseCsv(getString("nat_admin_" + groupId, "")); }
+
+// v1.13.2: 自动检测优先 + 手动登记 fallback
+boolean isNativeOwner(String groupId, String wxid)  {
+    if (wxid == null || wxid.isEmpty()) return false;
+    if (getNativeOwners(groupId).contains(wxid)) return true;     // 手动登记
+    String auto = _detectNativeOwner(groupId);                    // 自动检测
+    return auto != null && auto.equals(wxid);
+}
+boolean isNativeAdmin(String groupId, String wxid)  {
+    if (wxid == null || wxid.isEmpty()) return false;
+    if (getNativeAdmins(groupId).contains(wxid)) return true;     // 手动登记
+    return _detectNativeAdmins(groupId).contains(wxid);           // 自动检测
+}
+
+// 自动检测 — 通过 reflection 探测 WAuxiliary GroupInfo (尝试常见命名)
+String _detectNativeOwner(String groupId) {
+    try {
+        List groups = getGroupList();
+        for (int i = 0; i < groups.size(); i++) {
+            Object info = groups.get(i);
+            Object ridObj = info.getClass().getMethod("getRoomId").invoke(info);
+            if (ridObj == null || !ridObj.toString().equals(groupId)) continue;
+            java.lang.reflect.Method[] ms = info.getClass().getMethods();
+            for (int j = 0; j < ms.length; j++) {
+                if (ms[j].getName().equals("getOwner") || ms[j].getName().equals("getOwnerId") ||
+                    ms[j].getName().equals("getRoomOwner") || ms[j].getName().equals("getOwnerWxid") ||
+                    ms[j].getName().equals("getRoomOwnerId")) {
+                    Object r = ms[j].invoke(info);
+                    if (r != null && !r.toString().isEmpty()) return r.toString();
+                }
+            }
+            break;
+        }
+    } catch (Exception e) { log("_detectNativeOwner err: " + e.getMessage()); }
+    return null;
+}
+
+List _detectNativeAdmins(String groupId) {
+    List result = new ArrayList();
+    try {
+        List groups = getGroupList();
+        for (int i = 0; i < groups.size(); i++) {
+            Object info = groups.get(i);
+            Object ridObj = info.getClass().getMethod("getRoomId").invoke(info);
+            if (ridObj == null || !ridObj.toString().equals(groupId)) continue;
+            java.lang.reflect.Method[] ms = info.getClass().getMethods();
+            for (int j = 0; j < ms.length; j++) {
+                if (ms[j].getName().equals("getManagers") || ms[j].getName().equals("getAdmins") ||
+                    ms[j].getName().equals("getRoomManagers") || ms[j].getName().equals("getManagerList") ||
+                    ms[j].getName().equals("getAdminList")) {
+                    Object r = ms[j].invoke(info);
+                    if (r != null) {
+                        if (r instanceof List) { result.addAll((List) r); return result; }
+                        if (!r.toString().isEmpty()) {
+                            String[] arr = r.toString().split(",");
+                            for (int k = 0; k < arr.length; k++) {
+                                if (!arr[k].trim().isEmpty()) result.add(arr[k].trim());
+                            }
+                            return result;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    } catch (Exception e) { log("_detectNativeAdmins err: " + e.getMessage()); }
+    return result;
+}
+
+// onLoad 时 dump GroupInfo 所有 getter/is 方法到 log, 帮助找真实 API 名
+void _probeGroupInfoAPI() {
+    try {
+        List groups = getGroupList();
+        if (groups == null || groups.isEmpty()) { log("[probe] getGroupList empty"); return; }
+        Object info = groups.get(0);
+        log("[probe] class: " + info.getClass().getName());
+        java.lang.reflect.Method[] ms = info.getClass().getMethods();
+        StringBuilder sb = new StringBuilder("[probe] methods: ");
+        for (int i = 0; i < ms.length; i++) {
+            if ((ms[i].getName().startsWith("get") || ms[i].getName().startsWith("is")) &&
+                !ms[i].getName().equals("getClass")) {
+                sb.append(ms[i].getName()).append("(");
+                Class[] pt = ms[i].getParameterTypes();
+                for (int k = 0; k < pt.length; k++) {
+                    if (k > 0) sb.append(",");
+                    sb.append(pt[k].getSimpleName());
+                }
+                sb.append(") ");
+            }
+        }
+        log(sb.toString());
+    } catch (Exception e) { log("[probe] err: " + e.getMessage()); }
+}
+void setProtected(String groupId, List p) { putString("protected_" + groupId, joinCsv(p)); }
+
+void doShowInactive(String groupId, String content) {
+    String[] tk = content.split("[\\s\\u2005\\u00A0]+");
+    int days = 7;
+    if (tk.length >= 2) { try { days = Integer.parseInt(tk[1].trim()); } catch (Exception e) {} }
+    if (days < 1) days = 1;
+    if (days > 365) days = 365;
+
+    List members = null;
+    try { members = getGroupMemberList(groupId); } catch (Exception e) { log("getGroupMemberList fail: " + e); }
+    if (members == null || members.isEmpty()) { sendText(groupId, "❌ 拿不到群成员列表"); return; }
+
+    long now = System.currentTimeMillis();
+    long cutoff = now - (long) days * 86400000L;
+    Map ls = parseTimeCsv(getString("lsg_" + groupId, ""));
+    Map fs = parseTimeCsv(getString("fsg_" + groupId, ""));
+    List prot = getProtected(groupId);
+    String botWxid = getLoginWxid();
+
+    // 冷启动: 如果 fsg 完全为空, 把所有当前成员的 first_seen 设为 now, 提示用户等待
+    if (fs.isEmpty()) {
+        for (int i = 0; i < members.size(); i++) {
+            fs.put((String) members.get(i), Long.valueOf(now));
+        }
+        putString("fsg_" + groupId, buildTimeCsv(fs));
+        sendText(groupId, "📊 已建立潜水基线 (共 " + members.size() + " 人)\n请等待 " + days + " 天后再发 #潜水 " + days);
+        return;
+    }
+
+    List inactive = new ArrayList();
+    int newJoinSkip = 0;
+    for (int i = 0; i < members.size(); i++) {
+        String w = (String) members.get(i);
+        if (w == null || w.isEmpty()) continue;
+        if (w.equals(botWxid)) continue;
+        if (isAdmin(w) || isOwner(w)) continue;
+        if (prot.contains(w)) continue;
+
+        Long fst = (Long) fs.get(w);
+        if (fst == null) {
+            // 新成员刚刚被加入 fsg, 跳过本轮
+            recordFirstSeen(groupId, w);
+            newJoinSkip++;
+            continue;
+        }
+        if (fst.longValue() > cutoff) { newJoinSkip++; continue; }  // 新成员豁免
+
+        Long lst = (Long) ls.get(w);
+        if (lst != null && lst.longValue() > cutoff) continue;     // 期内说过话
+
+        inactive.add(w);
+    }
+
+    if (inactive.isEmpty()) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("✅ 过去 ").append(days).append(" 天本群无潜水成员");
+        if (newJoinSkip > 0) sb.append("\n(").append(newJoinSkip).append(" 个新成员在豁免期)");
+        sendText(groupId, sb.toString());
+        return;
+    }
+
+    int cap = 80;
+    int total = inactive.size();
+    int show = total < cap ? total : cap;
+    List shown = new ArrayList();
+    StringBuilder sb = new StringBuilder();
+    sb.append("📋 过去 ").append(days).append(" 天潜水名单 (共 ").append(total).append(" 人):\n");
+    sb.append("━━━━━━\n");
+    for (int i = 0; i < show; i++) {
+        String w = (String) inactive.get(i);
+        shown.add(w);
+        sb.append(i + 1).append(". ").append(lookupName(w, groupId));
+        Long lst = (Long) ls.get(w);
+        if (lst != null) {
+            long ago = (now - lst.longValue()) / 86400000L;
+            sb.append("  ·  ").append(ago).append("天前");
+        } else {
+            Long fst = (Long) fs.get(w);
+            long inGroup = fst != null ? (now - fst.longValue()) / 86400000L : 0;
+            sb.append("  ·  从未发言 (在群 ").append(inGroup).append("天)");
+        }
+        sb.append('\n');
+    }
+    if (total > cap) sb.append("...（仅显示前 ").append(cap).append(" 个）\n");
+    sb.append("━━━━━━\n");
+    sb.append("批量踢: #踢潜水 1,3,5-8\n");
+    sb.append("豁免某人: @TA 保护  ");
+    if (newJoinSkip > 0) sb.append("\n(已跳过 ").append(newJoinSkip).append(" 个新成员)");
+
+    putString("pending_kick_" + groupId, joinCsv(shown));
+    putString("pending_kick_ts_" + groupId, String.valueOf(now));
+    sendText(groupId, sb.toString());
+}
+
+void doKickInactive(String groupId, String sender, String content) {
+    if (!isAdmin(sender)) return;
+
+    String[] tk = content.split("[\\s\\u2005\\u00A0]+", 2);
+    if (tk.length < 2 || tk[1].trim().isEmpty()) {
+        sendText(groupId, "用法: #踢潜水 1,3,5-8\n先发 #潜水 N 拿待踢名单");
+        return;
+    }
+
+    List pending = parseCsv(getString("pending_kick_" + groupId, ""));
+    if (pending.isEmpty()) { sendText(groupId, "❌ 没有待踢名单，先发 #潜水 N"); return; }
+
+    String tsStr = getString("pending_kick_ts_" + groupId, "0");
+    long ts = 0;
+    try { ts = Long.parseLong(tsStr); } catch (Exception e) {}
+    if (ts > 0 && System.currentTimeMillis() - ts > 1800000L) {
+        sendText(groupId, "❌ 待踢名单已过期 (>30分钟), 请重新 #潜水 N");
+        return;
+    }
+
+    List indexes = parseIndexRange(tk[1], pending.size());
+    if (indexes.isEmpty()) { sendText(groupId, "❌ 编号无效"); return; }
+
+    if (botPrivState(groupId).equals("none")) {
+        warnNoBotPriv(groupId);
+        return;
+    }
+
+    String botWxid = getLoginWxid();
+    int okCnt = 0, skipCnt = 0, failCnt = 0;
+    StringBuilder sb = new StringBuilder();
+    sb.append("🦶 批量踢潜水 (共 ").append(indexes.size()).append(" 个):\n");
+    sb.append("━━━━━━\n");
+
+    boolean abortedByPriv = false;
+    for (int i = 0; i < indexes.size(); i++) {
+        int idx = ((Integer) indexes.get(i)).intValue();
+        String w = (String) pending.get(idx - 1);
+        String name = lookupName(w, groupId);
+
+        // 二次防护
+        if (w.equals(botWxid) || isAdmin(w) || isOwner(w) || getProtected(groupId).contains(w)) {
+            sb.append("#").append(idx).append(" ").append(name).append(" ⏭ 跳过(受保护)\n");
+            skipCnt++; continue;
+        }
+
+        if (tryKickSilent(groupId, w)) {
+            sb.append("#").append(idx).append(" ").append(name).append(" ✅\n");
+            okCnt++;
+        } else {
+            sb.append("#").append(idx).append(" ").append(name).append(" ❌\n");
+            failCnt++;
+            if (botPrivState(groupId).equals("none")) {
+                sb.append("⚠️ 检测到机器人无群管权限, 中止剩余 ").append(indexes.size() - i - 1).append(" 个\n");
+                abortedByPriv = true;
+                break;
+            }
+        }
+    }
+    sb.append("━━━━━━\n");
+    sb.append("✅ ").append(okCnt).append(" 成功 / ⏭ ").append(skipCnt).append(" 跳过 / ❌ ").append(failCnt).append(" 失败");
+    if (abortedByPriv) sb.append("\n请群主把机器人提为群管理员, 然后 #群权限自检 重置缓存");
+    sendText(groupId, sb.toString());
+
+    putString("pending_kick_" + groupId, "");
+    putString("pending_kick_ts_" + groupId, "");
+}
+
+void doCheckBotPriv(String groupId, String sender) {
+    if (!isAdmin(sender)) return;
+    String old = botPrivState(groupId);
+    setBotPriv(groupId, "unknown");
+    sendText(groupId, "🔄 已清除本群权限缓存 (原状态: " + old + ")\n下次执行踢人时会重新检测");
+}
+
+void doProtect(String groupId, String sender, String target) {
+    if (!isAdmin(sender)) return;
+    List p = getProtected(groupId);
+    if (!p.contains(target)) p.add(target);
+    setProtected(groupId, p);
+    sendText(groupId, "🛡 已加入保护名单: " + lookupName(target, groupId) + "\n(潜水扫描时不会出现)");
+}
+
+void doUnprotect(String groupId, String sender, String target) {
+    if (!isAdmin(sender)) return;
+    List p = getProtected(groupId);
+    if (p.remove(target)) {
+        setProtected(groupId, p);
+        sendText(groupId, "✅ 已取消保护: " + lookupName(target, groupId));
+    } else {
+        sendText(groupId, "❌ 该用户不在保护名单");
+    }
+}
+
+void showProtected(String groupId) {
+    List p = getProtected(groupId);
+    if (p.isEmpty()) { sendText(groupId, "📋 本群保护名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🛡 保护名单 (").append(p.size()).append("):\n");
+    for (int i = 0; i < p.size(); i++) sb.append("· ").append(lookupName((String) p.get(i), groupId)).append("\n");
+    sendText(groupId, sb.toString());
+}
+
+// 启用群名单 (按群启用,默认全部关)
+List getEnabledGroups() { return parseCsv(getString("enabled_groups", "")); }
+boolean isGroupEnabled(String groupId) {
+    if (groupId == null || groupId.isEmpty()) return false;
+    return getEnabledGroups().contains(groupId);
+}
+void enableGroup(String groupId) {
+    List l = getEnabledGroups();
+    if (!l.contains(groupId)) { l.add(groupId); putString("enabled_groups", joinCsv(l)); }
+}
+// 包装: 启用 + 建立潜水基线, 返回新增的 first_seen 人数
+int enableGroupWithBaseline(String groupId) {
+    enableGroup(groupId);
+    return initFirstSeenBaseline(groupId);
+}
+void disableGroup(String groupId) {
+    List l = getEnabledGroups();
+    if (l.remove(groupId)) putString("enabled_groups", joinCsv(l));
+}
+
+// 群主 (owners) — 顶层权限,机器人账号自动是
+List getOwners() { return parseCsv(getString("super_owners", "")); }
+boolean isOwner(String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    if (wxid.equals(getLoginWxid())) return true;   // 机器人账号永远是群主
+    return getOwners().contains(wxid);
+}
+
+// 管理员 (admins) — 群主自动是;  额外明确加进来的也是
+List getAdmins() { return parseCsv(getString("super_admins", "")); }
+boolean isAdmin(String wxid) {
+    if (isOwner(wxid)) return true;
+    if (wxid == null || wxid.isEmpty()) return false;
+    return getAdmins().contains(wxid);
+}
+
+// v1.12: 严格模式收紧到仅群主, 否则等价 isAdmin
+boolean isAuthorized(String wxid) {
+    if (isStrictMode()) return isOwner(wxid);
+    return isAdmin(wxid);
+}
+
+// 权限判定: operator 是否能对 target 执行管理动作(踢/拉黑/警告等)
+// 群主: 能对管理员和普通成员动手, 不能对其他群主
+// 管理员: 只能对普通成员动手
+// 普通: 啥也不能
+boolean canActOn(String groupId, String operator, String target) {
+    if (target == null || target.isEmpty()) return false;
+    if (target.equals(operator)) return false;             // 不能动自己
+    if (target.equals(getLoginWxid())) return false;       // 不能动机器人
+    // v1.13: 微信原生群主/管理员保护 (登记的任何人都不能动 — 即使插件群主也不行)
+    // v1.13.1: groupId 由调用方显式传入
+    if (groupId != null && groupId.indexOf("@chatroom") >= 0) {
+        if (isNativeOwner(groupId, target)) return false;
+        if (isNativeAdmin(groupId, target)) return false;
+    }
+    if (isOwner(operator)) {
+        if (isOwner(target)) return false;                 // 插件群主互不能动
+        return true;
+    }
+    if (isAdmin(operator)) {
+        if (isAdmin(target)) return false;                 // 插件管理不能动管理/群主
+        return true;
+    }
+    return false;
+}
+
+int getWarn(String groupId, String wxid) {
+    try { return Integer.parseInt(getString("wn_" + groupId + "_" + wxid, "0")); }
+    catch (Exception e) { return 0; }
+}
+void setWarn(String groupId, String wxid, int n) {
+    if (n <= 0) putString("wn_" + groupId + "_" + wxid, "0");
+    else putString("wn_" + groupId + "_" + wxid, "" + n);
+}
+
+List getWarnList(String groupId) {
+    // 所有 wn_<groupId>_* 不便枚举(没有 getKeys),用单独 list 维护
+    return parseCsv(getString("wl_" + groupId, ""));
+}
+void addWarnList(String groupId, String wxid) {
+    List l = getWarnList(groupId);
+    if (!l.contains(wxid)) {
+        l.add(wxid);
+        putString("wl_" + groupId, joinCsv(l));
+    }
+}
+void delWarnList(String groupId, String wxid) {
+    List l = getWarnList(groupId);
+    if (l.remove(wxid)) putString("wl_" + groupId, joinCsv(l));
+}
+
+// 取可读名: 群名片 > 备注 > 昵称 > getFriendName > "未知"
+// 全程不显示 wxid 给用户看
+String lookupName(String wxid, String groupId) {
+    if (wxid == null || wxid.isEmpty()) return "未知";
+    if (groupId != null && !groupId.isEmpty()) {
+        try {
+            String n = getFriendDisplayName(wxid, groupId);
+            if (n != null && !n.isEmpty()) return n;
+        } catch (Exception e) {}
+    }
+    try {
+        String n = getFriendRemarkName(wxid);
+        if (n != null && !n.isEmpty()) return n;
+    } catch (Exception e) {}
+    try {
+        String n = getFriendNickName(wxid);
+        if (n != null && !n.isEmpty()) return n;
+    } catch (Exception e) {}
+    try {
+        String n = getFriendName(wxid);
+        if (n != null && !n.isEmpty()) return n;
+    } catch (Exception e) {}
+    return "未知";
+}
+
+// ========== 生命周期 ==========
+void onLoad() {
+    List enabled = getEnabledGroups();
+    log("GroupAdmin v1.13 loading, owner=" + getLoginWxid() + ", enabled groups=" + enabled.size());
+
+    // 延迟 5 秒, 等微信进程把通讯录数据加载好, 再扫已启用但没基线的群
+    delay(5000, new Runnable() {
+        public void run() {
+            List groups = getEnabledGroups();
+            int touched = 0;
+            int totalAdded = 0;
+            for (int i = 0; i < groups.size(); i++) {
+                String g = (String) groups.get(i);
+                String fsg = getString("fsg_" + g, "");
+                if (!fsg.isEmpty()) continue;       // 已有基线, 跳过
+                int added = initFirstSeenBaseline(g);
+                if (added > 0) { touched++; totalAdded += added; }
+            }
+            log("GroupAdmin v1.13 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+            _probeGroupInfoAPI();
+        }
+    });
+}
+void onUnload() {}
+
+// ==== WAuxiliary 主面板插件列表点"设置"时触发 (v1.10) ====
+// 弹一个 Dialog: 全局状态摘要 + 完整命令清单, 不需要进微信群也能查看
+int _gaC(String s) { return android.graphics.Color.parseColor(s); }
+android.graphics.drawable.GradientDrawable _gaRound(String fill, int radius) {
+    android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+    g.setColor(_gaC(fill));
+    g.setCornerRadius(radius);
+    return g;
+}
+
+void openSettings() {
+    Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+
+    int enabledCnt = parseCsv(getString("enabled_groups", "")).size();
+    int ownerCnt   = getOwners().size();
+    int adminCnt   = getAdmins().size();
+
+    StringBuilder sb = new StringBuilder();
+    sb.append("GroupAdmin v1.12\n");
+    sb.append("══════════════════════\n\n");
+    sb.append("📊 全局状态\n");
+    sb.append("• 已启用群数: ").append(enabledCnt).append("\n");
+    sb.append("• 群主 (super_owners): ").append(ownerCnt).append(" 人\n");
+    sb.append("• 管理员 (super_admins): ").append(adminCnt).append(" 人\n");
+    sb.append("• 严格模式: ").append(isStrictMode() ? "✅ 开启 (仅群主)" : "🔓 关闭 (管理员+)").append("\n");
+    sb.append("• 全局黑名单: ").append(getGlobalBlacklist().size()).append(" 人\n");
+    sb.append("• 全局白名单: ").append(getGlobalWhitelist().size()).append(" 人\n");
+    sb.append("• 机器人 wxid: ").append(getLoginWxid()).append("\n\n");
+    sb.append("📋 命令清单 (v1.9 起统一管理员+, 普通成员静默忽略)\n");
+    sb.append("──────────────────────\n\n");
+    sb.append("【群级开关 — 仅群主】\n");
+    sb.append("  开启群管 / 关闭群管 / 群管状态\n\n");
+    sb.append("【移出群聊】\n");
+    sb.append("  @TA 踢 / @TA 拉黑\n");
+    sb.append("  addsb wxid_xxx / delbk wxid_xxx\n\n");
+    sb.append("【潜水管理】\n");
+    sb.append("  #潜水 7        列出过去 7 天没说话的人\n");
+    sb.append("  #踢潜水 1,3,5-8  按编号批量踢\n");
+    sb.append("  @TA 保护 / @TA 取消保护\n\n");
+    sb.append("【警告系统 — 累计 ").append(WARN_AUTO_KICK).append(" 次自动踢】\n");
+    sb.append("  @TA 警告 / @TA 警告-1 / @TA 清零\n\n");
+    sb.append("【管理员管理 — 仅群主】\n");
+    sb.append("  @TA 管理员 / @TA 移除管理\n");
+    sb.append("  @TA 群主 / @TA 移除群主\n\n");
+    sb.append("【查询】\n");
+    sb.append("  群管帮助 / 黑名单 / 管理员\n");
+    sb.append("  警告名单 / 保护名单\n\n");
+    sb.append("【权限自检】\n");
+    sb.append("  #群权限自检 — 重置缓存, 下次踢人重新检测\n\n");
+    sb.append("📚 完整文档见插件目录 README.md");
+
+    int pad = (int)(16 * ctx.getResources().getDisplayMetrics().density);
+
+    TextView tv = new TextView(ctx);
+    tv.setText(sb.toString());
+    tv.setTextColor(_gaC("#E8E9EC"));
+    tv.setTextSize(13);
+    tv.setPadding(pad, pad, pad, pad);
+    tv.setLineSpacing(0, 1.2f);
+    tv.setBackground(_gaRound("#1A1D24", 0));
+
+    ScrollView sv = new ScrollView(ctx);
+    sv.addView(tv);
+    sv.setBackground(_gaRound("#0F1115", 0));
+
+    new AlertDialog.Builder(ctx)
+        .setView(sv)
+        .setPositiveButton("好的", null)
+        .show();
+}
+
+// ========== 消息处理 ==========
+void onHandleMsg(Object msg) {
+    if (!msg.isText()) return;
+    if (!msg.isChatroom()) return;
+
+    String content = msg.getContent();
+    if (content == null) return;
+    content = content.trim();
+    if (content.isEmpty()) return;
+
+    String groupId = msg.getTalker();
+    String sender  = msg.getSendTalker();
+    List   atList  = msg.getAtUserList();
+
+    // 调试日志(可后续删)
+    log("[onMsg] group=" + groupId + " sender=" + sender + " send=" + msg.isSend()
+        + " at=" + (atList == null ? 0 : atList.size()) + " content=" + content);
+
+    // ---- 启用/关闭/状态(不受 enabled 限制,owner 可随时操作) ----
+    if (content.equals("开启群管") || content.equals("启用群管")) {
+        if (!isOwner(sender)) return;
+        if (isGroupEnabled(groupId)) {
+            sendText(groupId, "ℹ️ 本群 GroupAdmin 已是启用状态");
+        } else {
+            int baseline = enableGroupWithBaseline(groupId);
+            String tip = baseline > 0
+                ? "\n📊 已建立潜水基线: " + baseline + " 人 (新成员加入会自动入基线)"
+                : "\n📊 潜水基线已存在,保持不变";
+            sendText(groupId, "✅ 本群 GroupAdmin 已启用 (发 '群管帮助' 看命令)" + tip);
+        }
+        return;
+    }
+    if (content.equals("关闭群管") || content.equals("禁用群管")) {
+        if (!isOwner(sender)) return;
+        if (!isGroupEnabled(groupId)) {
+            sendText(groupId, "ℹ️ 本群 GroupAdmin 本来就没启用");
+        } else {
+            disableGroup(groupId);
+            sendText(groupId, "🔕 本群 GroupAdmin 已停用 (黑名单/警告数据保留)");
+        }
+        return;
+    }
+    if (content.equals("群管状态")) {
+        if (!isAdmin(sender)) return;
+        if (isGroupEnabled(groupId)) {
+            sendText(groupId, "🟢 本群 GroupAdmin 已启用");
+        } else {
+            sendText(groupId, "🔴 本群 GroupAdmin 未启用\n群主发 '开启群管' 激活");
+        }
+        return;
+    }
+
+    // ---- 没启用就静默忽略其他所有命令 ----
+    if (!isGroupEnabled(groupId)) return;
+
+    // ---- 潜水追踪: 每条群消息记录发言时间 + first_seen ----
+    if (sender != null && !sender.isEmpty()) recordSpeak(groupId, sender);
+
+    // ---- 群管命令统一前置: 非管理员一律静默忽略 ----
+    // (查询 + 潜水 + 自检等都要管理员权限. 普通人发了不响应也不报错, 避免被探测)
+    boolean isCmd = content.equals("群管帮助") || content.equals("帮助 群管") ||
+                    content.equals("黑名单") || content.equals("管理员") ||
+                    content.equals("警告名单") || content.equals("保护名单") ||
+                    content.equals("白名单") || content.equals("清除警告名单") ||
+                    content.equals("全局黑名单") || content.equals("全局白名单") ||
+                    content.startsWith("严格模式") ||
+                    content.startsWith("#潜水") || content.equals("潜水") ||
+                    content.startsWith("#踢潜水") || content.startsWith("踢潜水") ||
+                    content.equals("#群权限自检") || content.equals("群权限自检") ||
+                    content.startsWith("addsb ") || content.startsWith("delbk ") ||
+                    content.startsWith("addwt ") || content.startsWith("delwt ") ||
+                    content.startsWith("addgb ") || content.startsWith("delgb ") ||
+                    content.startsWith("addgw ") || content.startsWith("delgw ");
+    if (isCmd && !isAuthorized(sender)) return;
+
+    // ---- 查询命令 ----
+    if (content.equals("群管帮助") || content.equals("帮助 群管")) { showHelp(groupId); return; }
+    if (content.equals("黑名单")) { showBlacklist(groupId); return; }
+    if (content.equals("管理员")) { showAdmins(groupId); return; }
+    if (content.equals("警告名单")) { showWarnList(groupId); return; }
+    if (content.equals("保护名单")) { showProtected(groupId); return; }
+    // v1.12 查询
+    if (content.equals("白名单")) { showWhitelist(groupId); return; }
+    if (content.equals("全局黑名单")) { showGlobalBlacklist(groupId); return; }
+    if (content.equals("全局白名单")) { showGlobalWhitelist(groupId); return; }
+    // v1.12 控制
+    if (content.equals("清除警告名单")) { doWarnClearAll(groupId, sender); return; }
+    if (content.startsWith("严格模式")) { doStrictMode(groupId, sender, content); return; }
+
+    // ---- 潜水管理 ----
+    if (content.startsWith("#潜水") || content.equals("潜水")) {
+        doShowInactive(groupId, content); return;
+    }
+    if (content.startsWith("#踢潜水") || content.startsWith("踢潜水")) {
+        doKickInactive(groupId, sender, content); return;
+    }
+    if (content.equals("#群权限自检") || content.equals("群权限自检")) {
+        doCheckBotPriv(groupId, sender); return;
+    }
+
+    // ---- by-wxid 命令(纯文本,无 @) ----
+    if (content.startsWith("addsb ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doBan(groupId, sender, w);
+        return;
+    }
+    if (content.startsWith("delbk ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doUnban(groupId, w);
+        return;
+    }
+    // v1.12 by-wxid: 白名单 / 全局黑 / 全局白
+    if (content.startsWith("addwt ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doWhitelist(groupId, sender, w);
+        return;
+    }
+    if (content.startsWith("delwt ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doUnwhitelist(groupId, sender, w);
+        return;
+    }
+    if (content.startsWith("addgb ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doAddGlobalBlacklist(groupId, w);
+        return;
+    }
+    if (content.startsWith("delgb ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doDelGlobalBlacklist(groupId, w);
+        return;
+    }
+    if (content.startsWith("addgw ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doAddGlobalWhitelist(groupId, w);
+        return;
+    }
+    if (content.startsWith("delgw ")) {
+        if (!isAuthorized(sender)) return;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) doDelGlobalWhitelist(groupId, w);
+        return;
+    }
+
+    // ---- @-style 动作命令 ----
+    if (atList == null || atList.size() == 0) return;   // 没 @ 就不是动作命令
+
+    // 取最后一个 token (动作关键字)
+    // ★ 用 regex 拆分,覆盖 ASCII space + U+2005 (微信 @ 用的全角空格)
+    String[] tokens = content.split("[\\s\\u2005\\u00A0]+");
+    String lastTok = tokens.length > 0 ? tokens[tokens.length - 1].trim() : "";
+
+    // 这些关键字可以触发动作命令
+    boolean isAction = lastTok.equals("踢") || lastTok.equals("请") ||
+                       lastTok.equals("拉黑") || lastTok.equals("黑名单") ||
+                       lastTok.equals("警告") || lastTok.equals("清零") ||
+                       lastTok.equals("警告-1") || lastTok.equals("警告减1") ||
+                       lastTok.equals("警告详情") ||
+                       lastTok.equals("管理员") || lastTok.equals("移除管理") ||
+                       lastTok.equals("群主") || lastTok.equals("移除群主") ||
+                       lastTok.equals("保护") || lastTok.equals("取消保护") ||
+                       lastTok.equals("白名单") || lastTok.equals("移除白名单") ||
+                       lastTok.equals("微信群主") || lastTok.equals("移除微信群主") ||
+                       lastTok.equals("微信管理员") || lastTok.equals("移除微信管理员");
+    if (!isAction) return;
+
+    if (!isAuthorized(sender)) return;       // 非管理员/群主静默 (严格模式仅群主)
+
+    // 取第一个非自己的 @ 作为 target
+    String me = getLoginWxid();
+    String target = null;
+    for (int i = 0; i < atList.size(); i++) {
+        String w = (String) atList.get(i);
+        if (!w.equals(me)) { target = w; break; }
+    }
+    if (target == null) {
+        sendText(groupId, "❌ 请 @ 你要操作的对象");
+        return;
+    }
+
+    // 群主专属命令
+    boolean ownerOnly = lastTok.equals("管理员") || lastTok.equals("移除管理") ||
+                        lastTok.equals("群主")   || lastTok.equals("移除群主") ||
+                        lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
+    if (ownerOnly && !isOwner(sender)) {
+        sendText(groupId, "❌ 此命令仅群主可用");
+        return;
+    }
+
+    if (lastTok.equals("踢") || lastTok.equals("请"))           { doKick(groupId, sender, target); }
+    else if (lastTok.equals("拉黑") || lastTok.equals("黑名单")) { doBan(groupId, sender, target); }
+    else if (lastTok.equals("警告"))                            { doWarn(groupId, sender, target); }
+    else if (lastTok.equals("清零"))                            { doWarnClear(groupId, sender, target); }
+    else if (lastTok.equals("警告-1") || lastTok.equals("警告减1")) { doWarnDec(groupId, sender, target); }
+    else if (lastTok.equals("警告详情"))                        { doWarnDetail(groupId, target); }
+    else if (lastTok.equals("管理员"))                          { doAddAdmin(groupId, target); }
+    else if (lastTok.equals("移除管理"))                        { doDelAdmin(groupId, target); }
+    else if (lastTok.equals("保护"))                            { doProtect(groupId, sender, target); }
+    else if (lastTok.equals("取消保护"))                        { doUnprotect(groupId, sender, target); }
+    else if (lastTok.equals("白名单"))                          { doWhitelist(groupId, sender, target); }
+    else if (lastTok.equals("移除白名单"))                      { doUnwhitelist(groupId, sender, target); }
+    else if (lastTok.equals("群主"))                            { doAddOwner(groupId, target); }
+    else if (lastTok.equals("移除群主"))                        { doDelOwner(groupId, target); }
+    // v1.13: 微信原生角色登记
+    else if (lastTok.equals("微信群主"))                        { doRegisterNativeOwner(groupId, target); }
+    else if (lastTok.equals("移除微信群主"))                    { doRemoveNativeOwner(groupId, target); }
+    else if (lastTok.equals("微信管理员"))                      { doRegisterNativeAdmin(groupId, target); }
+    else if (lastTok.equals("移除微信管理员"))                  { doRemoveNativeAdmin(groupId, target); }
+}
+
+// ========== 入群拦截 ==========
+void onMemberChange(String type, String groupWxid, String userWxid, String userName) {
+    if (!"join".equals(type)) return;
+    if (!isGroupEnabled(groupWxid)) return;       // 没启用就不管
+
+    // 新成员入群即记录 first_seen, 自动获得豁免期
+    recordFirstSeen(groupWxid, userWxid);
+
+    // v1.12: 白名单(本群+全局)免进群检测
+    if (isWhitelistAny(groupWxid, userWxid)) return;
+
+    // v1.12: 黑名单合并视图(本群 OR 全局)
+    final boolean fromGlobal = isGlobalBlacklist(userWxid);
+    boolean inLocal = getBlacklist(groupWxid).contains(userWxid);
+    if (!fromGlobal && !inLocal) return;
+
+    delay(2000, new Runnable() {
+        public void run() {
+            String tag = fromGlobal ? "🌐 全局黑名单" : "黑名单";
+            if (botPrivState(groupWxid).equals("none")) {
+                sendText(groupWxid, "⚠️ " + userName + " 在" + tag + "，但机器人无群管权限，未能自动踢出");
+                return;
+            }
+            if (tryKickSilent(groupWxid, userWxid)) {
+                sendText(groupWxid, "🚫 " + userName + " 在" + tag + ", 自动移除");
+            } else if (botPrivState(groupWxid).equals("none")) {
+                sendText(groupWxid, "⚠️ " + userName + " 在" + tag + "，机器人刚刚发现自己无群管权限");
+            }
+        }
+    });
+}
+
+// ========== 命令实现 ==========
+void doKick(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
+    if (botPrivState(groupId).equals("none")) { warnNoBotPriv(groupId); return; }
+    if (tryKickSilent(groupId, target)) {
+        sendText(groupId, "👢 已踢出 " + lookupName(target, groupId));
+    } else if (botPrivState(groupId).equals("none")) {
+        warnNoBotPriv(groupId);
+    } else {
+        sendText(groupId, "❌ 踢出失败 (非权限原因，可能成员已离群或网络问题)");
+    }
+}
+
+void doBan(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
+    // v1.12: 在白名单的人不能直接拉黑 (需先用 @TA 移除白名单)
+    if (isWhitelistAny(groupId, target)) {
+        sendText(groupId, "🛡 " + lookupName(target, groupId) + " 在白名单, 不能拉黑\n如需拉黑请先 @TA 移除白名单");
+        return;
+    }
+    List bl = getBlacklist(groupId);
+    if (!bl.contains(target)) { bl.add(target); setBlacklist(groupId, bl); }
+    String name = lookupName(target, groupId);
+    if (botPrivState(groupId).equals("none")) {
+        sendText(groupId, "🚫 已加入黑名单: " + name + "\n⚠️ 机器人无群管权限，本次未踢出。再入群时也无法自动踢。");
+        return;
+    }
+    if (tryKickSilent(groupId, target)) {
+        sendText(groupId, "🚫 已拉黑 " + name + " (再入群自动踢)");
+    } else if (botPrivState(groupId).equals("none")) {
+        sendText(groupId, "🚫 已加入黑名单: " + name + "\n⚠️ 但机器人无群管权限，未能踢出");
+    } else {
+        sendText(groupId, "🚫 已加入黑名单: " + name + "\n⚠️ 踢出失败 (非权限原因)");
+    }
+}
+
+void doUnban(String groupId, String target) {
+    List bl = getBlacklist(groupId);
+    if (bl.remove(target)) {
+        setBlacklist(groupId, bl);
+        sendText(groupId, "✅ 已解除黑名单: " + lookupName(target, groupId));
+    } else {
+        sendText(groupId, "❌ 该用户不在黑名单");
+    }
+}
+
+void doWarn(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
+    // v1.12: 白名单(本群+全局)免警告
+    if (isWhitelistAny(groupId, target)) {
+        sendText(groupId, "🛡 " + lookupName(target, groupId) + " 在白名单, 不警告");
+        return;
+    }
+    int n = getWarn(groupId, target) + 1;
+    setWarn(groupId, target, n);
+    addWarnList(groupId, target);
+    // v1.12: 记录最近警告时间 + 操作人
+    putString("wnt_" + groupId + "_" + target, String.valueOf(System.currentTimeMillis()));
+    putString("wnf_" + groupId + "_" + target, sender);
+
+    String name = lookupName(target, groupId);
+    String byName = lookupName(sender, groupId);
+    int remain = WARN_AUTO_KICK - n;
+
+    StringBuilder sb = new StringBuilder();
+    sb.append("[AtWx=").append(target).append("]\n");   // @ 受罚者, 让 TA 收到通知
+
+    if (n >= WARN_AUTO_KICK) {
+        sb.append("🚨 ").append(name).append(" 累计 ").append(n).append("/").append(WARN_AUTO_KICK).append(" 自动移除");
+        sendText(groupId, sb.toString());
+        if (botPrivState(groupId).equals("none")) {
+            sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");
+        } else if (!tryKickSilent(groupId, target) && botPrivState(groupId).equals("none")) {
+            sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");
+        }
+    } else if (n == 1) {
+        sb.append("⚠️ 警告 ").append(n).append("/").append(WARN_AUTO_KICK).append(" — ").append(name).append(" 还剩 ").append(remain).append(" 次");
+        sendText(groupId, sb.toString());
+    } else {
+        sb.append("⚠️⚠️ 警告 ").append(n).append("/").append(WARN_AUTO_KICK).append(" — ").append(name).append(" 仅剩 ").append(remain).append(" 次, 下次自动踢");
+        sendText(groupId, sb.toString());
+    }
+}
+
+void doWarnDec(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足"); return; }
+    int n = getWarn(groupId, target) - 1;
+    if (n < 0) n = 0;
+    setWarn(groupId, target, n);
+    if (n == 0) delWarnList(groupId, target);
+    sendText(groupId, "⚠️ " + lookupName(target, groupId) + " 警告 " + n + "/" + WARN_AUTO_KICK);
+}
+
+void doWarnClear(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足"); return; }
+    setWarn(groupId, target, 0);
+    delWarnList(groupId, target);
+    sendText(groupId, "✅ " + lookupName(target, groupId) + " 警告已清零");
+}
+
+void doAddAdmin(String groupId, String target) {
+    if (target.equals(getLoginWxid())) { sendText(groupId, "❌ 机器人账号已是群主, 不需要再加管理"); return; }
+    if (isOwner(target))  { sendText(groupId, "❌ 该用户已是群主"); return; }
+    List admins = getAdmins();
+    if (!admins.contains(target)) {
+        admins.add(target);
+        putString("super_admins", joinCsv(admins));
+    }
+    sendText(groupId, "🛡 已加为管理员: " + lookupName(target, groupId));
+}
+
+void doDelAdmin(String groupId, String target) {
+    List admins = getAdmins();
+    if (admins.remove(target)) {
+        putString("super_admins", joinCsv(admins));
+        sendText(groupId, "✅ 已移除管理: " + lookupName(target, groupId));
+    } else {
+        sendText(groupId, "❌ 该用户不是管理员");
+    }
+}
+
+void doAddOwner(String groupId, String target) {
+    if (target.equals(getLoginWxid())) { sendText(groupId, "❌ 机器人账号已是群主"); return; }
+    List owners = getOwners();
+    if (!owners.contains(target)) {
+        owners.add(target);
+        putString("super_owners", joinCsv(owners));
+        // 自动从 admin 列表里移除(避免重复)
+        List admins = getAdmins();
+        if (admins.remove(target)) putString("super_admins", joinCsv(admins));
+    }
+    sendText(groupId, "👑 已加为群主: " + lookupName(target, groupId));
+}
+
+void doDelOwner(String groupId, String target) {
+    if (target.equals(getLoginWxid())) { sendText(groupId, "❌ 不能移除机器人账号"); return; }
+    List owners = getOwners();
+    if (owners.remove(target)) {
+        putString("super_owners", joinCsv(owners));
+        sendText(groupId, "✅ 已移除群主: " + lookupName(target, groupId));
+    } else {
+        sendText(groupId, "❌ 该用户不是群主");
+    }
+}
+
+void showHelp(String groupId) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("📋 GroupAdmin v1.13\n");
+    sb.append("作者: 早哥\n");
+    sb.append("━━━━━━━━━━━\n");
+    sb.append("【日常】\n");
+    sb.append("@TA 踢       移出群聊\n");
+    sb.append("@TA 拉黑     加黑名单 + 踢\n");
+    sb.append("@TA 警告     累计 ").append(WARN_AUTO_KICK).append(" 次自动踢\n");
+    sb.append("@TA 清零     警告归零\n");
+    sb.append("@TA 白名单   免警告 + 免进群检测\n");
+    sb.append("@TA 保护     潜水豁免\n");
+    sb.append("#潜水 7      列出 7 天没说话的人\n\n");
+    sb.append("【查询】\n");
+    sb.append("黑名单 / 白名单 / 管理员\n");
+    sb.append("警告名单 / 保护名单\n\n");
+    sb.append("💡 发 \"群管\" 弹本群配置面板\n");
+    sb.append("(含全局配置 / 严格模式 / 警告详情\n");
+    sb.append(" / wxid 操作 等更多高级项)");
+    sendText(groupId, sb.toString());
+}
+
+void showBlacklist(String groupId) {
+    List bl = getBlacklist(groupId);
+    if (bl.isEmpty()) { sendText(groupId, "📋 本群黑名单空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🚫 黑名单 (").append(bl.size()).append("):\n");
+    for (int i = 0; i < bl.size(); i++) sb.append("· ").append(lookupName((String) bl.get(i), groupId)).append("\n");
+    sendText(groupId, sb.toString());
+}
+
+void showAdmins(String groupId) {
+    StringBuilder sb = new StringBuilder();
+    // 群主段
+    sb.append("👑 群主:\n");
+    String me = getLoginWxid();
+    String meName = lookupName(me, groupId);
+    if (meName.equals("未知")) {
+        try { String a = getLoginAlias(); if (a != null && !a.isEmpty()) meName = a; } catch (Exception e) {}
+    }
+    sb.append("· [机器人] ").append(meName).append("\n");
+    List owners = getOwners();
+    for (int i = 0; i < owners.size(); i++) {
+        sb.append("· ").append(lookupName((String) owners.get(i), groupId)).append("\n");
+    }
+    // 管理员段
+    List admins = getAdmins();
+    if (!admins.isEmpty()) {
+        sb.append("\n🛡 管理员:\n");
+        for (int i = 0; i < admins.size(); i++) {
+            sb.append("· ").append(lookupName((String) admins.get(i), groupId)).append("\n");
+        }
+    }
+    sendText(groupId, sb.toString());
+}
+
+void showWarnList(String groupId) {
+    List wl = getWarnList(groupId);
+    if (wl.isEmpty()) { sendText(groupId, "📋 本群无警告记录"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("⚠️ 警告名单 (").append(wl.size()).append("):\n");
+    for (int i = 0; i < wl.size(); i++) {
+        String w = (String) wl.get(i);
+        sb.append("· ").append(lookupName(w, groupId)).append(" - ").append(getWarn(groupId, w)).append("/").append(WARN_AUTO_KICK).append("\n");
+    }
+    sendText(groupId, sb.toString());
+}
+
+// ============================================================
+// ==== 群配置 GUI Dialog (v1.11) =============================
+// 触发: bot 自己在群里输入 `群管设置` / `群管配置` (onClickSendBtn 拦截)
+// 内容: 启用开关 + 状态摘要 + 黑/保护/警告 逐项操作 + 潜水控制
+// ============================================================
+
+int getDefaultInactiveDays() {
+    try { return Integer.parseInt(getString("default_inactive_days", "7")); }
+    catch (Exception e) { return 7; }
+}
+
+void setDefaultInactiveDays(int n) {
+    if (n < 1) n = 1; if (n > 365) n = 365;
+    putString("default_inactive_days", String.valueOf(n));
+}
+
+int rebuildBaselineForce(String groupId) {
+    putString("fsg_" + groupId, "");
+    return initFirstSeenBaseline(groupId);
+}
+
+// ---- onClickSendBtn: bot 输入框触发 ----
+boolean onClickSendBtn(String text) {
+    if (text == null) return false;
+    // v1.12: 加 `群管` / `#群管` 两个短触发词
+    if (text.equals("群管") || text.equals("#群管") ||
+        text.equals("群管设置") || text.equals("群管配置") ||
+        text.equals("#群管设置") || text.equals("#群管配置")) {
+        String talker = getTargetTalker();
+        if (talker == null || !talker.contains("@chatroom")) {
+            toast("此命令需在群聊中使用");
+            return true;
+        }
+        showGroupConfigDialog(talker);
+        return true;
+    }
+    return false;
+}
+
+// ---- 通用 UI helper ----
+android.widget.Button _gaBtn(Activity ctx, String text, String fillColor) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.Button b = new android.widget.Button(ctx);
+    b.setText(text);
+    b.setTextColor(_gaC("#E8E9EC"));
+    b.setBackground(_gaRound(fillColor, 24));
+    b.setAllCaps(false);
+    b.setTextSize(14);
+    b.setPadding(20 * dp, 12 * dp, 20 * dp, 12 * dp);
+    android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+    b.setLayoutParams(lp);
+    return b;
+}
+
+android.widget.LinearLayout _gaRow(Activity ctx, String name, String sub, String actText, String actFill) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+    row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+    row.setPadding(12 * dp, 10 * dp, 10 * dp, 10 * dp);
+    row.setBackground(_gaRound("#1A1D24", 12));
+    row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+
+    android.widget.LinearLayout left = new android.widget.LinearLayout(ctx);
+    left.setOrientation(android.widget.LinearLayout.VERTICAL);
+    left.setLayoutParams(new android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+    android.widget.TextView tvName = new android.widget.TextView(ctx);
+    tvName.setText(name);
+    tvName.setTextColor(_gaC("#E8E9EC"));
+    tvName.setTextSize(14);
+    left.addView(tvName);
+
+    if (sub != null && !sub.isEmpty()) {
+        android.widget.TextView tvSub = new android.widget.TextView(ctx);
+        tvSub.setText(sub);
+        tvSub.setTextColor(_gaC("#7C828E"));
+        tvSub.setTextSize(11);
+        left.addView(tvSub);
+    }
+    row.addView(left);
+
+    android.widget.Button act = new android.widget.Button(ctx);
+    act.setText(actText);
+    act.setTextColor(_gaC("#0F1115"));
+    act.setBackground(_gaRound(actFill, 16));
+    act.setAllCaps(false);
+    act.setTextSize(12);
+    act.setPadding(14 * dp, 6 * dp, 14 * dp, 6 * dp);
+    row.addView(act);
+    return row;
+}
+
+void _gaSpacer(android.widget.LinearLayout root, Activity ctx, int h) {
+    android.view.View v = new android.view.View(ctx);
+    v.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, h));
+    root.addView(v);
+}
+
+// ---- 主 Dialog ----
+void showGroupConfigDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+
+    boolean enabled = isGroupEnabled(groupId);
+    String botPriv = botPrivState(groupId);
+    int banCount = parseCsv(getString("bl_" + groupId, "")).size();
+    int wlCount = parseCsv(getString("wl_" + groupId, "")).size();
+    int pCount = getProtected(groupId).size();
+    boolean baselineExists = !getString("fsg_" + groupId, "").isEmpty();
+    int defDays = getDefaultInactiveDays();
+
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("⚙️ 本群 GroupAdmin 配置");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(18);
+    title.setPadding(0, 0, 0, 4 * dp);
+    root.addView(title);
+
+    android.widget.TextView gIdView = new android.widget.TextView(ctx);
+    gIdView.setText(groupId);
+    gIdView.setTextColor(_gaC("#7C828E"));
+    gIdView.setTextSize(11);
+    gIdView.setPadding(0, 0, 0, 12 * dp);
+    root.addView(gIdView);
+
+    // 状态 card
+    android.widget.LinearLayout statusCard = new android.widget.LinearLayout(ctx);
+    statusCard.setOrientation(android.widget.LinearLayout.VERTICAL);
+    statusCard.setPadding(12 * dp, 12 * dp, 12 * dp, 12 * dp);
+    statusCard.setBackground(_gaRound("#1A1D24", 12));
+
+    StringBuilder st = new StringBuilder();
+    st.append("启用状态: ").append(enabled ? "✅ 已启用" : "🔴 未启用").append("\n");
+    st.append("bot 权限: ");
+    if (botPriv.equals("admin")) st.append("✅ 群管理员");
+    else if (botPriv.equals("none")) st.append("❌ 非管理员 (踢人会失败)");
+    else st.append("❓ 未检测 (踢一次会自动检测)");
+    st.append("\n");
+    st.append("潜水基线: ").append(baselineExists ? "✅ 已建立" : "🔴 未建立").append("\n");
+    st.append("默认潜水天数: ").append(defDays).append(" 天\n");
+    st.append("黑 ").append(banCount).append("  ·  警告 ").append(wlCount).append("  ·  保护 ").append(pCount);
+
+    android.widget.TextView statusText = new android.widget.TextView(ctx);
+    statusText.setText(st.toString());
+    statusText.setTextColor(_gaC("#E8E9EC"));
+    statusText.setTextSize(13);
+    statusText.setLineSpacing(0, 1.4f);
+    statusCard.addView(statusText);
+    root.addView(statusCard);
+
+    _gaSpacer(root, ctx, 12 * dp);
+
+    final String fGroupId = groupId;
+    final boolean fEnabled = enabled;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    android.widget.Button toggleBtn = _gaBtn(ctx, enabled ? "🔕 禁用本群群管" : "✅ 启用本群群管", enabled ? "#FF6B6B" : "#5CB6FF");
+    toggleBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (fEnabled) {
+                List eg = parseCsv(getString("enabled_groups", ""));
+                eg.remove(fGroupId);
+                putString("enabled_groups", joinCsv(eg));
+                toast("已禁用本群群管");
+            } else {
+                List eg = parseCsv(getString("enabled_groups", ""));
+                if (!eg.contains(fGroupId)) eg.add(fGroupId);
+                putString("enabled_groups", joinCsv(eg));
+                int n = initFirstSeenBaseline(fGroupId);
+                toast("已启用 (基线 " + n + " 人)");
+            }
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(toggleBtn);
+
+    _gaSpacer(root, ctx, 8 * dp);
+
+    android.widget.Button banBtn = _gaBtn(ctx, "🦶 黑名单 (" + banCount + ")", "#252934");
+    banBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showBanListDialog(fGroupId);
+        }
+    });
+    root.addView(banBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button protBtn = _gaBtn(ctx, "🛡 保护名单 (" + pCount + ")", "#252934");
+    protBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showProtectedListDialog(fGroupId);
+        }
+    });
+    root.addView(protBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    // v1.12: 白名单按钮
+    int wtCount = getWhitelist(groupId).size();
+    android.widget.Button wtBtn = _gaBtn(ctx, "✅ 白名单 (" + wtCount + ")", "#252934");
+    wtBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showWhitelistDialog(fGroupId);
+        }
+    });
+    root.addView(wtBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button warnBtn = _gaBtn(ctx, "⚠️ 警告名单 (" + wlCount + ")", "#252934");
+    warnBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showWarnedListDialog(fGroupId);
+        }
+    });
+    root.addView(warnBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button inactBtn = _gaBtn(ctx, "💤 潜水/权限 控制", "#252934");
+    inactBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showInactiveControlDialog(fGroupId);
+        }
+    });
+    root.addView(inactBtn);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+
+    dh[0] = new AlertDialog.Builder(ctx)
+        .setView(sv)
+        .setNegativeButton("关闭", null)
+        .create();
+    dh[0].show();
+}
+
+// ---- 黑名单子 Dialog ----
+void showBanListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List bl = parseCsv(getString("bl_" + groupId, ""));
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("🦶 黑名单 (" + bl.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    if (bl.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无黑名单");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < bl.size(); i++) {
+            final String wxid = (String) bl.get(i);
+            android.widget.LinearLayout row = _gaRow(ctx, lookupName(wxid, fGroupId), wxid, "解黑", "#FF6B6B");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    doUnban(fGroupId, wxid);
+                    toast("已解黑");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showBanListDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 保护名单子 Dialog ----
+void showProtectedListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List pl = getProtected(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("🛡 保护名单 (" + pl.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    if (pl.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无保护名单");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < pl.size(); i++) {
+            final String wxid = (String) pl.get(i);
+            android.widget.LinearLayout row = _gaRow(ctx, lookupName(wxid, fGroupId), wxid, "取消保护", "#FFD166");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    List p = getProtected(fGroupId);
+                    p.remove(wxid);
+                    putString("protected_" + fGroupId, joinCsv(p));
+                    toast("已取消保护");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showProtectedListDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 警告名单子 Dialog ----
+void showWarnedListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List wl = getWarnList(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("⚠️ 警告名单 (" + wl.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    if (wl.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无警告记录");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < wl.size(); i++) {
+            final String wxid = (String) wl.get(i);
+            int n = getWarn(groupId, wxid);
+            android.widget.LinearLayout row = _gaRow(ctx, lookupName(wxid, fGroupId), "警告 " + n + "/" + WARN_AUTO_KICK, "清零", "#FFD166");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    setWarn(fGroupId, wxid, 0);
+                    List l = getWarnList(fGroupId);
+                    l.remove(wxid);
+                    putString("wl_" + fGroupId, joinCsv(l));
+                    toast("已清零");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showWarnedListDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 潜水/权限 控制 子 Dialog ----
+void showInactiveControlDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    String botPriv = botPrivState(groupId);
+    boolean baselineExists = !getString("fsg_" + groupId, "").isEmpty();
+    int defDays = getDefaultInactiveDays();
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("💤 潜水 / bot 权限 控制");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    // bot 权限段
+    String pTxt;
+    if (botPriv.equals("admin")) pTxt = "bot 权限: ✅ 群管理员";
+    else if (botPriv.equals("none")) pTxt = "bot 权限: ❌ 非管理员 (踢人会失败)";
+    else pTxt = "bot 权限: ❓ 未检测";
+    android.widget.TextView pv = new android.widget.TextView(ctx);
+    pv.setText(pTxt);
+    pv.setTextColor(_gaC("#E8E9EC"));
+    pv.setTextSize(13);
+    pv.setPadding(0, 0, 0, 6 * dp);
+    root.addView(pv);
+
+    android.widget.Button resetPrivBtn = _gaBtn(ctx, "🔄 重置 bot 权限缓存", "#252934");
+    resetPrivBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            putString("bp_" + fGroupId, "unknown");
+            toast("已重置, 下次踢人重新检测");
+            if (dh[0] != null) dh[0].dismiss();
+            showInactiveControlDialog(fGroupId);
+        }
+    });
+    root.addView(resetPrivBtn);
+
+    _gaSpacer(root, ctx, 16 * dp);
+
+    // 潜水基线段
+    android.widget.TextView bv = new android.widget.TextView(ctx);
+    bv.setText("潜水基线: " + (baselineExists ? "✅ 已建立" : "🔴 未建立"));
+    bv.setTextColor(_gaC("#E8E9EC"));
+    bv.setTextSize(13);
+    bv.setPadding(0, 0, 0, 6 * dp);
+    root.addView(bv);
+
+    android.widget.Button rebuildBtn = _gaBtn(ctx, "🔁 强制重建潜水基线 (覆盖现有)", "#FFD166");
+    rebuildBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            int n = rebuildBaselineForce(fGroupId);
+            toast("重建完成: " + n + " 人");
+            if (dh[0] != null) dh[0].dismiss();
+            showInactiveControlDialog(fGroupId);
+        }
+    });
+    root.addView(rebuildBtn);
+
+    _gaSpacer(root, ctx, 16 * dp);
+
+    // 默认天数段
+    android.widget.TextView dv = new android.widget.TextView(ctx);
+    dv.setText("默认潜水天数 (当前 " + defDays + ", v1.11 仅记录, 命令仍需 #潜水 N)");
+    dv.setTextColor(_gaC("#E8E9EC"));
+    dv.setTextSize(13);
+    dv.setPadding(0, 0, 0, 6 * dp);
+    root.addView(dv);
+
+    final android.widget.EditText inp = new android.widget.EditText(ctx);
+    inp.setText(String.valueOf(defDays));
+    inp.setTextColor(_gaC("#E8E9EC"));
+    inp.setHintTextColor(_gaC("#7C828E"));
+    inp.setBackground(_gaRound("#252934", 12));
+    inp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    inp.setTextSize(14);
+    inp.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+    inp.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+    root.addView(inp);
+
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button saveBtn = _gaBtn(ctx, "💾 保存默认天数", "#5CB6FF");
+    saveBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            try {
+                int n = Integer.parseInt(inp.getText().toString().trim());
+                setDefaultInactiveDays(n);
+                toast("已保存: " + n + " 天");
+            } catch (Exception e) { toast("请输入有效数字"); }
+        }
+    });
+    root.addView(saveBtn);
+
+    _gaSpacer(root, ctx, 16 * dp);
+
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ============================================================
+// ==== v1.12: 白名单 / 警告详情 / 全局配置 / 严格模式 ============
+// ============================================================
+
+// ---- 白名单 dispatch ----
+void doWhitelist(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足"); return; }
+    List wt = getWhitelist(groupId);
+    if (!wt.contains(target)) { wt.add(target); setWhitelist(groupId, wt); }
+    sendText(groupId, "✅ 已加入本群白名单: " + lookupName(target, groupId) + "\n(免警告 + 免进群黑名单检测)");
+}
+
+void doUnwhitelist(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足"); return; }
+    List wt = getWhitelist(groupId);
+    if (wt.remove(target)) {
+        setWhitelist(groupId, wt);
+        sendText(groupId, "✅ 已移除本群白名单: " + lookupName(target, groupId));
+    } else {
+        sendText(groupId, "❌ 该用户不在本群白名单");
+    }
+}
+
+void showWhitelist(String groupId) {
+    List wt = getWhitelist(groupId);
+    if (wt.isEmpty()) { sendText(groupId, "📋 本群白名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("✅ 本群白名单 (").append(wt.size()).append("):\n");
+    for (int i = 0; i < wt.size(); i++) {
+        sb.append("· ").append(lookupName((String) wt.get(i), groupId)).append("\n");
+    }
+    sendText(groupId, sb.toString());
+}
+
+// ---- 警告详情 ----
+void doWarnDetail(String groupId, String target) {
+    int n = getWarn(groupId, target);
+    String name = lookupName(target, groupId);
+    StringBuilder sb = new StringBuilder();
+    sb.append("⚠️ ").append(name).append(" 警告详情:\n");
+    sb.append("━━━━━━\n");
+    sb.append("当前警告: ").append(n).append("/").append(WARN_AUTO_KICK).append("\n");
+    if (n == 0) {
+        sb.append("(无警告记录)");
+    } else {
+        String tsStr = getString("wnt_" + groupId + "_" + target, "");
+        if (!tsStr.isEmpty()) {
+            try {
+                long ts = Long.parseLong(tsStr);
+                long ago = (System.currentTimeMillis() - ts) / 60000L;
+                if (ago < 60) sb.append("最近警告: ").append(ago).append(" 分钟前\n");
+                else if (ago < 1440) sb.append("最近警告: ").append(ago / 60).append(" 小时前\n");
+                else sb.append("最近警告: ").append(ago / 1440).append(" 天前\n");
+            } catch (Exception e) {}
+        }
+        String fromWxid = getString("wnf_" + groupId + "_" + target, "");
+        if (!fromWxid.isEmpty()) {
+            sb.append("操作人: ").append(lookupName(fromWxid, groupId)).append("\n");
+        }
+        int remain = WARN_AUTO_KICK - n;
+        if (remain > 0) sb.append("还剩 ").append(remain).append(" 次机会");
+        else sb.append("已达上限");
+    }
+    sendText(groupId, sb.toString());
+}
+
+// ---- 清除警告名单 (仅群主) ----
+void doWarnClearAll(String groupId, String sender) {
+    if (!isOwner(sender)) { sendText(groupId, "❌ 此命令仅群主可用"); return; }
+    List wl = getWarnList(groupId);
+    if (wl.isEmpty()) { sendText(groupId, "📋 本群无警告记录"); return; }
+    int cleared = wl.size();
+    for (int i = 0; i < wl.size(); i++) {
+        String w = (String) wl.get(i);
+        setWarn(groupId, w, 0);
+        putString("wnt_" + groupId + "_" + w, "");
+        putString("wnf_" + groupId + "_" + w, "");
+    }
+    putString("wl_" + groupId, "");
+    sendText(groupId, "✅ 已清空本群所有警告 (共清除 " + cleared + " 人)");
+}
+
+// ---- 全局黑名单 ----
+void doAddGlobalBlacklist(String groupId, String wxid) {
+    List bl = getGlobalBlacklist();
+    if (!bl.contains(wxid)) { bl.add(wxid); setGlobalBlacklist(bl); }
+    sendText(groupId, "🌐 已加入全局黑名单: " + wxid + "\n(任何已启用群进入即踢)");
+}
+
+void doDelGlobalBlacklist(String groupId, String wxid) {
+    List bl = getGlobalBlacklist();
+    if (bl.remove(wxid)) { setGlobalBlacklist(bl); sendText(groupId, "✅ 已从全局黑名单移除: " + wxid); }
+    else sendText(groupId, "❌ 该 wxid 不在全局黑名单");
+}
+
+void showGlobalBlacklist(String groupId) {
+    List bl = getGlobalBlacklist();
+    if (bl.isEmpty()) { sendText(groupId, "🌐 全局黑名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🌐 全局黑名单 (").append(bl.size()).append("):\n");
+    for (int i = 0; i < bl.size(); i++) {
+        sb.append("· ").append(bl.get(i)).append("\n");
+    }
+    sendText(groupId, sb.toString());
+}
+
+// ---- 全局白名单 ----
+void doAddGlobalWhitelist(String groupId, String wxid) {
+    List wt = getGlobalWhitelist();
+    if (!wt.contains(wxid)) { wt.add(wxid); setGlobalWhitelist(wt); }
+    sendText(groupId, "🌐 已加入全局白名单: " + wxid + "\n(任何已启用群免警告/免进群检测)");
+}
+
+void doDelGlobalWhitelist(String groupId, String wxid) {
+    List wt = getGlobalWhitelist();
+    if (wt.remove(wxid)) { setGlobalWhitelist(wt); sendText(groupId, "✅ 已从全局白名单移除: " + wxid); }
+    else sendText(groupId, "❌ 该 wxid 不在全局白名单");
+}
+
+void showGlobalWhitelist(String groupId) {
+    List wt = getGlobalWhitelist();
+    if (wt.isEmpty()) { sendText(groupId, "🌐 全局白名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🌐 全局白名单 (").append(wt.size()).append("):\n");
+    for (int i = 0; i < wt.size(); i++) {
+        sb.append("· ").append(wt.get(i)).append("\n");
+    }
+    sendText(groupId, sb.toString());
+}
+
+// ---- 严格模式 ----
+void doStrictMode(String groupId, String sender, String content) {
+    if (!isOwner(sender)) { sendText(groupId, "❌ 此命令仅群主可用"); return; }
+    String[] tk = content.split("[\\s\\u2005\\u00A0]+");
+    if (tk.length < 2) {
+        sendText(groupId, "用法:\n严格模式 开 — 仅群主能用命令\n严格模式 关 — 管理员+ 都能用\n严格模式 状态\n当前: " + (isStrictMode() ? "✅ 开启" : "🔓 关闭"));
+        return;
+    }
+    String arg = tk[1];
+    if (arg.equals("开") || arg.equals("on") || arg.equals("启用")) {
+        setStrictMode(true);
+        sendText(groupId, "✅ 严格模式已开启 (全局生效, 仅群主能用群管命令)");
+    } else if (arg.equals("关") || arg.equals("off") || arg.equals("禁用")) {
+        setStrictMode(false);
+        sendText(groupId, "✅ 严格模式已关闭 (管理员+ 都能用)");
+    } else if (arg.equals("状态")) {
+        sendText(groupId, "严格模式: " + (isStrictMode() ? "✅ 开启 (仅群主)" : "🔓 关闭 (管理员+)"));
+    } else {
+        sendText(groupId, "❌ 用法: 严格模式 开/关/状态");
+    }
+}
+
+// ---- 白名单 GUI 子 Dialog ----
+void showWhitelistDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List wt = getWhitelist(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("✅ 白名单 (" + wt.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 6 * dp);
+    root.addView(title);
+
+    android.widget.TextView hint = new android.widget.TextView(ctx);
+    hint.setText("白名单成员免警告 + 免进群黑名单检测");
+    hint.setTextColor(_gaC("#7C828E"));
+    hint.setTextSize(11);
+    hint.setPadding(0, 0, 0, 12 * dp);
+    root.addView(hint);
+
+    if (wt.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无白名单");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < wt.size(); i++) {
+            final String wxid = (String) wt.get(i);
+            android.widget.LinearLayout row = _gaRow(ctx, lookupName(wxid, fGroupId), wxid, "移除", "#7C828E");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    List l = getWhitelist(fGroupId);
+                    l.remove(wxid);
+                    setWhitelist(fGroupId, l);
+                    toast("已移除");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showWhitelistDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ============================================================
+// ==== v1.13: 微信原生群主/管理员手动登记 (保护免被踢/拉黑/警告)
+// ============================================================
+void doRegisterNativeOwner(String groupId, String target) {
+    List l = getNativeOwners(groupId);
+    if (!l.contains(target)) { l.add(target); putString("nat_owner_" + groupId, joinCsv(l)); }
+    sendText(groupId, "👑 已登记为微信群主: " + lookupName(target, groupId) + "\n(任何人不能再对其执行踢/拉黑/警告)");
+}
+
+void doRemoveNativeOwner(String groupId, String target) {
+    List l = getNativeOwners(groupId);
+    if (l.remove(target)) {
+        putString("nat_owner_" + groupId, joinCsv(l));
+        sendText(groupId, "✅ 已取消微信群主登记: " + lookupName(target, groupId));
+    } else sendText(groupId, "❌ 该用户未登记为微信群主");
+}
+
+void doRegisterNativeAdmin(String groupId, String target) {
+    List l = getNativeAdmins(groupId);
+    if (!l.contains(target)) { l.add(target); putString("nat_admin_" + groupId, joinCsv(l)); }
+    sendText(groupId, "🛡 已登记为微信管理员: " + lookupName(target, groupId) + "\n(任何人不能再对其执行踢/拉黑/警告)");
+}
+
+void doRemoveNativeAdmin(String groupId, String target) {
+    List l = getNativeAdmins(groupId);
+    if (l.remove(target)) {
+        putString("nat_admin_" + groupId, joinCsv(l));
+        sendText(groupId, "✅ 已取消微信管理员登记: " + lookupName(target, groupId));
+    } else sendText(groupId, "❌ 该用户未登记为微信管理员");
+}
