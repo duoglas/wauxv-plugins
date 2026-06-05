@@ -34,11 +34,40 @@
 
 权限层级：`super_owners` > `super_admins` / 原生群主(`nat_owner_`) > 群 `admins_`。判定：`isOwner` / `isAdmin` / `isAuthorized`。非授权者发命令一律静默忽略（v1.9 起，防探测）。
 
+### 4.3 警告自动踢上限（每群可调，默认 10）
+
+- 默认上限 **10**（无自定义的群用之）。常量 `WARN_AUTO_KICK` 仅作默认值，**不再直接用于显示/判定**。
+- per-群持久化 key：`wk_<groupId>`（fastkv/config.prop）。getter `getWarnKick(groupId)`：有自定义值则用之并**夹取到 1~99**，否则返回默认 10。setter `setWarnKick(groupId,n)` 同样夹取 1~99 后写入。
+- **所有警告显示与踢判定一律用 `getWarnKick(本群)`**（`doWarn` 显示 n/X + 踢判定 `n>=X`、`doWarnDec`、`showWarnList`、`doWarnDetail`、Dialog 警告名单行）。无群上下文的全局帮助（`openSettings`）显示"默认 10，各群可调"。
+- 改阈值入口：(a) 文字命令 `警告上限 N`（admin+）；(b) 设置 Dialog（`showGroupConfigDialog`）中一个数字输入控件（仿默认潜水天数控件）写 `wk_<group>`。
+- 边界：N 为 0/负/超大/非数字 → 夹取到 1~99 或拒绝并提示，不得除零/永不踢/秒踢。
+- **满上限自动踢出后清零（`doWarn`，L1）**：警告累计到本群上限（`n >= getWarnKick(本群)`）触发自动移除时：
+  - 无群管权限（`botPrivState=="none"`）→ 发"机器人无群管权限, 未能踢出"，**保留计数**（不清零），待有权限后下次警告即踢。
+  - 有权限 → `boolean kicked = tryKickSilent(...)`；**仅当 `kicked==true`（踢成功）才清零该成员警告**：`setWarn(...,0)` + `delWarnList(...)`（并清 `wnt_`/`wnf_` 记录），使其重新进群后从 0 重新累计。踢失败（含权限丢失）→ **保留计数**，按"未能踢出"提示。
+  - 语义关键：踢成才算"踢完清零"，没踢成不清零。
+
+---
+
 - 开关（仅 owner）：`开启群管`/`启用群管`、`关闭群管`/`禁用群管`
 - 查询（admin+）：`黑名单`、`管理员`、`警告名单`、`保护名单`、`白名单`、`全局黑名单`、`全局白名单`、`群管状态`、`群管群列表`、`帮助 群管`/`群管帮助`
-- 管理（admin+，L1）：`addsb <wxid>`(加黑)、`delbk`(删黑)、`addwt`/`delwt`(白名单)、`addgb`/`delgb`(全局黑)、`addgw`/`delgw`(全局白)、`清除警告名单`、`严格模式 [on/off]`
+- 管理（admin+，L1）：`addsb <wxid>`(加黑)、`delbk`(删黑)、`addwt`/`delwt`(白名单)、`addgb`/`delgb`(全局黑)、`addgw`/`delgw`(全局白)、`清除警告名单`、`严格模式 [on/off]`、`警告上限 N`(设本群警告自动踢上限，夹取 1~99)
 - 潜水：`#潜水 N`/`潜水`(列名单 L2)、`#踢潜水`/`踢潜水 1,3,5-8`(批量踢 L1)
 - 自检/设置：`#群权限自检`、`群管设置`/`#群管设置`（弹 Dialog，`onClickSendBtn` 拦截）
+
+### 4.1 @TA 动作（admin+，目标=被 @ 者）
+
+`@TA 踢/请 · 拉黑/黑名单 · 警告 · 警告-1/警告减1 · 清零 · 警告详情 · 保护/取消保护 · 白名单/移除白名单 · 管理员/移除管理 · 群主/移除群主 · 微信群主/移除微信群主`。动作关键词为消息**最后一个 token**。`管理员/移除管理/群主/移除群主/微信群主/移除微信群主` 为 ownerOnly。
+
+### 4.2 引用回复触发管理动作（admin+，目标=被引用消息发送者）
+
+- **消息形态（真机 [QDIAG] 实测确诊，2026-06-05）**：微信引用回复在 `onHandleMsg` 里**不是文本**——`isText()=false`、`getType()=822083633`（appmsg）、`getContent()` 返回**整段 XML**（~1200 字符）：`<msg><appmsg><title>回复文本</title>…<refermsg><chatusr>被引用者wxid</chatusr>…</refermsg></appmsg></msg>`。管理员实际打的动作词（如『警告』）在 **`<title>`** 里，**不在** `getContent()` 的末尾 token（末尾是 XML 碎片）。
+- **入口（按 isText 二分）**：在『无 @』分支里按 `isText()` 分流：
+  - `isText()=true`（普通文本）：维持原行为——`content.split` 取最后一个 token，末尾非动作词即 return（无 @ 无引用 → 无 target → return）。**不调 `getQuoteMsg()`、不解析 XML。**
+  - `!isText()`（appmsg）：`q = msg.getQuoteMsg()`；`q==null`（链接/文件/图片等非引用 appmsg）→ 安全 return；否则用正则 `<title>(.*?)</title>`（非贪婪 + DOTALL）从 `getContent()` 提取回复文本，取其**最后一个 token**（按 `[\s  ]+` split，与 @ 路径一致）作为 `actionTok`，`isActionTok(actionTok)` 判定；非动作词 → 安全 return（引用了但回复词不是动作，不打扰）；提取不到 `<title>` 也安全 return（不崩）。
+- **目标**：`target = q.getSendTalker()`（被引用消息发送者 wxid，实测 19 字符有效），防 null/空。
+- **权限不绕过**：引用触发的破坏性动作（踢/拉黑/警告等）走与 @ 路径**完全相同**的 `isAuthorized` + `canActOn` 校验（抽象出 `dispatchAction(groupId, sender, target, actionTok)`，目标既可来自 @ 也可来自引用）；非授权者引用发动作**静默拒绝**（与 @ 路径一致，防探测）；对受保护对象/原生群主引用动作被 `canActOn` 拒绝（含 ownerOnly）。
+- **热路径红线（C-PERF-01）**：`getQuoteMsg()` **只在 `!isText()` 时调用**；普通文本聊天（`isText()=true`）**绝不调用 `getQuoteMsg()`、绝不解析 XML title**，走原有文本路径（@ 动作 / 文本命令 / 末尾非动作词 return）。
+- **警告上限**：见 §4.3。
 
 ## 5. 数据存储（fastkv / config.prop）
 
@@ -71,6 +100,10 @@
 6. **onUnload 补 flush**：卸载/重载前同步 `l3Flush()` 一次内存增量落盘（防丢，RISK-4），并保留 T1 的 `perfFlush()`；随后 close `L3_DB` 并置 null。
 7. **onLoad 一次性迁移 CSV→DB（不可逆）**：用 config key `l3_sqlite_migrated` 守卫只迁一次，放在 onLoad 后台 delay 块（不阻塞加载）。遍历有 `lsg_`/`fsg_` 的群（`getEnabledGroups()`），`parseTimeCsv` 读旧 CSV → 批量 UPSERT 进 DB（`last_speak`/`first_seen` 取各自 CSV 值）。迁移后**校验**：DB 行数 / 该群 first_seen 数 与旧 CSV 条目数一致，记 plugin.log；校验通过才清旧 key（`putString("lsg_"/"fsg_"+g, "")`）并置 migrated；校验不过保留旧 key、记错误、不置 migrated（便于回滚，T0 已备份 config.prop）。
 8. `[现状]`（T4 落地）：降级已实装——缓冲上界 / flush 连续失败两触发器，`L3_DEGRADED` 仅挡 `recordSpeak` 采集入口，详见 §7。
+9. **引用动作的热路径红线（W2，C-PERF-01）**：真机 [QDIAG] 实测确诊——引用回复是 **appmsg（`isText()=false`、`getType()=822083633`）**，`getContent()` 是整段 XML，动作词在 `<title>`。因此引用路径的入口判据**改为 `!isText()`**，而非"末尾 token 是动作词"（XML 末尾是碎片，永远不是动作词，旧逻辑在此 return → 引用动作完全不触发，即 W2 的 bug 根因）。判定顺序（无 @ 分支按 `isText` 二分）：
+   - `isText()=true`（普通文本，占绝大多数）：维持原样——`content.split` 取 lastTok → `isActionTok(lastTok)` 纯字符串判定 → 末尾非动作词即 return（recordSpeak 内存入队已在更早完成）。**绝不调用 `getQuoteMsg()`、绝不解析 XML title**，热路径成本与改造前一致。
+   - `!isText()`（appmsg，频率远小于普通聊天）：`q = msg.getQuoteMsg()`（**仅在此一次调用**）；`q==null` → return；否则正则提取 `<title>` → 取末尾 token 作 `actionTok` → `isActionTok` 判定。`getQuoteMsg()` + XML 正则只发生在非文本消息上，不影响 `rs_avg_us`/`ohm_avg_us`（真机 perf.log 验证）。
+10. **isText 闸门（W2，WRISK-1）**：`onHandleMsgBody` 入口对非文本消息**零额外成本放行**——`isText()` 通过照常继续（普通文本路径不变、不调 getQuoteMsg）；`isText()` 不通过时再看 `getContent()` 是否非空（引用回复 appmsg 带 XML 文本），非空才继续走后续判定（引用路径在无 @ 分支的 `!isText` 子分支里调 `getQuoteMsg()` 取 title）。普通文本消息在第一个分支即通过，**永不为非文本消息额外调用 getQuoteMsg()**。（W2 修复后已移除临时探针 `[QDIAG]`/`[QUOTE-PROBE]`。）
 5. `[现状]`（T1 落地，C-PERF-04）：onHandleMsg 入口埋点已实现。热路径只做 `nanoTime` 取值 + 顶层内存计数器累加（样本数、onHandleMsg 累计/最大耗时、recordSpeak 累计/最大耗时、命令分支/普通分支计数），不每条消息写文件或 plugin.log（避免埋点自身变成热路径开销，RISK-5）。每累计 `PERF_FLUSH_EVERY`（默认 200）条消息聚合落盘一行到独立 `perf.log`（与 plugin.log 分离），落盘后清零窗口计数进入下一窗口。所有埋点逻辑被 try/catch 包裹，任何异常只跳过埋点、绝不抛入消息处理。
    - `perf.log` 路径：插件目录 `…/WAuxiliary/Plugin/GroupAdmin/perf.log`。
    - 行格式（空格分隔，可 grep/awk 聚合）：`ts=<epochMs> iso=<yyyy-MM-dd HH:mm:ss> n=<样本数> ohm_avg_us=<onHandleMsg平均微秒> ohm_max_us=<最大> rs_n=<recordSpeak调用数> rs_avg_us=<recordSpeak平均> rs_max_us=<最大> cmd=<命令分支数> normal=<普通消息分支数>`。

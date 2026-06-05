@@ -13,8 +13,6 @@
 //   - v1.13: 微信原生群主/管理员保护, 支持自动探测 + 手动登记 fallback
 //   - v1.15: 潜水采集 (lsg_/fsg_) 落盘从 config.prop 整群 CSV pivot 到自有 SQLite 库 (groupadmin.db)
 //            热路径仍只写内存增量 (O(1)); 后台批量 UPSERT; onLoad 一次性迁移 CSV→DB (VH-01 / RB-1/RB-2)
-//   - W2: 引用回复触发动作修复 — 引用回复是 appmsg(isText=false), 动作词在 <title>, target=getQuoteMsg().getSendTalker();
-//         getQuoteMsg() 仅 !isText 时调 (C-PERF-01); 删除 [QDIAG]/[QUOTE-PROBE] 临时探针
 // 不再过滤 isSend() — 机器人账号自己发命令也响应
 
 import java.util.*;
@@ -25,7 +23,7 @@ import android.widget.*;
 import android.graphics.*;
 import android.graphics.drawable.*;
 
-int WARN_AUTO_KICK = 10;   // 警告几次自动踢 (默认值; 每群可经 wk_<group> 覆盖, 见 getWarnKick)
+int WARN_AUTO_KICK = 3;   // 警告几次自动踢
 
 // ========== 性能埋点 (T1 / RB-3 / C-PERF-04) ==========
 // 热路径只做 nanoTime + 内存累加, 不每条消息写文件/写 log (RISK-5: 埋点不得反噬热路径)。
@@ -1667,25 +1665,6 @@ void setWarn(String groupId, String wxid, int n) {
     else putString("wn_" + groupId + "_" + wxid, "" + n);
 }
 
-// ---- W1: 每群警告自动踢上限 (默认 WARN_AUTO_KICK=10, 每群 wk_<group> 可覆盖) ----
-// 有自定义值则用之 (夹取 1~99); 否则返回默认 10。所有显示与踢判定都改用本 getter。
-int getWarnKick(String groupId) {
-    if (groupId == null) return WARN_AUTO_KICK;
-    String v = getString("wk_" + groupId, "");
-    if (v == null || v.isEmpty()) return WARN_AUTO_KICK;
-    try {
-        int n = Integer.parseInt(v.trim());
-        if (n < 1) n = 1; if (n > 99) n = 99;
-        return n;
-    } catch (Exception e) { return WARN_AUTO_KICK; }
-}
-// 写本群上限 (夹取 1~99)。返回夹取后的实际值。
-int setWarnKick(String groupId, int n) {
-    if (n < 1) n = 1; if (n > 99) n = 99;
-    putString("wk_" + groupId, String.valueOf(n));
-    return n;
-}
-
 List getWarnList(String groupId) {
     // 所有 wn_<groupId>_* 不便枚举(没有 getKeys),用单独 list 维护
     return parseCsv(getString("wl_" + groupId, ""));
@@ -1814,9 +1793,8 @@ void openSettings() {
     sb.append("  #潜水 7        列出过去 7 天没说话的人\n");
     sb.append("  #踢潜水 1,3,5-8  按编号批量踢\n");
     sb.append("  @TA 保护 / @TA 取消保护\n\n");
-    sb.append("【警告系统 — 默认累计 ").append(WARN_AUTO_KICK).append(" 次自动踢, 各群可调】\n");
-    sb.append("  @TA 警告 / @TA 警告-1 / @TA 清零\n");
-    sb.append("  警告上限 N (本群设上限) / 引用回复 + 动作词亦可\n\n");
+    sb.append("【警告系统 — 累计 ").append(WARN_AUTO_KICK).append(" 次自动踢】\n");
+    sb.append("  @TA 警告 / @TA 警告-1 / @TA 清零\n\n");
     sb.append("【管理员管理 — 仅群主】\n");
     sb.append("  @TA 管理员 / @TA 移除管理\n");
     sb.append("  @TA 群主 / @TA 移除群主\n");
@@ -1873,21 +1851,10 @@ void onHandleMsg(Object msg) {
 }
 
 void onHandleMsgBody(Object msg) {
-    // 群聊闸门最廉价, 先判 (非群聊一律不处理)。
+    if (!msg.isText()) return;
     if (!msg.isChatroom()) return;
 
-    // W2 / WRISK-1: 普通文本走 isText() 通过的零额外成本路径 (与原行为一致, 不调 getQuoteMsg)。
-    // 引用回复是 appmsg (isText()=false, getType()=822083633), getContent() 是整段 XML —— 不过 isText(),
-    // 此时回退看 getContent() 是否有可读文本; 仅当非文本时才多读一次 getContent() 判空; 普通文本消息在第一分支即通过, 不付任何额外成本。
-    // 注意: 这里绝不调用 getQuoteMsg() (那只在下方动作分发的 !isText 子分支里才调, 见 C-PERF-01)。
-    boolean isTextMsg = msg.isText();
-    String content;
-    if (isTextMsg) {
-        content = msg.getContent();
-    } else {
-        content = msg.getContent();
-        if (content == null || content.trim().isEmpty()) return;   // 非文本且无可读文本 → 不处理
-    }
+    String content = msg.getContent();
     if (content == null) return;
     content = content.trim();
     if (content.isEmpty()) return;
@@ -1974,7 +1941,7 @@ void onHandleMsgBody(Object msg) {
                     content.equals("警告名单") || content.equals("保护名单") ||
                     content.equals("白名单") || content.equals("清除警告名单") ||
                     content.equals("全局黑名单") || content.equals("全局白名单") ||
-                    content.startsWith("严格模式") || content.startsWith("警告上限") ||
+                    content.startsWith("严格模式") ||
                     content.startsWith("#潜水") || content.equals("潜水") ||
                     content.startsWith("#踢潜水") || content.startsWith("踢潜水") ||
                     content.equals("#群权限自检") || content.equals("群权限自检") ||
@@ -2004,8 +1971,6 @@ void onHandleMsgBody(Object msg) {
     // v1.12 控制
     if (content.equals("清除警告名单")) { doWarnClearAll(groupId, sender); return; }
     if (content.startsWith("严格模式")) { doStrictMode(groupId, sender, content); return; }
-    // W1: 文字命令设本群警告上限 (admin+, 已过 isAuthorized 闸门)
-    if (content.startsWith("警告上限")) { doSetWarnKick(groupId, content); return; }
 
     // ---- 潜水管理 ----
     if (content.startsWith("#潜水") || content.equals("潜水")) {
@@ -2069,110 +2034,52 @@ void onHandleMsgBody(Object msg) {
         return;
     }
 
-    // ---- 动作命令: 目标来自 @ (原路径) 或 引用回复 (W2) ----
-    // 取最后一个 token (动作关键字)。★ 用 regex 拆分,覆盖 ASCII space + U+2005 (微信 @ 用的全角空格)。
-    // lastTok/isAction 服务 @ 路径; 无 @ 路径按 isText 二分 (见下方): 普通文本用 lastTok, 引用回复(appmsg)从 <title> 另取。
-    // 注意: 普通文本聊天的 split + isActionTok 都是纯内存/字符串判定 (无 IO/getQuoteMsg), 末尾非动作词立即 return (C-PERF-01)。
+    // ---- @-style 动作命令 ----
+    if (atList == null || atList.size() == 0) return;   // 没 @ 就不是动作命令
+
+    // 取最后一个 token (动作关键字)
+    // ★ 用 regex 拆分,覆盖 ASCII space + U+2005 (微信 @ 用的全角空格)
     String[] tokens = content.split("[\\s\\u2005\\u00A0]+");
     String lastTok = tokens.length > 0 ? tokens[tokens.length - 1].trim() : "";
-    boolean isAction = isActionTok(lastTok);
 
-    boolean hasAt = atList != null && atList.size() > 0;
-
-    if (hasAt) {
-        // ===== @ 路径 (原行为完全不变) =====
-        if (!isAction) return;
-        // T1 埋点: @ 动作是命令, 之前误记为 normal, 回拨到 cmd (二者互斥)。
-        if (!_perfCmd) { try { PERF_NORMAL_N--; PERF_CMD_N++; _perfCmd = true; } catch (Throwable t) {} }
-
-        if (!isAuthorized(groupId, sender)) return;       // 非管理员/群主静默 (严格模式仅群主)
-
-        // 取第一个非自己的 @ 作为 target
-        String me = getLoginWxid();
-        String target = null;
-        for (int i = 0; i < atList.size(); i++) {
-            String w = (String) atList.get(i);
-            if (!w.equals(me)) { target = w; break; }
-        }
-        if (target == null) {
-            sendText(groupId, "❌ 请 @ 你要操作的对象");
-            return;
-        }
-        dispatchAction(groupId, sender, target, lastTok);
-        return;
-    }
-
-    // ===== 无 @ 分支: 按 isText 二分 (W2 修复) =====
-    if (isTextMsg) {
-        // 普通文本消息: 无 @ 无引用 → 末尾动作词无 target, 维持原行为直接 return。
-        // (热路径零额外开销: 不调 getQuoteMsg、不解析 XML; recordSpeak 内存入队已在更早完成。)
-        return;
-    }
-
-    // 非文本 appmsg (含引用回复): getContent() 的末尾 token 是 XML 碎片 (不是动作词),
-    // 真正的回复文本/动作词在 <title> 里, 被引用者 = getQuoteMsg().getSendTalker()。C-PERF-01: getQuoteMsg 只在此 (!isText) 调用。
-    Object quote = null;
-    try { quote = msg.getQuoteMsg(); } catch (Throwable t) { quote = null; }
-    if (quote == null) return;   // 非引用的其它 appmsg (链接/文件/图片) → 忽略, 不进会误判的路径
-
-    // 从 <title> 提取回复文本 → 取末尾 token 作动作词 (与 @ 路径同一套 split: 空白 / U+2005 / U+00A0)。
-    String actionTok = "";
-    try {
-        java.util.regex.Matcher m = java.util.regex.Pattern
-            .compile("<title>(.*?)</title>", java.util.regex.Pattern.DOTALL)
-            .matcher(content);
-        if (m.find()) {
-            String title = m.group(1);
-            if (title != null) {
-                String[] tt = title.trim().split("[\\s\\u2005\\u00A0]+");
-                if (tt.length > 0) actionTok = tt[tt.length - 1].trim();
-            }
-        }
-    } catch (Throwable t) { actionTok = ""; }
-    if (!isActionTok(actionTok)) return;   // 提取不到 title / 回复词不是动作 → 忽略, 不打扰
-
-    String qTarget = null;
-    try { qTarget = quote.getSendTalker(); } catch (Throwable t) { qTarget = null; }
-    if (qTarget == null || qTarget.isEmpty()) return;
-
-    // T1 埋点: 引用动作是命令, 回拨到 cmd。
+    // 这些关键字可以触发动作命令
+    boolean isAction = lastTok.equals("踢") || lastTok.equals("请") ||
+                       lastTok.equals("拉黑") || lastTok.equals("黑名单") ||
+                       lastTok.equals("警告") || lastTok.equals("清零") ||
+                       lastTok.equals("警告-1") || lastTok.equals("警告减1") ||
+                       lastTok.equals("警告详情") ||
+                       lastTok.equals("管理员") || lastTok.equals("移除管理") ||
+                       lastTok.equals("群主") || lastTok.equals("移除群主") ||
+                       lastTok.equals("保护") || lastTok.equals("取消保护") ||
+                       lastTok.equals("白名单") || lastTok.equals("移除白名单") ||
+                       lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
+    if (!isAction) return;
+    // T1 埋点: @ 动作是命令, 之前误记为 normal, 回拨到 cmd (二者互斥)。
     if (!_perfCmd) { try { PERF_NORMAL_N--; PERF_CMD_N++; _perfCmd = true; } catch (Throwable t) {} }
 
-    // ★ 权限/保护与 @ 路径完全相同: 先 isAuthorized 静默闸门, 再走 dispatchAction (内含 ownerOnly + canActOn)。
-    if (!isAuthorized(groupId, sender)) return;       // 非授权者引用发动作 → 静默拒绝 (防探测)
-    dispatchAction(groupId, sender, qTarget, actionTok);
-}
+    if (!isAuthorized(groupId, sender)) return;       // 非管理员/群主静默 (严格模式仅群主)
 
-// 动作关键词集 (与 @ / 引用路径共用)。
-boolean isActionTok(String lastTok) {
-    return lastTok.equals("踢") || lastTok.equals("请") ||
-           lastTok.equals("拉黑") || lastTok.equals("黑名单") ||
-           lastTok.equals("警告") || lastTok.equals("清零") ||
-           lastTok.equals("警告-1") || lastTok.equals("警告减1") ||
-           lastTok.equals("警告详情") ||
-           lastTok.equals("管理员") || lastTok.equals("移除管理") ||
-           lastTok.equals("群主") || lastTok.equals("移除群主") ||
-           lastTok.equals("保护") || lastTok.equals("取消保护") ||
-           lastTok.equals("白名单") || lastTok.equals("移除白名单") ||
-           lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
-}
+    // 取第一个非自己的 @ 作为 target
+    String me = getLoginWxid();
+    String target = null;
+    for (int i = 0; i < atList.size(); i++) {
+        String w = (String) atList.get(i);
+        if (!w.equals(me)) { target = w; break; }
+    }
+    if (target == null) {
+        sendText(groupId, "❌ 请 @ 你要操作的对象");
+        return;
+    }
 
-// ownerOnly 关键词集。
-boolean isOwnerOnlyTok(String lastTok) {
-    return lastTok.equals("管理员") || lastTok.equals("移除管理") ||
-           lastTok.equals("群主")   || lastTok.equals("移除群主") ||
-           lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
-}
-
-// 统一动作分发 (目标可来自 @ 或 引用回复)。
-// 调用前提: caller 已通过 isAuthorized(groupId,sender) 闸门。
-// 各 do* 内部仍各自做 canActOn(保护名单/原生群主/层级)校验 → 破坏性动作权限不被任何入口绕过。
-void dispatchAction(String groupId, String sender, String target, String lastTok) {
-    // 群主专属命令: 与 @ 路径一致的 ownerOnly 校验。
-    if (isOwnerOnlyTok(lastTok) && !isOwner(sender)) {
+    // 群主专属命令
+    boolean ownerOnly = lastTok.equals("管理员") || lastTok.equals("移除管理") ||
+                        lastTok.equals("群主")   || lastTok.equals("移除群主") ||
+                        lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
+    if (ownerOnly && !isOwner(sender)) {
         sendText(groupId, "❌ 此命令仅群主可用");
         return;
     }
+
     if (lastTok.equals("踢") || lastTok.equals("请"))           { doKick(groupId, sender, target); }
     else if (lastTok.equals("拉黑") || lastTok.equals("黑名单")) { doBan(groupId, sender, target); }
     else if (lastTok.equals("警告"))                            { doWarn(groupId, sender, target); }
@@ -2288,35 +2195,24 @@ void doWarn(String groupId, String sender, String target) {
 
     String name = lookupName(target, groupId);
     String byName = lookupName(sender, groupId);
-    int kick = getWarnKick(groupId);   // W1: 本群上限 (默认 10, 可经 wk_<group> 覆盖)
-    int remain = kick - n;
+    int remain = WARN_AUTO_KICK - n;
 
     StringBuilder sb = new StringBuilder();
     sb.append("[AtWx=").append(target).append("]\n");   // @ 受罚者, 让 TA 收到通知
 
-    if (n >= kick) {
-        sb.append("🚨 ").append(name).append(" 累计 ").append(n).append("/").append(kick).append(" 自动移除");
+    if (n >= WARN_AUTO_KICK) {
+        sb.append("🚨 ").append(name).append(" 累计 ").append(n).append("/").append(WARN_AUTO_KICK).append(" 自动移除");
         sendText(groupId, sb.toString());
         if (botPrivState(groupId).equals("none")) {
-            sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");   // 无权限: 不清零, 保留计数等下次
-        } else {
-            boolean kicked = tryKickSilent(groupId, target);
-            if (kicked) {
-                // 踢成功才清零: 重新进群从 0 重新累计
-                setWarn(groupId, target, 0);
-                delWarnList(groupId, target);
-                putString("wnt_" + groupId + "_" + target, "");
-                putString("wnf_" + groupId + "_" + target, "");
-            } else {
-                // 踢失败(含权限丢失, tryKickSilent 内已 setBotPriv): 不清零, 保留计数
-                sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");
-            }
+            sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");
+        } else if (!tryKickSilent(groupId, target) && botPrivState(groupId).equals("none")) {
+            sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");
         }
     } else if (n == 1) {
-        sb.append("⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 还剩 ").append(remain).append(" 次");
+        sb.append("⚠️ 警告 ").append(n).append("/").append(WARN_AUTO_KICK).append(" — ").append(name).append(" 还剩 ").append(remain).append(" 次");
         sendText(groupId, sb.toString());
     } else {
-        sb.append("⚠️⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 仅剩 ").append(remain).append(" 次, 下次自动踢");
+        sb.append("⚠️⚠️ 警告 ").append(n).append("/").append(WARN_AUTO_KICK).append(" — ").append(name).append(" 仅剩 ").append(remain).append(" 次, 下次自动踢");
         sendText(groupId, sb.toString());
     }
 }
@@ -2327,7 +2223,7 @@ void doWarnDec(String groupId, String sender, String target) {
     if (n < 0) n = 0;
     setWarn(groupId, target, n);
     if (n == 0) delWarnList(groupId, target);
-    sendText(groupId, "⚠️ " + lookupName(target, groupId) + " 警告 " + n + "/" + getWarnKick(groupId));
+    sendText(groupId, "⚠️ " + lookupName(target, groupId) + " 警告 " + n + "/" + WARN_AUTO_KICK);
 }
 
 void doWarnClear(String groupId, String sender, String target) {
@@ -2335,21 +2231,6 @@ void doWarnClear(String groupId, String sender, String target) {
     setWarn(groupId, target, 0);
     delWarnList(groupId, target);
     sendText(groupId, "✅ " + lookupName(target, groupId) + " 警告已清零");
-}
-
-// W1: `警告上限 N` 设本群警告自动踢上限 (调用前已过 isAuthorized)。N 夹取 1~99。
-void doSetWarnKick(String groupId, String content) {
-    String arg = content.substring("警告上限".length()).trim();
-    if (arg.isEmpty()) {
-        sendText(groupId, "ℹ️ 本群警告上限: " + getWarnKick(groupId) + "\n用法: 警告上限 N (N=1~99)");
-        return;
-    }
-    int n;
-    try { n = Integer.parseInt(arg); }
-    catch (Exception e) { sendText(groupId, "❌ 请输入有效数字 (1~99)"); return; }
-    int actual = setWarnKick(groupId, n);
-    if (actual != n) sendText(groupId, "✅ 本群警告上限已设为 " + actual + " 次自动踢 (输入 " + n + " 已夹取到 1~99)");
-    else sendText(groupId, "✅ 本群警告上限已设为 " + actual + " 次自动踢");
 }
 
 void doAddAdmin(String groupId, String target) {
@@ -2405,7 +2286,7 @@ void showHelp(String groupId) {
     sb.append("【日常】\n");
     sb.append("@TA 踢       移出群聊\n");
     sb.append("@TA 拉黑     加黑名单 + 踢\n");
-    sb.append("@TA 警告     累计 ").append(getWarnKick(groupId)).append(" 次自动踢\n");
+    sb.append("@TA 警告     累计 ").append(WARN_AUTO_KICK).append(" 次自动踢\n");
     sb.append("@TA 清零     警告归零\n");
     sb.append("@TA 白名单   免警告 + 免进群检测\n");
     sb.append("@TA 保护     潜水豁免\n");
@@ -2460,7 +2341,7 @@ void showWarnList(String groupId) {
     sb.append("⚠️ 警告名单 (").append(wl.size()).append("):\n");
     for (int i = 0; i < wl.size(); i++) {
         String w = (String) wl.get(i);
-        sb.append("· ").append(lookupName(w, groupId)).append(" - ").append(getWarn(groupId, w)).append("/").append(getWarnKick(groupId)).append("\n");
+        sb.append("· ").append(lookupName(w, groupId)).append(" - ").append(getWarn(groupId, w)).append("/").append(WARN_AUTO_KICK).append("\n");
     }
     sendText(groupId, sb.toString());
 }
@@ -2623,7 +2504,6 @@ void showGroupConfigDialog(String groupId) {
     st.append("\n");
     st.append("潜水基线: ").append(baselineExists ? "✅ 已建立" : "🔴 未建立").append("\n");
     st.append("默认潜水天数: ").append(defDays).append(" 天\n");
-    st.append("警告自动踢上限: ").append(getWarnKick(groupId)).append(" 次\n");
     st.append("本群管理员: ").append(adminCount).append(" 人\n");
     st.append("全局群主: ").append(getOwners().size()).append(" 人\n");
     st.append("黑 ").append(banCount).append("  ·  警告 ").append(wlCount).append("  ·  保护 ").append(pCount);
@@ -2720,43 +2600,6 @@ void showGroupConfigDialog(String groupId) {
         }
     });
     root.addView(warnBtn);
-    _gaSpacer(root, ctx, 6 * dp);
-
-    // W1: 本群警告自动踢上限 数字输入控件 (仿默认潜水天数控件) → 写 wk_<group>
-    android.widget.TextView wkLabel = new android.widget.TextView(ctx);
-    wkLabel.setText("⚠️ 警告自动踢上限 (1~99, 默认 " + WARN_AUTO_KICK + ")");
-    wkLabel.setTextColor(_gaC("#E8E9EC"));
-    wkLabel.setTextSize(13);
-    wkLabel.setPadding(0, 0, 0, 6 * dp);
-    root.addView(wkLabel);
-
-    final android.widget.EditText wkInp = new android.widget.EditText(ctx);
-    wkInp.setText(String.valueOf(getWarnKick(groupId)));
-    wkInp.setTextColor(_gaC("#E8E9EC"));
-    wkInp.setHintTextColor(_gaC("#7C828E"));
-    wkInp.setBackground(_gaRound("#252934", 12));
-    wkInp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
-    wkInp.setTextSize(14);
-    wkInp.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
-    wkInp.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
-        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
-        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
-    root.addView(wkInp);
-    _gaSpacer(root, ctx, 6 * dp);
-
-    final String fWkGroupId = groupId;
-    android.widget.Button wkSaveBtn = _gaBtn(ctx, "💾 保存警告上限", "#5CB6FF");
-    wkSaveBtn.setOnClickListener(new android.view.View.OnClickListener() {
-        public void onClick(android.view.View v) {
-            try {
-                int n = Integer.parseInt(wkInp.getText().toString().trim());
-                int actual = setWarnKick(fWkGroupId, n);   // 夹取 1~99
-                wkInp.setText(String.valueOf(actual));
-                toast(actual != n ? ("已保存: " + actual + " (已夹取到 1~99)") : ("已保存: " + actual + " 次自动踢"));
-            } catch (Exception e) { toast("请输入有效数字 (1~99)"); }
-        }
-    });
-    root.addView(wkSaveBtn);
     _gaSpacer(root, ctx, 6 * dp);
 
     android.widget.Button inactBtn = _gaBtn(ctx, "💤 潜水/权限 控制", "#252934");
@@ -3151,7 +2994,7 @@ void showWarnedListDialog(String groupId) {
         for (int i = 0; i < wl.size(); i++) {
             final String wxid = (String) wl.get(i);
             int n = getWarn(groupId, wxid);
-            android.widget.LinearLayout row = _gaRow(ctx, lookupName(wxid, fGroupId), "警告 " + n + "/" + getWarnKick(fGroupId), "清零", "#FFD166");
+            android.widget.LinearLayout row = _gaRow(ctx, lookupName(wxid, fGroupId), "警告 " + n + "/" + WARN_AUTO_KICK, "清零", "#FFD166");
             android.view.View act = row.getChildAt(1);
             act.setOnClickListener(new android.view.View.OnClickListener() {
                 public void onClick(android.view.View v) {
@@ -3352,7 +3195,7 @@ void doWarnDetail(String groupId, String target) {
     StringBuilder sb = new StringBuilder();
     sb.append("⚠️ ").append(name).append(" 警告详情:\n");
     sb.append("━━━━━━\n");
-    sb.append("当前警告: ").append(n).append("/").append(getWarnKick(groupId)).append("\n");
+    sb.append("当前警告: ").append(n).append("/").append(WARN_AUTO_KICK).append("\n");
     if (n == 0) {
         sb.append("(无警告记录)");
     } else {
@@ -3370,7 +3213,7 @@ void doWarnDetail(String groupId, String target) {
         if (!fromWxid.isEmpty()) {
             sb.append("操作人: ").append(lookupName(fromWxid, groupId)).append("\n");
         }
-        int remain = getWarnKick(groupId) - n;
+        int remain = WARN_AUTO_KICK - n;
         if (remain > 0) sb.append("还剩 ").append(remain).append(" 次机会");
         else sb.append("已达上限");
     }
