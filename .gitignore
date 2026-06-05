@@ -3,6 +3,10 @@
 **/plugin.log
 **/config.prop
 **/config.prop.*
+# SQLite 运行期数据库（含真实 wxid，数据存储，不入版本）
+*.db
+*.db-wal
+*.db-shm
 # Harness 运行期产物
 .harness/observations.jsonl
 .harness/session-*.md

@@ -11,8 +11,6 @@
 //            警告详情 (@TA 警告详情) / 清除警告名单 (一键全清, 仅群主) / 严格模式 (仅群主)
 //            doWarn 加时间+来源记录; GUI 主 Dialog 加白名单按钮
 //   - v1.13: 微信原生群主/管理员保护, 支持自动探测 + 手动登记 fallback
-//   - v1.15: 潜水采集 (lsg_/fsg_) 落盘从 config.prop 整群 CSV pivot 到自有 SQLite 库 (groupadmin.db)
-//            热路径仍只写内存增量 (O(1)); 后台批量 UPSERT; onLoad 一次性迁移 CSV→DB (VH-01 / RB-1/RB-2)
 // 不再过滤 isSend() — 机器人账号自己发命令也响应
 
 import java.util.*;
@@ -24,440 +22,6 @@ import android.graphics.*;
 import android.graphics.drawable.*;
 
 int WARN_AUTO_KICK = 3;   // 警告几次自动踢
-
-// ========== 性能埋点 (T1 / RB-3 / C-PERF-04) ==========
-// 热路径只做 nanoTime + 内存累加, 不每条消息写文件/写 log (RISK-5: 埋点不得反噬热路径)。
-// 每累计 PERF_FLUSH_EVERY 条消息聚合落盘一行到独立 perf.log (不污染 plugin.log)。
-// perf.log 只写耗时/计数, 绝不写 wxid/群名/群ID/消息内容。
-int  PERF_FLUSH_EVERY  = 200;   // 每 N 条消息聚合落盘一行
-long PERF_N            = 0;     // 当前窗口样本数 (onHandleMsg 调用数)
-long PERF_OHM_SUM_NS   = 0;     // 窗口 onHandleMsg 累计耗时 (ns)
-long PERF_OHM_MAX_NS   = 0;     // 窗口 onHandleMsg 最大耗时 (ns)
-long PERF_RS_N         = 0;     // 窗口 recordSpeak 调用数
-long PERF_RS_SUM_NS    = 0;     // 窗口 recordSpeak 累计耗时 (ns)
-long PERF_RS_MAX_NS    = 0;     // 窗口 recordSpeak 最大耗时 (ns)
-long PERF_CMD_N        = 0;     // 窗口命令分支计数 (文本命令 / @ 动作; 与 normal 互斥)
-long PERF_NORMAL_N     = 0;     // 窗口普通聊天消息分支计数 (到达 L3 采集且非命令)
-String PERF_LOG_PATH   = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdmin/perf.log";
-
-// 落盘一行聚合并清零窗口。仅在 try/catch 内调用; 自身再包一层防御。
-void perfFlush() {
-    try {
-        long n = PERF_N;
-        if (n <= 0) return;
-        long ohmAvgUs = (PERF_OHM_SUM_NS / n) / 1000L;
-        long ohmMaxUs = PERF_OHM_MAX_NS / 1000L;
-        long rsN = PERF_RS_N;
-        long rsAvgUs = rsN > 0 ? (PERF_RS_SUM_NS / rsN) / 1000L : 0;
-        long rsMaxUs = PERF_RS_MAX_NS / 1000L;
-        long nowMs = System.currentTimeMillis();
-        String iso = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date(nowMs));
-        String line = "ts=" + nowMs + " iso=" + iso + " n=" + n
-                + " ohm_avg_us=" + ohmAvgUs + " ohm_max_us=" + ohmMaxUs
-                + " rs_n=" + rsN + " rs_avg_us=" + rsAvgUs + " rs_max_us=" + rsMaxUs
-                + " cmd=" + PERF_CMD_N + " normal=" + PERF_NORMAL_N + "\n";
-        java.io.FileWriter fw = new java.io.FileWriter(PERF_LOG_PATH, true);  // append
-        try { fw.write(line); } finally { fw.close(); }
-    } catch (Throwable t) {
-        // 落盘失败不影响热路径; 一次性记到 plugin.log 便于排查
-        try { log("perf flush fail: " + t); } catch (Throwable t2) {}
-    } finally {
-        // 无论成功失败都清零窗口, 避免坏窗口无限累积
-        PERF_N = 0; PERF_OHM_SUM_NS = 0; PERF_OHM_MAX_NS = 0;
-        PERF_RS_N = 0; PERF_RS_SUM_NS = 0; PERF_RS_MAX_NS = 0;
-        PERF_CMD_N = 0; PERF_NORMAL_N = 0;
-    }
-}
-
-// ========== L3 潜水采集异步化 (T2/T2′ / RB-1/RB-2 / VH-01 / C-PERF-01/02/03 / C-ARCH-02/03) ==========
-// 热路径 recordSpeak 只往内存脏增量 Map 写 (O(1)), 绝不碰 getString/putString/DB/磁盘。
-// 后台 delay() 自我重调度循环 (默认 30s) 把脏增量批量 UPSERT 进自有 SQLite 库 (行级, 与群人数无关)。
-// 并发: 消息线程写 dirty、flush 线程换出 dirty, 都在 synchronized(L3_LOCK) 内, 杜绝 ConcurrentModificationException / 丢增量。
-int    L3_FLUSH_MS   = 30000;          // 后台 flush 周期 (ms)
-Object L3_LOCK       = new Object();   // 保护 L3_dirtyLs / L3_dirtySeen 的内存锁 (热路径 recordSpeak 只用这把)
-// T2′ (C-PLUGIN-03): 串行化整段 flush (换出脏 Map + 写 DB + 提交) 的独立锁。
-// 与 L3_LOCK 分开。热路径 recordSpeak 绝不获取 FLUSH_LOCK、绝不碰 L3_DB (普通消息永不阻塞磁盘锁, 保 C-PERF-03)。
-// 锁序恒为 FLUSH_LOCK 外、L3_LOCK 内 (仅 l3Flush 在 FLUSH_LOCK 内做一小段 L3_LOCK 换出); recordSpeak 只持 L3_LOCK → 无环 → 无死锁。
-Object FLUSH_LOCK    = new Object();   // 串行化 l3Flush (后台 flush + 命令路径 flush-before-read)
-Map    L3_dirtyLs    = new HashMap();  // groupId -> (Map wxid->ts) 待落盘的 last_speak 增量
-Map    L3_dirtySeen  = new HashMap();  // groupId -> (Map wxid->ts) 待落盘的 first_seen 候选
-boolean L3_flushStarted = false;       // 后台 flush 循环是否已启动 (防重复调度)
-// ===== T4: L3 降级 (C-ARCH-02 / RB-4) =====
-// 两个稳健触发器: (1) 内存缓冲条数上界 (2) flush 连续失败。满足任一 → L3_DEGRADED, recordSpeak 丢弃新增量。
-// 红线: 降级只影响 recordSpeak 采集入口; L1/L2 命令/flush-before-read/DB 查询永不读 L3_DEGRADED。
-// 刻意不做 timing (耗时超标) 触发器: 单条耗时抖动大易误触发, 缓冲/失败两触发器已覆盖压力与出错两类根因。
-long   L3_flushFailStreak = 0;          // 连续 flush 失败次数 (DB 打不开/写不进; flush 成功一轮归零)
-long   L3_dirtyCount      = 0;          // O(1) running counter: 脏增量总条数 (L3_LOCK 内 ++/清零, 热路径不求 size)
-int    L3_BUFFER_CAP      = 5000;       // 脏增量条数上界: ≥ 此值进入降级 (保护内存)
-int    L3_FAIL_CAP        = 5;          // flush 连续失败阈值: ≥ 此值进入降级 (DB 持续不可用)
-boolean L3_DEGRADED       = false;      // 降级标志: 真则 recordSpeak 直接 return (廉价布尔读)
-
-// ===== T2′ SQLite 落盘底座 (替代 config.prop 整群 CSV) =====
-// 表: speak(grp,wxid,last_speak,first_seen, PK(grp,wxid)) + 索引 (grp,last_speak)。
-// 连接单例: 顶层缓存一个 SQLiteDatabase, 懒打开, onUnload close。SQLiteDatabase 内部锁线程安全。
-String L3_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdmin/groupadmin.db";
-android.database.sqlite.SQLiteDatabase L3_DB = null;   // 连接单例 (懒打开)
-
-// 懒打开 DB 单例 + 建表/建索引/设 WAL。仅在 FLUSH_LOCK / 命令路径里调用 (非热路径)。返回可用连接, 失败返回 null。
-android.database.sqlite.SQLiteDatabase l3Db() {
-    // 快路径: 已打开直接返回, 不抢锁 (写路径 flush 高频调本方法, 命中即走这里)。
-    if (L3_DB != null && L3_DB.isOpen()) return L3_DB;
-    // 慢路径 (仅首次/重开): 整段 检查 null→打开→赋值 串行到 FLUSH_LOCK, 杜绝两线程并发各 open 一次泄漏连接 (Santa A#5)。
-    // FLUSH_LOCK 可重入: 写路径已持 FLUSH_LOCK 调本方法安全; 读路径仅首次短暂取锁打开连接, 不在热路径。
-    // 锁序不变: l3Db 内不再嵌套取其它锁 (FLUSH_LOCK 仍是最外层), 无新死锁。
-    synchronized (FLUSH_LOCK) {
-        if (L3_DB != null && L3_DB.isOpen()) return L3_DB;   // 双重检查: 等锁期间别的线程可能已打开
-        try {
-            android.database.sqlite.SQLiteDatabase db =
-                android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(L3_DB_PATH, (android.database.sqlite.SQLiteDatabase.CursorFactory) null);
-            db.execSQL("CREATE TABLE IF NOT EXISTS speak(grp TEXT, wxid TEXT, last_speak INTEGER, first_seen INTEGER, PRIMARY KEY(grp,wxid))");
-            db.execSQL("CREATE INDEX IF NOT EXISTS idx_speak_grp_last ON speak(grp,last_speak)");
-            // WAL 必须走 rawQuery: 该 PRAGMA 返回一行, execSQL 会拒绝并抛异常 (spike 已确认)。
-            try { android.database.Cursor c = db.rawQuery("PRAGMA journal_mode=WAL", (String[]) null); if (c != null) c.close(); } catch (Throwable t) {}
-            try { db.execSQL("PRAGMA synchronous=NORMAL"); } catch (Throwable t) {}
-            L3_DB = db;
-            return L3_DB;
-        } catch (Throwable t) {
-            try { log("l3Db open fail: " + t); } catch (Throwable t2) {}
-            return null;
-        }
-    }
-}
-
-// 查某群所有 (wxid -> last_speak)。命令路径调用 (doShowInactive); 调用前应已 flush-before-read。
-Map l3QueryLastSpeak(String groupId) {
-    Map m = new HashMap();
-    android.database.sqlite.SQLiteDatabase db = l3Db();
-    if (db == null) return m;
-    android.database.Cursor c = null;
-    try {
-        c = db.rawQuery("SELECT wxid,last_speak FROM speak WHERE grp=? AND last_speak IS NOT NULL", new String[]{ groupId });
-        while (c.moveToNext()) {
-            String w = c.getString(0);
-            if (w != null && !c.isNull(1)) m.put(w, Long.valueOf(c.getLong(1)));
-        }
-    } catch (Throwable t) { try { log("l3QueryLastSpeak fail: " + t); } catch (Throwable t2) {} }
-    finally { if (c != null) try { c.close(); } catch (Throwable t) {} }
-    return m;
-}
-
-// 查某群所有 (wxid -> first_seen)。
-Map l3QueryFirstSeen(String groupId) {
-    Map m = new HashMap();
-    android.database.sqlite.SQLiteDatabase db = l3Db();
-    if (db == null) return m;
-    android.database.Cursor c = null;
-    try {
-        c = db.rawQuery("SELECT wxid,first_seen FROM speak WHERE grp=? AND first_seen IS NOT NULL", new String[]{ groupId });
-        while (c.moveToNext()) {
-            String w = c.getString(0);
-            if (w != null && !c.isNull(1)) m.put(w, Long.valueOf(c.getLong(1)));
-        }
-    } catch (Throwable t) { try { log("l3QueryFirstSeen fail: " + t); } catch (Throwable t2) {} }
-    finally { if (c != null) try { c.close(); } catch (Throwable t) {} }
-    return m;
-}
-
-// 该群有 first_seen 的行数 (基线是否已建立)。
-int l3CountFirstSeen(String groupId) {
-    android.database.sqlite.SQLiteDatabase db = l3Db();
-    if (db == null) return 0;
-    android.database.Cursor c = null;
-    try {
-        c = db.rawQuery("SELECT count(*) FROM speak WHERE grp=? AND first_seen IS NOT NULL", new String[]{ groupId });
-        if (c.moveToFirst()) return c.getInt(0);
-    } catch (Throwable t) { try { log("l3CountFirstSeen fail: " + t); } catch (Throwable t2) {} }
-    finally { if (c != null) try { c.close(); } catch (Throwable t) {} }
-    return 0;
-}
-
-// 单群批量 UPSERT first_seen (绝不改晚: 已有更早值不被覆盖)。用于 initFirstSeenBaseline / doShowInactive 冷启动。
-// 返回新增 (此前 DB 无 first_seen) 的人数。非热路径 (命令/onLoad), 持 FLUSH_LOCK 串行化, 与后台 flush 互斥。
-int l3UpsertFirstSeen(String groupId, List wxids, long ts) {
-    if (wxids == null || wxids.isEmpty()) return 0;
-    int added = 0;
-    synchronized (FLUSH_LOCK) {
-        android.database.sqlite.SQLiteDatabase db = l3Db();
-        if (db == null) return 0;
-        try {
-            // 先查现有, 算 added (语义对齐旧 initFirstSeenBaseline 返回"新设置人数")
-            Map cur = l3QueryFirstSeen(groupId);
-            db.beginTransaction();
-            try {
-                android.database.sqlite.SQLiteStatement st = db.compileStatement(
-                    "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,NULL,?) "
-                    + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=min(first_seen,excluded.first_seen)");
-                try {
-                    for (int i = 0; i < wxids.size(); i++) {
-                        String w = (String) wxids.get(i);
-                        if (w == null || w.isEmpty()) continue;
-                        if (!cur.containsKey(w)) added++;
-                        st.clearBindings();
-                        st.bindString(1, groupId);
-                        st.bindString(2, w);
-                        st.bindLong(3, ts);
-                        st.execute();
-                    }
-                } finally { st.close(); }
-                db.setTransactionSuccessful();
-            } finally { db.endTransaction(); }
-        } catch (Throwable t) { try { log("l3UpsertFirstSeen fail group=" + groupId + " " + t); } catch (Throwable t2) {} }
-    }
-    return added;
-}
-
-// 强制重建基线: 清空该群 first_seen, 再按当前成员重设 (语义对齐旧 rebuildBaselineForce: 清空 fsg_ 再 initBaseline)。
-// 清 first_seen 用 UPDATE SET first_seen=NULL (保留 last_speak 行, 不删行)。
-void l3ClearFirstSeen(String groupId) {
-    synchronized (FLUSH_LOCK) {
-        android.database.sqlite.SQLiteDatabase db = l3Db();
-        if (db == null) return;
-        try { db.execSQL("UPDATE speak SET first_seen=NULL WHERE grp=?", new String[]{ groupId }); }
-        catch (Throwable t) { try { log("l3ClearFirstSeen fail: " + t); } catch (Throwable t2) {} }
-    }
-}
-
-// 该群 DB 里 last_speak / first_seen 各自非空的行数 (迁移校验用)。
-int[] l3CountGroup(String groupId) {
-    int[] r = new int[]{0, 0};
-    android.database.sqlite.SQLiteDatabase db = l3Db();
-    if (db == null) return r;
-    android.database.Cursor c = null;
-    try {
-        c = db.rawQuery("SELECT sum(last_speak IS NOT NULL), sum(first_seen IS NOT NULL) FROM speak WHERE grp=?", new String[]{ groupId });
-        if (c.moveToFirst()) { r[0] = c.isNull(0) ? 0 : c.getInt(0); r[1] = c.isNull(1) ? 0 : c.getInt(1); }
-    } catch (Throwable t) { try { log("l3CountGroup fail: " + t); } catch (Throwable t2) {} }
-    finally { if (c != null) try { c.close(); } catch (Throwable t) {} }
-    return r;
-}
-
-// T2′: 一次性迁移旧 lsg_/fsg_ CSV → SQLite。migrated 标志守卫只迁一次。校验通过才清旧 key + 置 migrated。
-// 不可逆 (T0 已备份 config.prop)。仅在 onLoad 后台 delay 调用 (非热路径)。
-void l3MigrateCsvToDb() {
-    if ("1".equals(getString("l3_sqlite_migrated", "0"))) return;   // 已迁过
-    android.database.sqlite.SQLiteDatabase db = l3Db();
-    if (db == null) { log("l3 migrate: DB open fail, 跳过本次 (下次重试)"); return; }
-
-    List groups = getEnabledGroups();
-    int gOk = 0, gFail = 0;
-    boolean allOk = true;
-    synchronized (FLUSH_LOCK) {
-        for (int i = 0; i < groups.size(); i++) {
-            String g = (String) groups.get(i);
-            String lcsv = getString("lsg_" + g, "");
-            String fcsv = getString("fsg_" + g, "");
-            if (lcsv.isEmpty() && fcsv.isEmpty()) continue;   // 该群无旧数据
-            Map lm = parseTimeCsv(lcsv);
-            Map fm = parseTimeCsv(fcsv);
-            int srcLs = lm.size();
-            int srcFs = fm.size();
-            try {
-                db.beginTransaction();
-                try {
-                    android.database.sqlite.SQLiteStatement upLs = db.compileStatement(
-                        "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,?,NULL) "
-                        + "ON CONFLICT(grp,wxid) DO UPDATE SET last_speak=excluded.last_speak");
-                    android.database.sqlite.SQLiteStatement upFs = db.compileStatement(
-                        "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,NULL,?) "
-                        + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=excluded.first_seen");
-                    try {
-                        Iterator it = lm.entrySet().iterator();
-                        while (it.hasNext()) {
-                            Map.Entry e = (Map.Entry) it.next();
-                            String w = (String) e.getKey(); Long ts = (Long) e.getValue();
-                            if (w == null || ts == null) continue;
-                            upLs.clearBindings(); upLs.bindString(1, g); upLs.bindString(2, w); upLs.bindLong(3, ts.longValue()); upLs.execute();
-                        }
-                        Iterator it2 = fm.entrySet().iterator();
-                        while (it2.hasNext()) {
-                            Map.Entry e = (Map.Entry) it2.next();
-                            String w = (String) e.getKey(); Long ts = (Long) e.getValue();
-                            if (w == null || ts == null) continue;
-                            upFs.clearBindings(); upFs.bindString(1, g); upFs.bindString(2, w); upFs.bindLong(3, ts.longValue()); upFs.execute();
-                        }
-                    } finally { upLs.close(); upFs.close(); }
-                    db.setTransactionSuccessful();
-                } finally { db.endTransaction(); }
-                // 校验: DB 该群 last_speak/first_seen 行数 应 == 源 CSV 条目数
-                int[] cnt = l3CountGroup(g);
-                if (cnt[0] == srcLs && cnt[1] == srcFs) {
-                    putString("lsg_" + g, "");
-                    putString("fsg_" + g, "");
-                    gOk++;
-                    log("l3 migrate group=" + g + " OK: lsg " + srcLs + "→" + cnt[0] + ", fsg " + srcFs + "→" + cnt[1] + " (旧 key 已清)");
-                } else {
-                    allOk = false; gFail++;
-                    log("l3 migrate group=" + g + " 校验不过: lsg src=" + srcLs + " db=" + cnt[0] + ", fsg src=" + srcFs + " db=" + cnt[1] + " (保留旧 key)");
-                }
-            } catch (Throwable t) {
-                allOk = false; gFail++;
-                try { log("l3 migrate group=" + g + " 异常, 保留旧 key: " + t); } catch (Throwable t2) {}
-            }
-        }
-    }
-    if (allOk) {
-        putString("l3_sqlite_migrated", "1");
-        log("l3 migrate DONE: " + gOk + " 群迁入并清旧 key, migrated=1");
-    } else {
-        log("l3 migrate INCOMPLETE: ok=" + gOk + " fail=" + gFail + ", 不置 migrated (下次 onLoad 重试)");
-    }
-}
-
-// 后台 flush 循环: 自我重调度。整体 try/catch(Throwable), finally 无条件再 delay 下一轮 → 异常绝不停摆 (RISK-2)。
-void l3FlushLoop() {
-    try {
-        l3Flush();
-    } catch (Throwable t) {
-        try { log("l3 flush loop err: " + t); } catch (Throwable t2) {}
-    } finally {
-        try {
-            delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
-        } catch (Throwable t) {
-            try { log("l3 flush reschedule fail: " + t); } catch (Throwable t2) {}
-        }
-    }
-}
-
-// 同步把内存脏增量批量 UPSERT 进 SQLite。可被后台循环、flush-before-read、onUnload 复用。
-// 原子换出脏 Map 后慢慢处理, L3_LOCK 只在换出瞬间持有, 不阻塞消息线程做 DB IO。
-void l3Flush() {
-    // T2′: 整段 (换出脏 Map → 批量 UPSERT → 提交 → perfFlush) 串行到 FLUSH_LOCK 下。
-    // FLUSH_LOCK 只保证: 命令路径调本方法时会等在途 flush 提交完, 且本次把当前内存增量提交进 DB 后才返回。
-    // flush-before-read 的正确性不靠 "FLUSH_LOCK 串行化保证读到已提交" (随后的 query 在 FLUSH_LOCK 外, 期间可能又有新 flush),
-    // 而是靠 UPSERT 的单调语义: last_speak=max(...)、first_seen=min(...) — 任何并发顺序都只会让值更新更不误踢, 不丢已提交的较新发言。
-    // 锁序固定: FLUSH_LOCK 外、L3_LOCK 内 (换出脏 Map 那一小段)。recordSpeak 只持 L3_LOCK, 永不持 FLUSH_LOCK → 无死锁。
-    synchronized (FLUSH_LOCK) {
-        Map ls = null;
-        Map fs = null;
-        // L3_LOCK 只在原子换出脏 Map 的瞬间持有 (嵌套在 FLUSH_LOCK 内, 锁序固定),
-        // 绝不在 L3_LOCK 内做 DB IO, 否则会让消息线程的 recordSpeak (同一把内存锁) 等待写库。
-        synchronized (L3_LOCK) {
-            if (!L3_dirtyLs.isEmpty() || !L3_dirtySeen.isEmpty()) {
-                ls = L3_dirtyLs; L3_dirtyLs = new HashMap();
-                fs = L3_dirtySeen; L3_dirtySeen = new HashMap();
-            }
-            L3_dirtyCount = 0;   // T4: 换出即清零 running counter (与 recordSpeak ++ 对称, 都在 L3_LOCK 内)
-        }
-        if (ls == null) {
-            // 无脏增量: 仅驱动 perf 落盘 (热路径已不做文件 IO)
-            try { perfFlush(); } catch (Throwable t) {}
-            return;
-        }
-        boolean anyFail = false;
-        android.database.sqlite.SQLiteDatabase db = l3Db();
-        if (db == null) {
-            // DB 打不开: 算一次失败, 但不把换出的增量丢回 (避免无限堆积); 已知会丢 ≤一周期, RISK-4 范围内。
-            L3_flushFailStreak++;
-            l3MaybeDegradeOnFail();   // T4 触发器(2): 连续失败到顶 → 降级
-            try { perfFlush(); } catch (Throwable t) {}
-            return;
-        }
-        try {
-            db.beginTransaction();
-            try {
-                // last_speak: ON CONFLICT 取 max (单调, 不会改旧). first_seen 一并以增量 ts 初值, 冲突时取 min。
-                android.database.sqlite.SQLiteStatement upLs = db.compileStatement(
-                    "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,?,?) "
-                    + "ON CONFLICT(grp,wxid) DO UPDATE SET last_speak=max(last_speak,excluded.last_speak), "
-                    + "first_seen=min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)");
-                // first_seen 候选: 单独 UPSERT, 冲突时 first_seen 取 min (绝不改晚), 不动 last_speak。
-                android.database.sqlite.SQLiteStatement upFs = db.compileStatement(
-                    "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,NULL,?) "
-                    + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)");
-                try {
-                    Iterator git = ls.entrySet().iterator();
-                    while (git.hasNext()) {
-                        Map.Entry ge = (Map.Entry) git.next();
-                        String g = (String) ge.getKey();
-                        Map inc = (Map) ge.getValue();
-                        if (inc == null) continue;
-                        Iterator it = inc.entrySet().iterator();
-                        while (it.hasNext()) {
-                            Map.Entry e = (Map.Entry) it.next();
-                            String w = (String) e.getKey();
-                            Long ts = (Long) e.getValue();
-                            if (w == null || ts == null) continue;
-                            upLs.clearBindings();
-                            upLs.bindString(1, g);
-                            upLs.bindString(2, w);
-                            upLs.bindLong(3, ts.longValue());
-                            upLs.bindLong(4, ts.longValue());   // first_seen 初值 = 本次发言 ts (冲突取 min)
-                            upLs.execute();
-                        }
-                    }
-                    Iterator fgit = fs.entrySet().iterator();
-                    while (fgit.hasNext()) {
-                        Map.Entry ge = (Map.Entry) fgit.next();
-                        String g = (String) ge.getKey();
-                        Map fcand = (Map) ge.getValue();
-                        if (fcand == null) continue;
-                        Iterator it = fcand.entrySet().iterator();
-                        while (it.hasNext()) {
-                            Map.Entry e = (Map.Entry) it.next();
-                            String w = (String) e.getKey();
-                            Long ts = (Long) e.getValue();
-                            if (w == null || ts == null) continue;
-                            upFs.clearBindings();
-                            upFs.bindString(1, g);
-                            upFs.bindString(2, w);
-                            upFs.bindLong(3, ts.longValue());
-                            upFs.execute();
-                        }
-                    }
-                } finally { upLs.close(); upFs.close(); }
-                db.setTransactionSuccessful();
-            } finally { db.endTransaction(); }
-        } catch (Throwable t) {
-            anyFail = true;
-            try { log("l3 flush db upsert fail: " + t); } catch (Throwable t2) {}
-        }
-        if (anyFail) {
-            L3_flushFailStreak++;
-            l3MaybeDegradeOnFail();   // T4 触发器(2): 连续失败到顶 → 降级
-        } else {
-            L3_flushFailStreak = 0;
-            l3MaybeRecover();         // T4 恢复: 成功一轮 + 缓冲已排空到低水位 → 解除降级
-        }
-        // perf 落盘也搬到后台 (热路径零磁盘 IO, C-PERF-03)
-        try { perfFlush(); } catch (Throwable t) {}
-    }
-}
-
-// ========== T4 降级触发/恢复 (仅 FLUSH_LOCK 内 l3Flush 调用; 非热路径) ==========
-// 触发器(2): flush 连续失败到阈值 → 进入降级。读 dirtyCount 时短取 L3_LOCK 保一致 (锁序 FLUSH_LOCK 外, L3_LOCK 内, 不破坏现有序)。
-void l3MaybeDegradeOnFail() {
-    if (L3_DEGRADED) return;
-    if (L3_flushFailStreak >= L3_FAIL_CAP) {
-        long dc; synchronized (L3_LOCK) { dc = L3_dirtyCount; }
-        L3_DEGRADED = true;
-        perfDegrade(true, "fail_streak", dc, L3_flushFailStreak);
-    }
-}
-
-// 恢复: flush 成功一轮 (streak 已归零) 且换出后缓冲已排空到低水位 (< CAP/2) → 解除降级, recordSpeak 恢复采集。
-void l3MaybeRecover() {
-    if (!L3_DEGRADED) return;
-    long dc; synchronized (L3_LOCK) { dc = L3_dirtyCount; }
-    if (L3_flushFailStreak == 0 && dc < (L3_BUFFER_CAP / 2)) {
-        L3_DEGRADED = false;
-        perfDegrade(false, null, dc, L3_flushFailStreak);
-    }
-}
-
-// 降级留痕: 往 perf.log 追加一行标记 (绝不含 wxid/群名/群ID/内容)。enter=true 进入, false 解除。
-void perfDegrade(boolean enter, String reason, long dirty, long failStreak) {
-    try {
-        long nowMs = System.currentTimeMillis();
-        String iso = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date(nowMs));
-        String line = "ts=" + nowMs + " iso=" + iso + " L3_DEGRADE "
-                + (enter ? ("enter reason=" + reason) : "exit")
-                + " dirty=" + dirty + " fail_streak=" + failStreak + "\n";
-        java.io.FileWriter fw = new java.io.FileWriter(PERF_LOG_PATH, true);
-        try { fw.write(line); } finally { fw.close(); }
-    } catch (Throwable t) {
-        try { log("perf degrade mark fail: " + t); } catch (Throwable t2) {}
-    }
-}
 
 // ========== 工具 ==========
 List parseCsv(String csv) {
@@ -629,49 +193,51 @@ void warnNoBotPriv(String groupId) {
 
 // ========== 潜水追踪 ==========
 // 存: lsg_<groupId> = wxid|ts,...  (last_speak), fsg_<groupId> = wxid|ts,... (first_seen)
-// T2: 热路径只入内存脏增量 (O(1)), 绝不碰磁盘。落盘由后台 l3FlushLoop / flush-before-read / onUnload 完成。
 void recordSpeak(String groupId, String wxid) {
     if (groupId == null || wxid == null || groupId.isEmpty() || wxid.isEmpty()) return;
-    // T4 降级: 入口廉价判断 (一个布尔读 + 判断, O(1))。降级期丢弃 L3 采集, 保收发, 不影响 L1/L2。
-    if (L3_DEGRADED) return;
-    Long now = Long.valueOf(System.currentTimeMillis());
-    synchronized (L3_LOCK) {
-        Map ls = (Map) L3_dirtyLs.get(groupId);
-        if (ls == null) { ls = new HashMap(); L3_dirtyLs.put(groupId, ls); }
-        // T4: 只在新 key 时 +1 running counter (覆盖已有 key 不增条数), 与 flush 换出清零对称。
-        if (!ls.containsKey(wxid)) L3_dirtyCount++;
-        ls.put(wxid, now);   // last_speak: 同周期内多次发言取最后一次 (覆盖即可, flush 再与磁盘取较新)
+    long now = System.currentTimeMillis();
 
-        Map fs = (Map) L3_dirtySeen.get(groupId);
-        if (fs == null) { fs = new HashMap(); L3_dirtySeen.put(groupId, fs); }
-        // first_seen 候选: 只在本周期首次见到时记一次, 不覆盖 (flush 落盘时再保证不覆盖磁盘上更早的)
-        if (!fs.containsKey(wxid)) { L3_dirtyCount++; fs.put(wxid, now); }
+    String lkey = "lsg_" + groupId;
+    Map lm = parseTimeCsv(getString(lkey, ""));
+    lm.put(wxid, Long.valueOf(now));
+    putString(lkey, buildTimeCsv(lm));
 
-        // T4 触发器(1) 缓冲上界: O(1) 计数到顶 → 进入降级 (留痕含原因/条数), 后续 recordSpeak 直接丢弃。
-        if (!L3_DEGRADED && L3_dirtyCount >= L3_BUFFER_CAP) {
-            L3_DEGRADED = true;
-            perfDegrade(true, "buffer_cap", L3_dirtyCount, L3_flushFailStreak);
-        }
+    String fkey = "fsg_" + groupId;
+    Map fm = parseTimeCsv(getString(fkey, ""));
+    if (!fm.containsKey(wxid)) {
+        fm.put(wxid, Long.valueOf(now));
+        putString(fkey, buildTimeCsv(fm));
     }
 }
 
 void recordFirstSeen(String groupId, String wxid) {
-    if (groupId == null || wxid == null || wxid.isEmpty()) return;
-    // T2′: first_seen UPSERT 进 SQLite, 冲突取 min (绝不覆盖更早的)。命令/入群路径 (L1/L2), 非热路径。
-    List one = new ArrayList();
-    one.add(wxid);
-    l3UpsertFirstSeen(groupId, one, System.currentTimeMillis());
+    if (groupId == null || wxid == null) return;
+    String fkey = "fsg_" + groupId;
+    Map fm = parseTimeCsv(getString(fkey, ""));
+    if (!fm.containsKey(wxid)) {
+        fm.put(wxid, Long.valueOf(System.currentTimeMillis()));
+        putString(fkey, buildTimeCsv(fm));
+    }
 }
 
 // 把群里所有当前成员中没 first_seen 的人设为 now (建立基线)
-// 返回新设置的人数 (此前 DB 无 first_seen 的人)
+// 返回新设置的人数
 int initFirstSeenBaseline(String groupId) {
     if (groupId == null || groupId.isEmpty()) return 0;
     List members = null;
     try { members = getGroupMemberList(groupId); } catch (Exception e) { log("baseline: getGroupMemberList fail " + groupId + " " + e); }
     if (members == null || members.isEmpty()) return 0;
-    // T2′: 批量 UPSERT first_seen 进 SQLite, 冲突取 min (不覆盖更早), 返回新增人数。命令路径, 非热路径。
-    return l3UpsertFirstSeen(groupId, members, System.currentTimeMillis());
+    String fkey = "fsg_" + groupId;
+    Map fm = parseTimeCsv(getString(fkey, ""));
+    long now = System.currentTimeMillis();
+    int added = 0;
+    for (int i = 0; i < members.size(); i++) {
+        String w = (String) members.get(i);
+        if (w == null || w.isEmpty()) continue;
+        if (!fm.containsKey(w)) { fm.put(w, Long.valueOf(now)); added++; }
+    }
+    if (added > 0) putString(fkey, buildTimeCsv(fm));
+    return added;
 }
 
 // 受保护名单 (手动维护, 用于微信原生群主等无法自动识别的人)
@@ -1378,27 +944,19 @@ void doShowInactive(String groupId, String content) {
     try { members = getGroupMemberList(groupId); } catch (Exception e) { log("getGroupMemberList fail: " + e); }
     if (members == null || members.isEmpty()) { sendText(groupId, "❌ 拿不到群成员列表"); return; }
 
-    // T2′: flush-before-read — 最新发言可能仍在内存脏增量未落盘, 读前先同步 flush 提交进 DB, 避免刚发言者被误判潜水。
-    // 注: 正确性由 UPSERT 单调 max(last_speak)/min(first_seen) 语义保证, 非靠 FLUSH_LOCK 串行化 (随后的 query 在锁外)。
-    try { l3Flush(); } catch (Throwable t) { log("doShowInactive l3Flush fail: " + t); }
-
     long now = System.currentTimeMillis();
     long cutoff = now - (long) days * 86400000L;
-    // T2′: lsg_/fsg_ 从 SQLite 查 (flush 已把内存增量提交进 DB)。
-    Map ls = l3QueryLastSpeak(groupId);
-    Map fs = l3QueryFirstSeen(groupId);
-    boolean coldStart = fs.isEmpty();
-    if (coldStart) {
-        // 冷启动: 该群 DB 无任何 first_seen, 把所有当前成员的 first_seen 设为 now (批量 UPSERT, 冲突取 min)。
-        List allMem = new ArrayList();
-        for (int i = 0; i < members.size(); i++) allMem.add(members.get(i));
-        l3UpsertFirstSeen(groupId, allMem, now);
-        for (int i = 0; i < members.size(); i++) fs.put((String) members.get(i), Long.valueOf(now));
-    }
+    Map ls = parseTimeCsv(getString("lsg_" + groupId, ""));
+    Map fs = parseTimeCsv(getString("fsg_" + groupId, ""));
     List prot = getProtected(groupId);
     String botWxid = getLoginWxid();
 
-    if (coldStart) {
+    // 冷启动: 如果 fsg 完全为空, 把所有当前成员的 first_seen 设为 now, 提示用户等待
+    if (fs.isEmpty()) {
+        for (int i = 0; i < members.size(); i++) {
+            fs.put((String) members.get(i), Long.valueOf(now));
+        }
+        putString("fsg_" + groupId, buildTimeCsv(fs));
         sendText(groupId, "📊 已建立潜水基线 (共 " + members.size() + " 人)\n请等待 " + days + " 天后再发 #潜水 " + days);
         return;
     }
@@ -1709,49 +1267,27 @@ String lookupName(String wxid, String groupId) {
 // ========== 生命周期 ==========
 void onLoad() {
     List enabled = getEnabledGroups();
-    log("GroupAdmin v1.15.0 loading, owner=" + getLoginWxid() + ", enabled groups=" + enabled.size());
+    log("GroupAdmin v1.14.0 loading, owner=" + getLoginWxid() + ", enabled groups=" + enabled.size());
 
-    // 延迟 5 秒, 等微信进程把通讯录数据加载好, 再 (一次性迁移 CSV→DB) + 扫已启用但没基线的群
+    // 延迟 5 秒, 等微信进程把通讯录数据加载好, 再扫已启用但没基线的群
     delay(5000, new Runnable() {
         public void run() {
-            // T2′: 一次性迁移旧 lsg_/fsg_ CSV → SQLite (migrated 标志守卫只迁一次, 不阻塞加载)。
-            try { l3MigrateCsvToDb(); } catch (Throwable t) { try { log("l3 migrate err: " + t); } catch (Throwable t2) {} }
-
             List groups = getEnabledGroups();
             int touched = 0;
             int totalAdded = 0;
             for (int i = 0; i < groups.size(); i++) {
                 String g = (String) groups.get(i);
-                if (l3CountFirstSeen(g) > 0) continue;   // T2′: 已有基线 (DB 查), 跳过
+                String fsg = getString("fsg_" + g, "");
+                if (!fsg.isEmpty()) continue;       // 已有基线, 跳过
                 int added = initFirstSeenBaseline(g);
                 if (added > 0) { touched++; totalAdded += added; }
             }
-            log("GroupAdmin v1.15.0 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+            log("GroupAdmin v1.14.0 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
             // _probeGroupInfoAPI();
         }
     });
-
-    // T2/T2′: 启动 L3 后台 flush 循环 (内存脏增量 → SQLite UPSERT + 顺带 perf 落盘)。防重复启动。
-    if (!L3_flushStarted) {
-        L3_flushStarted = true;
-        try {
-            delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
-        } catch (Throwable t) {
-            L3_flushStarted = false;
-            try { log("l3 flush loop start fail: " + t); } catch (Throwable t2) {}
-        }
-    }
 }
-void onUnload() {
-    // T2/T2′: 卸载/重载前把内存脏增量同步 UPSERT 进 DB, 防丢 (RISK-4)。
-    try { l3Flush(); } catch (Throwable t) { try { log("onUnload l3Flush fail: " + t); } catch (Throwable t2) {} }
-    // T1: 把当前未满窗口的埋点聚合落盘, 避免样本丢失 (l3Flush 已会触发一次, 这里兜底)。
-    try { perfFlush(); } catch (Throwable t) {}
-    // T2′: close DB 单例并置 null, 重载后 onLoad 重新懒开 (不搞 epoch)。
-    try { synchronized (FLUSH_LOCK) { if (L3_DB != null) { L3_DB.close(); L3_DB = null; } } }
-    catch (Throwable t) { try { log("onUnload db close fail: " + t); } catch (Throwable t2) {} }
-    L3_flushStarted = false;
-}
+void onUnload() {}
 
 // ==== WAuxiliary 主面板插件列表点"设置"时触发 (v1.10) ====
 // 弹一个 Dialog: 全局状态摘要 + 完整命令清单, 不需要进微信群也能查看
@@ -1827,30 +1363,7 @@ void openSettings() {
 }
 
 // ========== 消息处理 ==========
-// 性能埋点包装层 (T1 / C-PERF-04): 测本次 onHandleMsg 总耗时, 累加进窗口计数, 到阈值落盘。
-// 埋点全程 try/catch, 任何异常都不影响消息处理 (热路径优先)。
 void onHandleMsg(Object msg) {
-    long _perfStart = 0;
-    boolean _perfOn = false;
-    try { _perfStart = System.nanoTime(); _perfOn = true; } catch (Throwable t) { _perfOn = false; }
-    try {
-        onHandleMsgBody(msg);
-    } finally {
-        if (_perfOn) {
-            try {
-                long dur = System.nanoTime() - _perfStart;
-                PERF_N++;
-                PERF_OHM_SUM_NS += dur;
-                if (dur > PERF_OHM_MAX_NS) PERF_OHM_MAX_NS = dur;
-                // T2: 热路径不再做文件 IO (C-PERF-03)。perf 落盘改由后台 l3Flush 循环驱动。
-                // 兜底: 窗口异常膨胀 (后台循环长时间没跑) 时才在热路径 flush 一次, 防内存计数溢出/数据失真。
-                if (PERF_N >= PERF_FLUSH_EVERY * 50L) perfFlush();
-            } catch (Throwable t) { /* 埋点出错绝不影响消息 */ }
-        }
-    }
-}
-
-void onHandleMsgBody(Object msg) {
     if (!msg.isText()) return;
     if (!msg.isChatroom()) return;
 
@@ -1917,23 +1430,8 @@ void onHandleMsgBody(Object msg) {
     if (!isGroupEnabled(groupId)) return;
 
     // ---- 潜水追踪: 每条群消息记录发言时间 + first_seen ----
-    // T1 埋点: 单独测 recordSpeak 耗时 (T2 改造前 O(N) 同步 CSV 写的真实基线)。
-    if (sender != null && !sender.isEmpty()) {
-        long _rsStart = 0; boolean _rsOn = false;
-        try { _rsStart = System.nanoTime(); _rsOn = true; } catch (Throwable t) { _rsOn = false; }
-        try {
-            recordSpeak(groupId, sender);
-        } finally {
-            if (_rsOn) {
-                try {
-                    long d = System.nanoTime() - _rsStart;
-                    PERF_RS_N++;
-                    PERF_RS_SUM_NS += d;
-                    if (d > PERF_RS_MAX_NS) PERF_RS_MAX_NS = d;
-                } catch (Throwable t) {}
-            }
-        }
-    }
+    if (sender != null && !sender.isEmpty()) recordSpeak(groupId, sender);
+
     // ---- 群管命令统一前置: 非管理员一律静默忽略 ----
     // (查询 + 潜水 + 自检等都要管理员权限. 普通人发了不响应也不报错, 避免被探测)
     boolean isCmd = content.equals("群管帮助") || content.equals("帮助 群管") ||
@@ -1949,10 +1447,6 @@ void onHandleMsgBody(Object msg) {
                     content.startsWith("addwt ") || content.startsWith("delwt ") ||
                     content.startsWith("addgb ") || content.startsWith("delgb ") ||
                     content.startsWith("addgw ") || content.startsWith("delgw ");
-    // T1 埋点: 粗分类计数。normal = 到达 L3 采集路径的普通聊天消息; cmd = 命令消息(文本命令或后续 @ 动作)。
-    // 二者互斥: 文本命令归 cmd, 其余先记 normal, 若后面命中 @ 动作再回拨到 cmd。
-    boolean _perfCmd = isCmd;
-    try { if (isCmd) PERF_CMD_N++; else PERF_NORMAL_N++; } catch (Throwable t) {}
     if (isCmd && !isAuthorized(groupId, sender)) {
         if (content.equals("管理员")) log("admin-query auth: group=" + safeGroupDebug(groupId) + ", sender=" + safeGroupDebug(sender) + ", owner=" + isOwner(sender) + ", groupAdmin=" + isAdminInGroup(groupId, sender) + ", strict=" + isStrictMode());
         return;
@@ -2054,8 +1548,6 @@ void onHandleMsgBody(Object msg) {
                        lastTok.equals("白名单") || lastTok.equals("移除白名单") ||
                        lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
     if (!isAction) return;
-    // T1 埋点: @ 动作是命令, 之前误记为 normal, 回拨到 cmd (二者互斥)。
-    if (!_perfCmd) { try { PERF_NORMAL_N--; PERF_CMD_N++; _perfCmd = true; } catch (Throwable t) {} }
 
     if (!isAuthorized(groupId, sender)) return;       // 非管理员/群主静默 (严格模式仅群主)
 
@@ -2363,10 +1855,7 @@ void setDefaultInactiveDays(int n) {
 }
 
 int rebuildBaselineForce(String groupId) {
-    // T2′: 清空该群 first_seen (UPDATE SET first_seen=NULL, 保留 last_speak 行) → 再按当前成员重建。
-    // l3ClearFirstSeen 与 l3UpsertFirstSeen 各自持 FLUSH_LOCK, 与后台 flush 互斥; 二者之间若有后台 flush
-    // 插入, 至多补回个别 first_seen=该消息ts (取 min), 不影响"按当前成员重建为 now"的语义 (新 now 必更晚, min 留旧)。
-    l3ClearFirstSeen(groupId);
+    putString("fsg_" + groupId, "");
     return initFirstSeenBaseline(groupId);
 }
 
@@ -2462,10 +1951,7 @@ void showGroupConfigDialog(String groupId) {
     int banCount = parseCsv(getString("bl_" + groupId, "")).size();
     int wlCount = parseCsv(getString("wl_" + groupId, "")).size();
     int pCount = getProtected(groupId).size();
-    // T2′ (Reviewer B): flush-before-read — first_seen 可能仍在内存脏增量未落盘,
-    // 启用群后 30s 内直接查 DB 会误显「基线未建立」诱导误重建。读前先 flush 提交进 DB。
-    try { l3Flush(); } catch (Throwable t) {}
-    boolean baselineExists = l3CountFirstSeen(groupId) > 0;
+    boolean baselineExists = !getString("fsg_" + groupId, "").isEmpty();
     int defDays = getDefaultInactiveDays();
 
     int dp = (int) ctx.getResources().getDisplayMetrics().density;
@@ -3037,9 +2523,7 @@ void showInactiveControlDialog(String groupId) {
     final AlertDialog[] dh = new AlertDialog[1];
 
     String botPriv = botPrivState(groupId);
-    // T2′ (Reviewer B): flush-before-read — 同上, 避免 30s 窗口内误显「基线未建立」。
-    try { l3Flush(); } catch (Throwable t) {}
-    boolean baselineExists = l3CountFirstSeen(groupId) > 0;
+    boolean baselineExists = !getString("fsg_" + groupId, "").isEmpty();
     int defDays = getDefaultInactiveDays();
     int dp = (int) ctx.getResources().getDisplayMetrics().density;
 
