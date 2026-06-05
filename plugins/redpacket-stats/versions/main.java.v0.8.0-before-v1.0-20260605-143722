@@ -1,0 +1,761 @@
+// RedPacketStats — v0.8.0 (全自动链路: 检测红包 → 拉封面页 NewReceiveUI → 自动点"看看大家的手气" → NewDetailUI → 后台反射读明细)
+//
+// 链路:
+//   1. onHandleMsg(廉价): 群聊 + (type==436207665 或含 <nativeurl>) → 提 nativeurl/talker/sender →
+//      内存 Set 去重(每红包一次) → delay(LAUNCH_DELAY_MS) → hbOpenReceive() 拉封面页 NewReceiveUI。
+//   2. NewReceiveUI.onResume(classname 过滤 + identityHashCode 去重):
+//        a. delay(3000) 后台反射封面对象图(万一封面就有列表) → [HB-REFLECT] from=NewReceiveUI
+//        b. delay(2000) UI 线程【有界遍历(≤MAX_NODES 800 / 深度≤50) + 单次 performClick】点"看看大家的手气"
+//           → 微信自己流转到 NewDetailUI → [HB-CLICK]
+//   3. NewDetailUI.onResume(classname 过滤 + 去重): delay(3500) 后台反射 dump 领取者明细 → [HB-REFLECT] from=NewDetailUI
+//
+// !!! ANR 铁律 (已 ANR 两次, 本轮死守):
+//   1. 开页 = startActivity / callStaticMethod, 不遍历。
+//   2. 反射全在后台线程 + 强上界 (MAX_VISIT=4000 / MAX_DEPTH=6)。
+//   3. 查找+点击: UI 线程一次性有界遍历 (节点 ≤800 / 深度 ≤50, 到界即停) + 单次 performClick + 零文件IO (几十 ms)。
+//   4. 每个 Activity 实例 identityHashCode 去重, 只处理一次。
+//   5. onHandleMsg 只做最廉价判定 + 存值 + 排一个 delay, 绝不在热路径开页/反射/遍历。
+//   6. 全程 try/catch(Throwable), 任何异常不抛回微信。
+//
+// 反射部分 (hbReflectDump / hbIsCandidateList / hbDumpCandidate / hbFieldValue / 脱敏 / 上界) 原样
+//   保留自 v0.6/v0.7, 已被验证可用 (NewDetailUI 领取者列表读取成功)。
+
+import android.app.Activity;
+import android.content.Intent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodHook.MethodHookParam;
+import de.robv.android.xposed.XposedHelpers;
+
+// ---- 对象图遍历强上界 (ANR/卡顿防护) ----
+int MAX_VISIT = 4000;   // 反射最多访问的对象数
+int MAX_DEPTH = 6;      // 反射最大字段嵌套深度
+int MAX_CANDIDATES = 3; // 找到 2~3 个候选 List 就够, 控制 log 体量
+int DUMP_ELEMENTS = 2;  // 每个候选 List 只 dump 前 2 个元素的字段结构
+
+// cgi 异步拉回数据的等待窗口 (打开金额列表页后约 3.5 秒到位)
+int REFLECT_DELAY_MS = 3500;
+
+// ---- NewReceiveUI 子时序 ----
+int RECEIVE_REFLECT_DELAY_MS = 3000;  // 封面页落地后, 后台反射封面对象图 (万一封面就有列表)
+int RECEIVE_CLICK_DELAY_MS  = 2000;   // 封面页落地后, UI 线程有界查找 + 点 "看看大家的手气"
+
+// ---- View 树查找强上界 (UI 线程, 一次性, 零文件IO) ----
+int CLICK_MAX_NODES = 800;  // 最多遍历的 View 节点数, 到界即停
+int CLICK_MAX_DEPTH = 50;   // 最大 View 嵌套深度
+
+// ---- 自动开页延迟 ----
+// spike 用 60 秒: 红包到达后给用户 60s 领完, 然后 bot 自动拉封面页。
+// 正式版应改为 5 分钟 = 300000 (等所有人领完)。
+int LAUNCH_DELAY_MS = 60000;
+
+// 防重复注册守卫 (onLoad 可能被多次调用)
+boolean HOOKED = false;
+
+// 同一 Activity 实例只处理一次的去重集合 (线程安全)。key = identityHashCode(act)。
+// 注: NewReceiveUI 与 NewDetailUI 各自实例 hash 不同, 共用一个 Set 即可。
+java.util.Set SEEN = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+// 每个红包只自动开一次的去重集合 (线程安全)。key = nativeurl (或 fallback)。
+java.util.Set OPENED = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+String HB_REFLECT_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/reflect_probe.log";
+
+// 封面页 (标准入口, 能拉起) 与 金额列表页 (领取者明细在此) 的类名关键词
+String UI_RECEIVE = "LuckyMoneyNewReceiveUI";
+String UI_DETAIL  = "LuckyMoneyNewDetailUI";
+
+// 领取者列表元素类名关键词
+String LM_PKG = "com.tencent.mm.plugin.luckymoney";
+
+// 红包消息类型 (微信 WCPay 红包)
+int HB_MSG_TYPE = 436207665;
+
+// "看看大家的手气" 主匹配 + 兜底关键词
+String CLICK_PRIMARY = "看看大家的手气";
+String[] CLICK_FALLBACK = {"手气", "查看", "红包详情", "详情"};
+
+void onLoad() {
+    try {
+        log("RedPacketStats v0.8.0 (全自动链路: 检测红包 -> NewReceiveUI -> 点'看看大家的手气' -> NewDetailUI -> 后台反射) loaded.");
+    } catch (Throwable t) {}
+
+    if (HOOKED) {
+        try { log("RedPacketStats hook already registered, skip."); } catch (Throwable t) {}
+        return;
+    }
+    try {
+        // 一个 Activity.onResume hook, 按类名路由到 NewReceiveUI / NewDetailUI 两条处理。
+        XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                try { hbOnActivityResume(param.thisObject); } catch (Throwable t) {}
+            }
+        });
+        HOOKED = true;
+        try { log("RedPacketStats Activity.onResume hooked (route NewReceiveUI/NewDetailUI) + onHandleMsg auto-open enabled."); } catch (Throwable t) {}
+        hbBgLog("[HB-OPEN] " + hbNow() + " v0.8.0 loaded. Activity.onResume hooked (routes " + UI_RECEIVE + " & " + UI_DETAIL + "). "
+            + "onHandleMsg auto-open ON: redpacket -> delay " + LAUNCH_DELAY_MS + "ms -> open " + UI_RECEIVE
+            + " -> (delay " + RECEIVE_REFLECT_DELAY_MS + "ms bg-reflect cover) + (delay " + RECEIVE_CLICK_DELAY_MS
+            + "ms UI bounded find+click '" + CLICK_PRIMARY + "') -> " + UI_DETAIL + ".onResume -> bg-reflect dump.");
+    } catch (Throwable t) {
+        try { log("RedPacketStats hook register FAIL: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ================================================================
+// ============ onHandleMsg 红包检测 + 排程自动拉封面页 ============
+// ================================================================
+// 热路径铁律: 只做最廉价判定 + 存值 + 排一个 delay。绝不在此开页/反射/遍历/读 SQLite/全文解析。
+void onHandleMsg(Object msg) {
+    try {
+        if (msg == null) return;
+
+        // (1) 群聊闸门最廉价, 先判。失败不阻断。
+        try { if (!msg.isChatroom()) return; } catch (Throwable t) {}
+
+        // (2) 廉价判定红包本体: type==436207665 或 content 含 <nativeurl> (不解析 XML)。
+        boolean isHb = false;
+        int type = 0;
+        try { type = ((Number) msg.getType()).intValue(); } catch (Throwable t) { type = 0; }
+        if (type == HB_MSG_TYPE) isHb = true;
+
+        String content = null;
+        try { content = msg.getContent(); } catch (Throwable t) { content = null; }
+        if (!isHb) {
+            if (content == null) return;
+            if (content.indexOf("<nativeurl>") < 0) return;
+            isHb = true;
+        }
+        if (content == null) {
+            try { content = msg.getContent(); } catch (Throwable t) { content = null; }
+        }
+        if (content == null) return;
+
+        // (3) 命中才解析一小段 wcpayinfo (红包频率极低, 不在普通消息上付成本)。
+        final String nativeurl = hbGetElement(content, "wcpayinfo", "nativeurl");
+
+        String sender0 = null, talker0 = null;
+        try { sender0 = msg.getSendTalker(); } catch (Throwable t) { sender0 = null; }  // 发红包的人
+        try { talker0 = msg.getTalker(); } catch (Throwable t) { talker0 = null; }      // 群 id
+        if (sender0 == null) sender0 = talker0;
+        final String sender = sender0;
+        final String talker = talker0;
+
+        long msgid0 = 0L;
+        try { msgid0 = ((Number) msg.getMsgId()).longValue(); } catch (Throwable t) { msgid0 = 0L; }
+        final long msgid = msgid0;
+
+        // (4) 每个红包只自动拉一次。去重 key 优先 nativeurl, 没有用 talker+sender+msgid 兜底。
+        String dkey = (nativeurl != null && nativeurl.length() > 0)
+            ? nativeurl
+            : ("k:" + talker + ":" + sender + ":" + msgid);
+        if (!OPENED.add(dkey)) return;
+
+        hbBgLog("[HB-OPEN] " + hbNow() + " redpacket detected (type=" + type + ", hasNativeurl="
+            + (nativeurl != null) + "). scheduling auto-open of " + UI_RECEIVE + " in " + LAUNCH_DELAY_MS + "ms.");
+
+        // (5) 延迟自动拉封面页。delay 后调 hbOpenReceive (UI 线程: startActivity 需要)。
+        delay(LAUNCH_DELAY_MS, new Runnable() {
+            public void run() {
+                try {
+                    hbOpenReceive(nativeurl, sender, talker);
+                } catch (Throwable t) {
+                    try { log("RedPacketStats auto-open err: " + t); } catch (Throwable t2) {}
+                    hbBgLog("[HB-OPEN] " + hbNow() + " auto-open scheduled-run err: " + t);
+                }
+            }
+        });
+    } catch (Throwable t) {
+        try { log("RedPacketStats onHandleMsg err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ============ 构造 NewReceiveUI intent + 拉封面页 ============
+void hbOpenReceive(String nativeurl, String sender, String talker) {
+    try {
+        Object hostCtx = null;
+        try { hostCtx = hostContext; } catch (Throwable t) { hostCtx = null; }
+        if (hostCtx == null) {
+            try {
+                Activity top = getTopActivity();
+                if (top != null) hostCtx = top.getApplicationContext();
+            } catch (Throwable t) {}
+        }
+        if (hostCtx == null) {
+            hbBgLog("[HB-OPEN] " + hbNow() + " ABORT: no hostContext / getTopActivity null.");
+            return;
+        }
+
+        Intent intent = new Intent();
+        if (nativeurl != null) intent.putExtra("key_native_url", nativeurl);
+        if (talker != null)    intent.putExtra("key_username", talker);   // 群 id
+        intent.putExtra("key_is_self_sent", false);
+
+        hbBgLog("[HB-OPEN] " + hbNow() + " hbOpenReceive begin. extras: key_native_url=" + (nativeurl != null)
+            + ", key_username=" + (talker != null) + ", key_is_self_sent=false.");
+
+        startLuckyMoneyReceive(hostCtx, intent);
+    } catch (Throwable t) {
+        try { log("RedPacketStats hbOpenReceive err: " + t); } catch (Throwable t2) {}
+        hbBgLog("[HB-OPEN] " + hbNow() + " hbOpenReceive err: " + t);
+    }
+}
+
+// ============ 照搬的启动器 (源: 自动抢红包 startLuckyMoneyActivity) — 目标 NewReceiveUI ============
+// 优先: callStaticMethod(findClass(混淆类), 方法, hostContext, "luckymoney", ".ui.LuckyMoneyNewReceiveUI", intent)。
+// 降级: intent.setClassName(pkg, "...LuckyMoneyNewReceiveUI"); addFlags(NEW_TASK); startActivity。
+void startLuckyMoneyReceive(Object hostCtx, Intent intent) {
+    boolean success = false;
+    String landedOn = "?";
+    try {
+        String[] possibleClasses = {"nk4.l", "oq4.l", "pn4.l", "qm4.l", "rm4.l", "sm4.l", "tm4.l", "um4.l", "vm4.l", "wl4.l"};
+        String[] possibleMethods = {"A", "B", "C", "D"};
+        String activity = ".ui.LuckyMoneyNewReceiveUI";
+
+        for (int ci = 0; ci < possibleClasses.length && !success; ci++) {
+            String className = possibleClasses[ci];
+            for (int mi = 0; mi < possibleMethods.length && !success; mi++) {
+                String methodName = possibleMethods[mi];
+                try {
+                    Class clazz = XposedHelpers.findClass(className, hostCtx.getClassLoader());
+                    XposedHelpers.callStaticMethod(clazz, methodName, hostCtx, "luckymoney", activity, intent);
+                    success = true;
+                    landedOn = className + "." + methodName + " -> " + activity;
+                    hbBgLog("[HB-OPEN] " + hbNow() + " OPEN OK via callStaticMethod: " + landedOn);
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        // 降级: 直接 startActivity NewReceiveUI。
+        if (!success) {
+            hbBgLog("[HB-OPEN] " + hbNow() + " callStaticMethod all candidates failed, trying fallback startActivity.");
+            try {
+                String pkg = hostCtx.getPackageName();
+                intent.setClassName(pkg, "com.tencent.mm.plugin.luckymoney" + activity);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                hostCtx.startActivity(intent);
+                success = true;
+                landedOn = "fallback startActivity -> " + activity;
+                hbBgLog("[HB-OPEN] " + hbNow() + " OPEN OK via fallback startActivity: " + activity);
+            } catch (Throwable ignored2) {}
+        }
+
+        if (!success) {
+            hbBgLog("[HB-OPEN] " + hbNow() + " OPEN FAIL: all callStaticMethod candidates + fallback startActivity failed. "
+                + "(check wechat version / class obfuscation drift)");
+        } else {
+            hbBgLog("[HB-OPEN] " + hbNow() + " landedOn=" + landedOn
+                + " ; " + UI_RECEIVE + ".onResume will trigger: bg-reflect(delay " + RECEIVE_REFLECT_DELAY_MS
+                + "ms) + UI find+click '" + CLICK_PRIMARY + "'(delay " + RECEIVE_CLICK_DELAY_MS + "ms).");
+        }
+    } catch (Throwable t) {
+        try { log("RedPacketStats startLuckyMoneyReceive err: " + t); } catch (Throwable t2) {}
+        hbBgLog("[HB-OPEN] " + hbNow() + " startLuckyMoneyReceive err: " + t);
+    }
+}
+
+// ============ 轻量 XML 取值 (源: 自动抢红包 getElementContent), 仅红包命中时调用一次 ============
+String hbGetElement(String xmlString, String elementName, String tagName) {
+    try {
+        if (xmlString == null) return null;
+        javax.xml.parsers.DocumentBuilderFactory factory = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+        javax.xml.parsers.DocumentBuilder builder = factory.newDocumentBuilder();
+        org.xml.sax.InputSource is = new org.xml.sax.InputSource(
+            new java.io.StringReader(xmlString.replaceAll("^[^:]+:\n", "")));
+        org.w3c.dom.Document document = builder.parse(is);
+        org.w3c.dom.NodeList list = document.getElementsByTagName(elementName);
+        if (list.getLength() > 0) {
+            org.w3c.dom.Node parent = list.item(0);
+            org.w3c.dom.NodeList children = parent.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                org.w3c.dom.Node child = children.item(i);
+                if (child.getNodeName().equalsIgnoreCase(tagName)) {
+                    return child.getTextContent();
+                }
+            }
+        }
+    } catch (Throwable t) {
+        return null;
+    }
+    return null;
+}
+
+// ================================================================
+// ============ onResume 路由: NewReceiveUI / NewDetailUI ============
+// ================================================================
+// UI 线程, 极轻: 仅判类名 + 去重 + 排 delay。绝不在此反射或遍历。
+void hbOnActivityResume(Object thisObject) {
+    try {
+        if (thisObject == null) return;
+        final Activity act = (Activity) thisObject;
+        String cn = act.getClass().getName();
+        if (cn == null) return;
+
+        boolean isReceive = cn.indexOf(UI_RECEIVE) >= 0;
+        boolean isDetail  = cn.indexOf(UI_DETAIL) >= 0;
+        if (!isReceive && !isDetail) return;  // 别的页零成本 return
+
+        // 同一 Activity 实例只处理一次。
+        Integer idHash = Integer.valueOf(System.identityHashCode(act));
+        if (!SEEN.add(idHash)) return;
+
+        final String fcn = cn;
+
+        if (isReceive) {
+            hbBgLog("[HB-OPEN] " + hbNow() + " HIT " + fcn + " (cover page). schedule bg-reflect("
+                + RECEIVE_REFLECT_DELAY_MS + "ms) + UI find+click(" + RECEIVE_CLICK_DELAY_MS + "ms).");
+
+            // (a) delay 3000: 后台反射封面对象图 (万一封面就有领取列表)。
+            delay(RECEIVE_REFLECT_DELAY_MS, new Runnable() {
+                public void run() {
+                    try {
+                        new Thread() {
+                            public void run() {
+                                try { hbReflectDump(act, "NewReceiveUI"); } catch (Throwable t) {
+                                    try { log("RedPacketStats receive reflect bg err: " + t); } catch (Throwable t2) {}
+                                }
+                            }
+                        }.start();
+                    } catch (Throwable t) {
+                        try { log("RedPacketStats receive reflect schedule err: " + t); } catch (Throwable t2) {}
+                    }
+                }
+            });
+
+            // (b) delay 2000: UI 线程有界查找 + 单次点击 "看看大家的手气"。
+            delay(RECEIVE_CLICK_DELAY_MS, new Runnable() {
+                public void run() {
+                    try { hbFindAndClick(act); } catch (Throwable t) {
+                        try { log("RedPacketStats find+click err: " + t); } catch (Throwable t2) {}
+                        hbBgLog("[HB-CLICK] " + hbNow() + " find+click run err: " + t);
+                    }
+                }
+            });
+            return;
+        }
+
+        // isDetail: 金额列表页 → 后台反射 dump 明细 (v0.6 验证逻辑)。
+        hbBgLog("[HB-REFLECT] " + hbNow() + " HIT " + fcn + " (detail page). schedule bg-reflect in " + REFLECT_DELAY_MS + "ms (waiting for cgi data).");
+        delay(REFLECT_DELAY_MS, new Runnable() {
+            public void run() {
+                try {
+                    new Thread() {
+                        public void run() {
+                            try { hbReflectDump(act, "NewDetailUI"); } catch (Throwable t) {
+                                try { log("RedPacketStats detail reflect bg err: " + t); } catch (Throwable t2) {}
+                            }
+                        }
+                    }.start();
+                } catch (Throwable t) {
+                    try { log("RedPacketStats detail reflect schedule err: " + t); } catch (Throwable t2) {}
+                }
+            }
+        });
+    } catch (Throwable t) {
+        try { log("RedPacketStats onResume route err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ================================================================
+// ============ UI 线程: 有界查找 + 单次点击 "看看大家的手气" ============
+// ================================================================
+// 铁律: 一次性 BFS 遍历 DecorView, 节点 ≤CLICK_MAX_NODES(800) / 深度 ≤CLICK_MAX_DEPTH(50), 到界即停。
+//       命中即停并单次 performClick, 零文件IO (写 log 走后台线程)。几十 ms。
+void hbFindAndClick(Activity act) {
+    int[] nodes = new int[]{0};
+    String hitText = null;
+    View hitView = null;
+    boolean clicked = false;
+    try {
+        View root = null;
+        try { root = act.getWindow().getDecorView(); } catch (Throwable t) { root = null; }
+        if (root == null) {
+            hbBgLog("[HB-CLICK] " + hbNow() + " not found, nodes=0 (no DecorView).");
+            return;
+        }
+
+        // BFS 队列: Object[]{ view, depth }
+        java.util.ArrayDeque queue = new java.util.ArrayDeque();
+        queue.add(new Object[]{ root, Integer.valueOf(0) });
+
+        boolean fallbackHit = false;  // 兜底关键词命中 (主匹配优先)
+        View fbView = null; String fbText = null;
+
+        while (!queue.isEmpty()) {
+            if (nodes[0] >= CLICK_MAX_NODES) break;
+            Object[] entry = (Object[]) queue.poll();
+            View v = (View) entry[0];
+            int depth = ((Integer) entry[1]).intValue();
+            if (v == null) continue;
+            nodes[0]++;
+
+            // 读文本 (TextView 有 getText; 其它 View 跳过文本判定)。
+            String text = null;
+            if (v instanceof TextView) {
+                try {
+                    CharSequence cs = ((TextView) v).getText();
+                    if (cs != null) text = cs.toString();
+                } catch (Throwable t) { text = null; }
+            }
+            if (text != null && text.length() > 0) {
+                if (text.indexOf(CLICK_PRIMARY) >= 0) {
+                    // 主匹配: 立即命中, 停止查找。
+                    hitText = text; hitView = v;
+                    break;
+                }
+                if (!fallbackHit) {
+                    for (int i = 0; i < CLICK_FALLBACK.length; i++) {
+                        if (text.indexOf(CLICK_FALLBACK[i]) >= 0) {
+                            fallbackHit = true; fbView = v; fbText = text;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 子节点入队 (深度上界)。
+            if (depth < CLICK_MAX_DEPTH && v instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) v;
+                int childCount = 0;
+                try { childCount = vg.getChildCount(); } catch (Throwable t) { childCount = 0; }
+                for (int i = 0; i < childCount; i++) {
+                    if (nodes[0] >= CLICK_MAX_NODES) break;
+                    View child = null;
+                    try { child = vg.getChildAt(i); } catch (Throwable t) { child = null; }
+                    if (child != null) queue.add(new Object[]{ child, Integer.valueOf(depth + 1) });
+                }
+            }
+        }
+
+        // 主匹配没中, 用兜底命中。
+        if (hitView == null && fallbackHit) {
+            hitView = fbView; hitText = fbText;
+        }
+
+        if (hitView == null) {
+            hbBgLog("[HB-CLICK] " + hbNow() + " not found, nodes=" + nodes[0] + ".");
+            return;
+        }
+
+        // 命中: view 自身可点直接 performClick, 否则向上找最近可点击 parent。
+        View clickTarget = null;
+        try {
+            if (hitView.isClickable()) {
+                clickTarget = hitView;
+            } else {
+                Object p = null;
+                try { p = hitView.getParent(); } catch (Throwable t) { p = null; }
+                int up = 0;
+                while (p != null && up < CLICK_MAX_DEPTH) {
+                    if (p instanceof View) {
+                        View pv = (View) p;
+                        if (pv.isClickable()) { clickTarget = pv; break; }
+                        try { p = pv.getParent(); } catch (Throwable t) { p = null; }
+                    } else {
+                        break;
+                    }
+                    up++;
+                }
+            }
+        } catch (Throwable t) { clickTarget = null; }
+
+        // 实在找不到可点击祖先, 退回对命中 view 本身 performClick (有的 TextView 自身就处理点击)。
+        if (clickTarget == null) clickTarget = hitView;
+
+        try {
+            clicked = clickTarget.performClick();
+        } catch (Throwable t) {
+            clicked = false;
+            hbBgLog("[HB-CLICK] " + hbNow() + " performClick threw: " + t);
+        }
+
+        hbBgLog("[HB-CLICK] " + hbNow() + " hit='" + hbTextSkeleton(hitText) + "' clicked=" + clicked
+            + " (nodes=" + nodes[0] + ", targetClickable=" + safeIsClickable(clickTarget) + ").");
+    } catch (Throwable t) {
+        hbBgLog("[HB-CLICK] " + hbNow() + " find+click err: " + t + " (nodes=" + nodes[0] + ").");
+    }
+}
+
+boolean safeIsClickable(View v) {
+    try { return v != null && v.isClickable(); } catch (Throwable t) { return false; }
+}
+
+// 文本骨架: 只取前 12 字 + 长度, 避免 log 噪声 (UI 文案非敏感, 但仍限长)。
+String hbTextSkeleton(String s) {
+    try {
+        if (s == null) return "null";
+        String t = s.replace('\n', ' ').trim();
+        if (t.length() <= 12) return t;
+        return t.substring(0, 12) + "…(len=" + t.length() + ")";
+    } catch (Throwable t) { return "?"; }
+}
+
+// ================================================================
+// ============ 以下为反射部分 (v0.6/v0.7 原样保留, 仅加 from= 标签) ============
+// ================================================================
+
+// 纯反射: 在对象图里找"领取者列表" (后台线程, 零 View 调用)。
+// BFS 遍历 root (Activity 实例) 对象图, 队列 + visited 去重防环, 强上界 MAX_VISIT/MAX_DEPTH。
+void hbReflectDump(Object root, String from) {
+    StringBuilder sb = new StringBuilder(16384);
+    sb.append("[HB-REFLECT] ============================================\n");
+    sb.append("[HB-REFLECT] ").append(hbNow()).append(" DUMP from=").append(from).append(" root=")
+      .append(root == null ? "null" : root.getClass().getName()).append("\n");
+
+    if (root == null) { hbBgLog(sb.toString()); return; }
+
+    java.util.Set visited = new java.util.HashSet();
+    java.util.ArrayDeque queue = new java.util.ArrayDeque();
+    queue.add(new Object[]{ root, root.getClass().getSimpleName(), Integer.valueOf(0) });
+    visited.add(Integer.valueOf(System.identityHashCode(root)));
+
+    int visitCount = 0;
+    int candidateCount = 0;
+
+    try {
+        while (!queue.isEmpty()) {
+            if (visitCount >= MAX_VISIT) break;
+            if (candidateCount >= MAX_CANDIDATES) break;
+
+            Object[] entry = (Object[]) queue.poll();
+            Object obj = entry[0];
+            String path = (String) entry[1];
+            int depth = ((Integer) entry[2]).intValue();
+            visitCount++;
+
+            if (obj == null) continue;
+
+            if (candidateCount < MAX_CANDIDATES && hbIsCandidateList(obj)) {
+                candidateCount++;
+                try { hbDumpCandidate(obj, path, sb, candidateCount); } catch (Throwable t) {
+                    sb.append("[HB-REFLECT] candidate dump fail at ").append(path).append(" : ").append(t).append("\n");
+                }
+                continue;
+            }
+
+            if (depth >= MAX_DEPTH) continue;
+
+            Class c = obj.getClass();
+            if (hbIsLeaf(obj)) continue;
+
+            int superHops = 0;
+            while (c != null && superHops <= 3) {
+                if (visitCount >= MAX_VISIT) break;
+                java.lang.reflect.Field[] fields = null;
+                try { fields = c.getDeclaredFields(); } catch (Throwable t) { fields = null; }
+                if (fields != null) {
+                    for (int i = 0; i < fields.length; i++) {
+                        if (visitCount >= MAX_VISIT) break;
+                        java.lang.reflect.Field f = fields[i];
+                        try {
+                            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                            f.setAccessible(true);
+                            Object child = null;
+                            try { child = f.get(obj); } catch (Throwable t) { continue; }
+                            if (child == null) continue;
+                            Integer h = Integer.valueOf(System.identityHashCode(child));
+                            if (visited.contains(h)) continue;
+                            visited.add(h);
+                            if (hbIsLeaf(child)) continue;
+                            String childPath = path + "." + f.getName() + "(" + hbShort(f.getType().getName()) + ")";
+                            queue.add(new Object[]{ child, childPath, Integer.valueOf(depth + 1) });
+                        } catch (Throwable t) {
+                            continue;
+                        }
+                    }
+                }
+                try { c = c.getSuperclass(); } catch (Throwable t) { c = null; }
+                superHops++;
+            }
+        }
+    } catch (Throwable t) {
+        sb.append("[HB-REFLECT] BFS fail: ").append(t).append("\n");
+    }
+
+    if (candidateCount == 0) {
+        sb.append("[HB-REFLECT] from=").append(from).append(" no candidate list found, visited=").append(visitCount).append("\n");
+    } else {
+        sb.append("[HB-REFLECT] from=").append(from).append(" done: candidates=").append(candidateCount)
+          .append(", visited=").append(visitCount).append("\n");
+    }
+    sb.append("[HB-REFLECT] ============================================\n");
+
+    hbBgLog(sb.toString());
+}
+
+// 候选判定: 非空 List 或数组, 元素类名匹配领取者特征。
+boolean hbIsCandidateList(Object obj) {
+    try {
+        Object firstElem = null;
+        int size = 0;
+        if (obj instanceof java.util.List) {
+            java.util.List lst = (java.util.List) obj;
+            size = lst.size();
+            if (size == 0) return false;
+            firstElem = lst.get(0);
+        } else if (obj.getClass().isArray()) {
+            size = java.lang.reflect.Array.getLength(obj);
+            if (size == 0) return false;
+            firstElem = java.lang.reflect.Array.get(obj, 0);
+        } else {
+            return false;
+        }
+        if (firstElem == null) return false;
+        String ecn = firstElem.getClass().getName();
+        if (ecn == null) return false;
+        if (ecn.startsWith(LM_PKG)) return true;
+        String low = ecn.toLowerCase();
+        if (low.indexOf("receiver") >= 0 || low.indexOf("detail") >= 0
+            || low.indexOf("hb") >= 0 || low.indexOf("member") >= 0
+            || low.indexOf("luckymoney") >= 0) return true;
+        return false;
+    } catch (Throwable t) {
+        return false;
+    }
+}
+
+// dump 一个候选 List: 路径 + size + 元素类名 + 前 2 元素字段结构。
+void hbDumpCandidate(Object obj, String path, StringBuilder sb, int idx) {
+    int size = 0;
+    java.util.List asList = null;
+    boolean isArr = false;
+    if (obj instanceof java.util.List) {
+        asList = (java.util.List) obj;
+        size = asList.size();
+    } else if (obj.getClass().isArray()) {
+        isArr = true;
+        size = java.lang.reflect.Array.getLength(obj);
+    }
+    Object first = isArr ? java.lang.reflect.Array.get(obj, 0) : asList.get(0);
+    String elemCn = (first == null) ? "null" : first.getClass().getName();
+
+    sb.append("[HB-REFLECT] >>> CANDIDATE #").append(idx).append("\n");
+    sb.append("[HB-REFLECT]     path = ").append(path).append("\n");
+    sb.append("[HB-REFLECT]     containerType = ").append(obj.getClass().getName()).append("\n");
+    sb.append("[HB-REFLECT]     size = ").append(size).append("\n");
+    sb.append("[HB-REFLECT]     elemClass = ").append(elemCn).append("\n");
+
+    int dumpN = size < DUMP_ELEMENTS ? size : DUMP_ELEMENTS;
+    for (int e = 0; e < dumpN; e++) {
+        Object el = isArr ? java.lang.reflect.Array.get(obj, e) : asList.get(e);
+        sb.append("[HB-REFLECT]     --- element[").append(e).append("] ---\n");
+        if (el == null) { sb.append("[HB-REFLECT]       (null)\n"); continue; }
+        try {
+            Class ec = el.getClass();
+            int hops = 0;
+            while (ec != null && hops <= 3) {
+                java.lang.reflect.Field[] fs = null;
+                try { fs = ec.getDeclaredFields(); } catch (Throwable t) { fs = null; }
+                if (fs != null) {
+                    for (int i = 0; i < fs.length; i++) {
+                        java.lang.reflect.Field f = fs[i];
+                        try {
+                            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                            f.setAccessible(true);
+                            String fname = f.getName();
+                            String ftype = f.getType().getName();
+                            Object fv = null;
+                            try { fv = f.get(el); } catch (Throwable t) { continue; }
+                            sb.append("[HB-REFLECT]       ").append(fname)
+                              .append(" : ").append(ftype)
+                              .append(" = ").append(hbFieldValue(fv)).append("\n");
+                        } catch (Throwable t) {
+                            continue;
+                        }
+                    }
+                }
+                try { ec = ec.getSuperclass(); } catch (Throwable t) { ec = null; }
+                hops++;
+            }
+        } catch (Throwable t) {
+            sb.append("[HB-REFLECT]       element dump fail: ").append(t).append("\n");
+        }
+    }
+}
+
+// 字段值脱敏渲染。数字原样 (金额=分)。wxid/url 截前 6 + len。短 String 原样 (昵称)。
+String hbFieldValue(Object v) {
+    try {
+        if (v == null) return "null";
+        if (v instanceof Number) return v.toString();
+        if (v instanceof java.math.BigDecimal) return v.toString();
+        if (v instanceof Boolean) return v.toString();
+        if (v instanceof Character) return "'" + v + "'";
+        if (v instanceof String) {
+            String s = (String) v;
+            String low = s.toLowerCase();
+            boolean sensitive =
+                low.indexOf("wxid_") >= 0 ||
+                low.indexOf("@chatroom") >= 0 ||
+                low.indexOf("http") >= 0 ||
+                low.indexOf("wxpay") >= 0 ||
+                low.indexOf("://") >= 0;
+            if (sensitive) {
+                String head = s.length() <= 6 ? s : s.substring(0, 6);
+                return "'" + head + "'…(wxid/url, len=" + s.length() + ")";
+            }
+            if (s.length() > 12) {
+                String head = s.length() <= 4 ? s : s.substring(0, 4);
+                return "'" + head + "'…(len=" + s.length() + ")";
+            }
+            return "'" + s + "'(len=" + s.length() + ")";
+        }
+        if (v instanceof java.util.List) {
+            return "List@(size=" + ((java.util.List) v).size() + ")";
+        }
+        if (v.getClass().isArray()) {
+            return v.getClass().getName() + "@(len=" + java.lang.reflect.Array.getLength(v) + ")";
+        }
+        return v.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(v));
+    } catch (Throwable t) {
+        return "<value err>";
+    }
+}
+
+// 叶子值: 不值得展开其字段 (基本包装/String/枚举/Class)。
+boolean hbIsLeaf(Object o) {
+    if (o == null) return true;
+    if (o instanceof Number) return true;
+    if (o instanceof String) return true;
+    if (o instanceof Boolean) return true;
+    if (o instanceof Character) return true;
+    if (o instanceof Enum) return true;
+    if (o instanceof Class) return true;
+    if (o instanceof java.math.BigDecimal) return true;
+    return false;
+}
+
+// 类名取最后一段, log 更短。
+String hbShort(String cn) {
+    if (cn == null) return "?";
+    int i = cn.lastIndexOf('.');
+    return i < 0 ? cn : cn.substring(i + 1);
+}
+
+// 后台线程一次性 append 写文件。失败只 log, 不抛。
+void hbBgLog(final String content) {
+    try {
+        new Thread() {
+            public void run() {
+                try {
+                    java.io.FileWriter fw = new java.io.FileWriter(HB_REFLECT_LOG, true);
+                    try { fw.write(content); fw.write("\n"); } finally { fw.close(); }
+                } catch (Throwable t) {
+                    try { log("RedPacketStats bg write fail: " + t); } catch (Throwable t2) {}
+                }
+            }
+        }.start();
+    } catch (Throwable t) {
+        try { log("RedPacketStats bg thread fail: " + t); } catch (Throwable t2) {}
+    }
+}
+
+String hbNow() {
+    try {
+        return new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date());
+    } catch (Throwable t) { return "?"; }
+}
+
+void onUnload() {}
