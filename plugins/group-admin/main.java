@@ -1,4 +1,4 @@
-// GroupAdmin v1.14.0 - 群管理: 踢人 / 拉黑 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.15.0 - 群管理: 踢人 / 拉黑 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
 // 完整命令清单见 README.md 或 WAuxiliary 主面板插件列表 → 设置 (openSettings)
 // 重要变化历程:
 //   - v1.7: 潜水成员清理 (#潜水 N / #踢潜水) + bot 群管权限自检 (#群权限自检)
@@ -11,10 +11,11 @@
 //            警告详情 (@TA 警告详情) / 清除警告名单 (一键全清, 仅群主) / 严格模式 (仅群主)
 //            doWarn 加时间+来源记录; GUI 主 Dialog 加白名单按钮
 //   - v1.13: 微信原生群主/管理员保护, 支持自动探测 + 手动登记 fallback
-//   - v1.15: 潜水采集 (lsg_/fsg_) 落盘从 config.prop 整群 CSV pivot 到自有 SQLite 库 (groupadmin.db)
-//            热路径仍只写内存增量 (O(1)); 后台批量 UPSERT; onLoad 一次性迁移 CSV→DB (VH-01 / RB-1/RB-2)
-//   - W2: 引用回复触发动作修复 — 引用回复是 appmsg(isText=false), 动作词在 <title>, target=getQuoteMsg().getSendTalker();
-//         getQuoteMsg() 仅 !isText 时调 (C-PERF-01); 删除 [QDIAG]/[QUOTE-PROBE] 临时探针
+//   - v1.14: 管理员权限按群拆分 (admins_<groupId>); 微信原生管理员用本群体系
+//   - v1.15: [性能] 潜水采集 (lsg_/fsg_) 落盘从 config.prop 整群 CSV pivot 到自有 SQLite (groupadmin.db);
+//            热路径只写内存增量 O(1) + 后台批量 UPSERT + onLoad 一次性迁移 CSV→DB (消除 VH-01 消息卡顿)
+//            [警告增强] 引用回复(非@)可触发全部管理动作 (appmsg, 动作词在 <title>, target=getQuoteMsg().getSendTalker());
+//            警告自动踢上限默认 3→10 且每群可经设置 Dialog / `警告上限 N` 自定义; 满上限踢出成功后清零计数
 // 不再过滤 isSend() — 机器人账号自己发命令也响应
 
 import java.util.*;
