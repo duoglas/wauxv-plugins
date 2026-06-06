@@ -1,3 +1,4 @@
+- [项目当前状态/挂起项](project-status.md) — 换机器/新 session 先看这条；部署版本+真机收尾项+迁移状态
 - [存储底座 SQLite over CSV](storage-substrate-sqlite-over-csv.md) — 遇存储瓶颈先质疑底座再打补丁；BeanShell 可驱动 SQLite
 - [recordSpeak 重构进度](recordspeak-refactor-progress.md) — VH-01 消除，已 pivot SQLite，进行中
 - [BeanShell 解析比 javac 严](beanshell-parser-stricter-than-javac.md) — 部署前用 bsh-2.0b6 离线全文解析(去 final)验语法
