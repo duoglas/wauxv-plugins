@@ -1,0 +1,4 @@
+- [存储底座 SQLite over CSV](storage-substrate-sqlite-over-csv.md) — 遇存储瓶颈先质疑底座再打补丁；BeanShell 可驱动 SQLite
+- [recordSpeak 重构进度](recordspeak-refactor-progress.md) — VH-01 消除，已 pivot SQLite，进行中
+- [BeanShell 解析比 javac 严](beanshell-parser-stricter-than-javac.md) — 部署前用 bsh-2.0b6 离线全文解析(去 final)验语法
+- [WAuxiliary getString 是 FUSE IO](waux-getstring-fuse-io-cache-hotpath.md) — 每次读盘 ~26ms，热路径上的配置读必须内存缓存

@@ -1,5 +1,16 @@
 # CLAUDE.md
 
+## 环境自检 / 跨机器接力（每个新 session 先做）
+
+本仓库随 **Dropbox** 在多台 Mac 间同步，工作目录可能在任意机器的 `~/Dropbox/<…>-work/android-ops`。**新 session 开始时：**
+
+1. 先跑环境自检：`bash scripts/bootstrap.sh`（识别本机、检查 adb/scrcpy/手机/root、显示插件版本、本机记忆为空时自动从快照 seed）。
+2. **读 `docs/memory-snapshot/MEMORY.md` 及其引用的记忆条目接上下文**——这是跨机器权威记忆副本（随 Dropbox 走），不依赖某台机器的 `~/.claude`。
+3. 迁移/环境细节看 `docs/ONBOARDING.md`。
+4. 写了新记忆后，把 `~/.claude/.../memory/*.md` 同步回 `docs/memory-snapshot/`（否则别的机器接不到）。
+
+设备：Pixel 8a (`44151JEKB08662` / akita)，USB + `scrcpy` 看屏幕。
+
 ## 项目简介
 
 安卓设备运维总仓——通过 `adb` 管理一台 Pixel 8a (akita / Android 16 / Magisk root) 上的：WAuxiliary 微信增强模块的自定义 BeanShell 插件、keepalive 保活 Magisk 模块、以及设备隐藏与网络配置。开发与运维全程靠 adb 连真机进行，没有传统应用代码与编译链。
