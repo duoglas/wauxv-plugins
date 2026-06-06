@@ -50,6 +50,7 @@
 | C-PLUGIN-02 | 改动 `main.java` 前先在 `versions/` 或设备 `*.before-*` 留可追溯旧版（现已纳入 git）。 | 出问题要能快速对比/回滚。 | 无法定位哪次改动引入回归。 |
 | C-PLUGIN-03 | 每个插件必须有 **spec 文档**（`plugins/<name>/SPEC.md`）：描述功能、hook 点、动作的 L1/L2/L3 分层、数据存储结构与上界、降级策略。**改行为先改 spec 再改代码。** | spec 是 review/测试/重构的对照基准，避免凭记忆改。 | 行为漂移、性能/正确性无对照。 |
 | C-PLUGIN-04 | **充分测试**：无单测框架下建立真机测试矩阵（正常消息 / 各管理命令 / 高频积压 / 大群 / 边界与异常消息类型），关键场景每次改动回归并留证据。 | 微信版本/群规模变化会让 hook 失效（已见红包个数 ArrayIndexOutOfBounds）。 | 回归无人发现，线上群出事。 |
+| C-PLUGIN-05 | `onLoad` 必须对微信登录态/通讯录未就绪健壮：任何依赖登录态的调用（`getLoginWxid` 等，冷启动早期会抛 `NoResetUinStack`）必须 try/catch 兜底；**cosmetic 调用（日志拼串等）绝不能阻断关键初始化**（后台 flush 循环启动、内存缓存填充、延迟基线调度）。关键初始化分段 try/catch，互不连坐；登录态相关的一次性初始化应延迟/重试到就绪。 | 微信冷启动时 onLoad 可能先于登录态恢复执行，一处早抛会中断整段初始化，导致 flush 循环不启动（脏增量不落盘、强杀丢数据）等隐性降级。 | onLoad 早期异常静默吞掉关键初始化，插件半瘫且不易察觉。 |
 
 ## [SEC]
 
@@ -71,3 +72,4 @@
 | ID | 日期 | 发生了什么 | 根因 | 对应约束 |
 |---|---|---|---|---|
 | VH-01 | 2026-06-05 | GroupAdmin `recordSpeak` 每条群消息对全群发言时间 CSV 做读-解析-改一条-序列化-写回(O(群人数))，`lsg_/fsg_` 随时间膨胀使 config.prop 涨到 66KB，微信收消息严重延迟、私聊群聊都卡；关 WAuxiliary 总开关即恢复。本质是把 L3 统计类工作同步压在消息热路径上，且无性能埋点拖到用户实测才暴露。 | onHandleMsg 热路径上的 O(N) 全量读写 + 单 key 无上界 + L3 未异步降级 + 无埋点。 | C-PERF-01, C-PERF-02, C-PERF-04, C-ARCH-01, C-ARCH-02 |
+| VH-02 | 2026-06-07 | GroupAdmin 在微信冷重启(00:29)时 `onLoad` 第一行日志拼串调 `getLoginWxid()`，因登录态未就绪抛 `zt0.c: NoResetUinStack`，导致整段 onLoad 中断——后台 L3 flush 循环未启动、延迟基线复查未排程。插件消息路径仍懒恢复(owner 探测/recordSpeak 正常)，但处于隐性降级(脏增量缺定时 flush)。watchdog 真机监控捕获。 | onLoad 早期对登录态未就绪无防御，一句 cosmetic 日志的 getLoginWxid 连坐关键初始化。 | C-PLUGIN-05 |

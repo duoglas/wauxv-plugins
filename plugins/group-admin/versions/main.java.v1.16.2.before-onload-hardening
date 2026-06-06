@@ -1,4 +1,4 @@
-// GroupAdmin v1.16.3 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.16.2 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
 // 完整命令清单见 README.md 或 WAuxiliary 主面板插件列表 → 设置 (openSettings)
 // 重要变化历程:
 //   - v1.7: 潜水成员清理 (#潜水 N / #踢潜水) + bot 群管权限自检 (#群权限自检)
@@ -26,9 +26,6 @@
 //   - v1.16.2: [性能] enabled 群内存缓存(消除每条消息 FUSE 读, seg2 ~26ms→~0) — isGroupEnabled 不再每条消息读
 //              config.prop, 改 ENABLED_CACHE HashSet (TTL 60s 兜底外部改动; enable/disable 变更后立即刷新保即时生效);
 //              加载失败保留旧缓存, 缓存异常回退直接读 (闸门正确性优先)。仅动 isGroupEnabled 读路径+缓存维护。
-//   - v1.16.3: [健壮性/C-PLUGIN-05] onLoad 防御登录态未就绪——getLoginWxid 安全取值 (取不到用占位串, 日志永不抛) +
-//              关键初始化分段 try/catch (日志块/延迟基线调度块/flush 循环启动块互不连坐); 修 VH-02 冷启动
-//              getLoginWxid 抛 NoResetUinStack 导致 onLoad 第一行中断、flush 循环不启动而丢脏增量。仅动 onLoad, 不碰热路径。
 // 不再过滤 isSend() — 机器人账号自己发命令也响应
 
 import java.util.*;
@@ -1822,57 +1819,38 @@ String lookupName(String wxid, String groupId) {
 
 // ========== 生命周期 ==========
 void onLoad() {
-    // [C-PLUGIN-05] 日志块: getLoginWxid 安全取值 (冷启动登录态/UIN栈未就绪会抛 NoResetUinStack),
-    // 这里只是 cosmetic 日志, 取不到用占位串, 且整块 try/catch, 绝不阻断后续关键初始化。
-    try {
-        List enabled = getEnabledGroups();
-        String _owner;
-        try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
-        if (_owner == null) _owner = "(login pending)";
-        log("GroupAdmin v1.16.3 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
-    } catch (Throwable t) {
-        try { log("GroupAdmin v1.16.3 onLoad log block err: " + t); } catch (Throwable t2) {}
-    }
+    List enabled = getEnabledGroups();
+    log("GroupAdmin v1.16.2 loading, owner=" + getLoginWxid() + ", enabled groups=" + enabled.size());
 
-    // [C-PLUGIN-05] 延迟基线调度块: 本身不依赖 getLoginWxid; 单独 try/catch 互不连坐。
     // 延迟 5 秒, 等微信进程把通讯录数据加载好, 再 (一次性迁移 CSV→DB) + 扫已启用但没基线的群
-    try {
-        delay(5000, new Runnable() {
-            public void run() {
-                // T2′: 一次性迁移旧 lsg_/fsg_ CSV → SQLite (migrated 标志守卫只迁一次, 不阻塞加载)。
-                try { l3MigrateCsvToDb(); } catch (Throwable t) { try { log("l3 migrate err: " + t); } catch (Throwable t2) {} }
+    delay(5000, new Runnable() {
+        public void run() {
+            // T2′: 一次性迁移旧 lsg_/fsg_ CSV → SQLite (migrated 标志守卫只迁一次, 不阻塞加载)。
+            try { l3MigrateCsvToDb(); } catch (Throwable t) { try { log("l3 migrate err: " + t); } catch (Throwable t2) {} }
 
-                List groups = getEnabledGroups();
-                int touched = 0;
-                int totalAdded = 0;
-                for (int i = 0; i < groups.size(); i++) {
-                    String g = (String) groups.get(i);
-                    if (l3CountFirstSeen(g) > 0) continue;   // T2′: 已有基线 (DB 查), 跳过
-                    int added = initFirstSeenBaseline(g);
-                    if (added > 0) { touched++; totalAdded += added; }
-                }
-                log("GroupAdmin v1.16.3 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
-                // _probeGroupInfoAPI();
+            List groups = getEnabledGroups();
+            int touched = 0;
+            int totalAdded = 0;
+            for (int i = 0; i < groups.size(); i++) {
+                String g = (String) groups.get(i);
+                if (l3CountFirstSeen(g) > 0) continue;   // T2′: 已有基线 (DB 查), 跳过
+                int added = initFirstSeenBaseline(g);
+                if (added > 0) { touched++; totalAdded += added; }
             }
-        });
-    } catch (Throwable t) {
-        try { log("l3 baseline schedule fail: " + t); } catch (Throwable t2) {}
-    }
-
-    // [C-PLUGIN-05] flush 循环启动块: 关键! 单独 try/catch, 不被前面任何块连累。
-    // T2/T2′: 启动 L3 后台 flush 循环 (内存脏增量 → SQLite UPSERT + 顺带 perf 落盘)。防重复启动。
-    try {
-        if (!L3_flushStarted) {
-            L3_flushStarted = true;
-            try {
-                delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
-            } catch (Throwable t) {
-                L3_flushStarted = false;
-                try { log("l3 flush loop start fail: " + t); } catch (Throwable t2) {}
-            }
+            log("GroupAdmin v1.16.2 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+            // _probeGroupInfoAPI();
         }
-    } catch (Throwable t) {
-        try { log("l3 flush loop start block fail: " + t); } catch (Throwable t2) {}
+    });
+
+    // T2/T2′: 启动 L3 后台 flush 循环 (内存脏增量 → SQLite UPSERT + 顺带 perf 落盘)。防重复启动。
+    if (!L3_flushStarted) {
+        L3_flushStarted = true;
+        try {
+            delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
+        } catch (Throwable t) {
+            L3_flushStarted = false;
+            try { log("l3 flush loop start fail: " + t); } catch (Throwable t2) {}
+        }
     }
 }
 void onUnload() {
