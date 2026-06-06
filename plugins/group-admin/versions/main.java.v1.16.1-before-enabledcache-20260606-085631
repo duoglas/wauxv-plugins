@@ -1,4 +1,4 @@
-// GroupAdmin v1.16.2 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.16.1 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
 // 完整命令清单见 README.md 或 WAuxiliary 主面板插件列表 → 设置 (openSettings)
 // 重要变化历程:
 //   - v1.7: 潜水成员清理 (#潜水 N / #踢潜水) + bot 群管权限自检 (#群权限自检)
@@ -23,9 +23,6 @@
 //            仅动黑名单增删入口; 踢/警告/保护/管理员/潜水/SQLite 落盘等一律未动。
 //   - v1.16.1: [诊断] onHandleMsg 分段计时埋点(诊断用) — 普通消息路径 seg1~seg5 (nanoTime+整型累加),
 //              perf.log 追加 seg{1..5}_avg_us/max_us 列, 定位 ~26ms 去向; 不改任何业务逻辑。
-//   - v1.16.2: [性能] enabled 群内存缓存(消除每条消息 FUSE 读, seg2 ~26ms→~0) — isGroupEnabled 不再每条消息读
-//              config.prop, 改 ENABLED_CACHE HashSet (TTL 60s 兜底外部改动; enable/disable 变更后立即刷新保即时生效);
-//              加载失败保留旧缓存, 缓存异常回退直接读 (闸门正确性优先)。仅动 isGroupEnabled 读路径+缓存维护。
 // 不再过滤 isSend() — 机器人账号自己发命令也响应
 
 import java.util.*;
@@ -1630,43 +1627,10 @@ void showProtected(String groupId) {
 }
 
 // 启用群名单 (按群启用,默认全部关)
-// v1.16.2: [性能/C-PERF-01,03] 启用群集合内存缓存 — 消除 isGroupEnabled 每条消息读 FUSE config.prop (~26ms/条)。
-//   ENABLED_CACHE 存 normGroupId 后的群 id; TTL 60s 兜底外部 adb 改 config.prop; enable/disable 变更后立即刷新保即时生效。
-//   加载失败保留旧缓存 (降级安全); isGroupEnabled 异常时回退直接读 getString (宁可慢不可错: 这是插件在本群是否生效的总闸门)。
-java.util.HashSet ENABLED_CACHE = null;   // 已启用群 id 集合 (normGroupId 后); null=尚未加载
-long ENABLED_CACHE_TS = 0;                 // 上次加载毫秒
-long ENABLED_TTL_MS   = 60000;             // 缓存 TTL: 外部改 config.prop 最多此时长后生效
-
-// 从 config.prop 读 enabled_groups, 全量 norm 后原子替换 ENABLED_CACHE。失败保留旧缓存只 log。
-void loadEnabledCache() {
-    try {
-        List l = parseCsv(getString("enabled_groups", ""));
-        java.util.HashSet ns = new java.util.HashSet();
-        for (int i = 0; i < l.size(); i++) {
-            String g = normGroupId((String) l.get(i));
-            if (!g.isEmpty()) ns.add(g);
-        }
-        ENABLED_CACHE = ns;            // 原子替换
-        ENABLED_CACHE_TS = System.currentTimeMillis();
-    } catch (Throwable t) {
-        log("loadEnabledCache failed (keep old cache): " + t);
-    }
-}
-
 List getEnabledGroups() { return parseCsv(getString("enabled_groups", "")); }
 boolean isGroupEnabled(String groupId) {
     String g = normGroupId(groupId);
     if (g.isEmpty()) return false;
-    try {
-        long now = System.currentTimeMillis();
-        if (ENABLED_CACHE == null || (now - ENABLED_CACHE_TS) > ENABLED_TTL_MS) {
-            loadEnabledCache();
-        }
-        if (ENABLED_CACHE != null) return ENABLED_CACHE.contains(g);
-    } catch (Throwable t) {
-        log("isGroupEnabled cache error, fallback to direct read: " + t);
-    }
-    // 回退: 缓存出错时直接读 (保证正确性, 与原逻辑完全一致)
     List l = getEnabledGroups();
     for (int i = 0; i < l.size(); i++) {
         if (g.equals(normGroupId((String) l.get(i)))) return true;
@@ -1682,7 +1646,6 @@ void enableGroup(String groupId) {
     }
     l.add(g);
     putString("enabled_groups", joinCsv(l));
-    loadEnabledCache();   // 变更即时失效: 启用后下一条消息立即生效
 }
 // 包装: 启用 + 建立潜水基线, 返回新增的 first_seen 人数
 int enableGroupWithBaseline(String groupId) {
@@ -1697,7 +1660,6 @@ void disableGroup(String groupId) {
         if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
     }
     if (changed) putString("enabled_groups", joinCsv(l));
-    loadEnabledCache();   // 变更即时失效: 停用后下一条消息立即不再管该群
 }
 
 // 群主 (owners) — 顶层权限,机器人账号自动是
@@ -1820,7 +1782,7 @@ String lookupName(String wxid, String groupId) {
 // ========== 生命周期 ==========
 void onLoad() {
     List enabled = getEnabledGroups();
-    log("GroupAdmin v1.16.2 loading, owner=" + getLoginWxid() + ", enabled groups=" + enabled.size());
+    log("GroupAdmin v1.16.1 loading, owner=" + getLoginWxid() + ", enabled groups=" + enabled.size());
 
     // 延迟 5 秒, 等微信进程把通讯录数据加载好, 再 (一次性迁移 CSV→DB) + 扫已启用但没基线的群
     delay(5000, new Runnable() {
@@ -1837,7 +1799,7 @@ void onLoad() {
                 int added = initFirstSeenBaseline(g);
                 if (added > 0) { touched++; totalAdded += added; }
             }
-            log("GroupAdmin v1.16.2 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+            log("GroupAdmin v1.16.1 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
             // _probeGroupInfoAPI();
         }
     });

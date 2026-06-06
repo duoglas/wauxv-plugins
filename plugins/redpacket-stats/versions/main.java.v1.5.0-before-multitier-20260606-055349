@@ -1,47 +1,4 @@
-// RedPacketStats — v1.6.4 — 在 v1.6.3 之上: enabled 群内存缓存(消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms)。
-//
-// v1.6.4: [性能/C-PERF-01,03] 启用群集合内存缓存 (仿 GroupAdmin v1.16.2)。消除红包消息热路径最后一处 per-红包 FUSE 读:
-//         onHandleMsgBody 的 isGroupEnabled → getEnabledGroups → getString(K_ENABLED) 原每个红包候选读一次 config.prop (~26ms)。
-//         新增顶层 RP_ENABLED_CACHE(HashSet,normGroupId 后)/RP_ENABLED_CACHE_TS/RP_ENABLED_TTL_MS(60s)。rpLoadEnabledCache() 全量 norm 后原子替换。
-//         isGroupEnabled: 缓存 null 或超 TTL → rpLoadEnabledCache(), 然后 contains; 整段 try/catch, 异常回退原"直接 getString 遍历"(宁可慢不可错)。
-//         enableGroup/disableGroup putString 后立即 rpLoadEnabledCache() — 开启/关闭红包统计下一个红包即时生效, 不等 TTL。
-//         归一口径与原 isGroupEnabled 完全一致(normGroupId=trim)。加载失败保留旧缓存只 log。只动 isGroupEnabled 读路径+缓存维护,
-//         不碰检测/入队/worker/分档/发送/统计/定时/导出; spike 归因埋点保留(验证红包热路径耗时进一步降)。
-//         其它只读 getEnabledGroups() 调用(每日迁移/daily groups, 非热路径)保持原 getString(不影响正确性)。
-//
-// v1.6.2: spike 归因埋点 (诊断用, 仿 v1.4.0 PERF_* 风格, 绝不反噬热路径)。
-//         目的: 区分 "每 ~200 条出现 1 次 200-370ms onHandleMsg max spike" 是 (A)真红包那条在热路径做重活,
-//         还是 (B)GC/框架抖动。新增一组顶层 long/int 累加 (只 nanoTime+整型, 无 IO/log/反射):
-//         1. A/B 分类计时: 每条 onHandleMsg 耗时按 红包消息(A, PERF_RP_*)/普通消息(B, PERF_NORM_*) 分别累加 sum/max/count。
-//            A/B 判定: onHandleMsgBody 过完"命中检测(isHb)+本群启用"闸门即置顶层标记 PERF_LAST_RP=true (走 extract+入队"重活"路径);
-//            未命中/未启用快速 return 的为 B。wrapper finally 读标记分类。每条进入前 wrapper 先清标记。
-//         2. spike 标记: 单条耗时 > PERF_SPIKE_NS(50ms) → PERF_SPIKE_N++, 并分 PERF_SPIKE_RP_N(spike且红包)/PERF_SPIKE_NORM_N(spike且普通)。
-//            关键判据: spike 几乎全落普通消息(B) → 大概率 GC/框架抖动(与本插件无关); spike 集中在红包消息(A) → extract/入队在热路径做了重活, 需移后台。
-//         3. perf flush 落盘行追加: rp_msg_n/rp_msg_avg_us/rp_msg_max_us/norm_avg_us/norm_max_us/spike_n/spike_rp/spike_norm + (可选)rp_extract_*。窗口重置时同步清零。
-//         4. (可选细计时) 红包消息内部单量 rpExtractTitle(XML parse) 耗时 → PERF_EXTRACT_* (rp_extract_avg_us/max_us), 帮进一步定位重活点。仅 nanoTime, 无新 IO/反射。
-//         严格不碰任何业务逻辑(检测/extract/入队/队列/分档/发送一行不动), 只插计时与计数; 整段 try/catch, 埋点出错不影响消息。
-//
-// v1.6.1: A. 档位上限 RP_MAX_TIERS 4→10。所有"写死 4"的档位相关命中点改用 RP_MAX_TIERS (getTiers 截断/红包阈值个数上限/
-//            红包增加档满档判定/Dialog 行解析截断/各错误文案 1-4→1-10/K=1/2/3/4→档号 1-10)。与档位无关的 4 (如尾号 substring(-4)、
-//            标题长度校验) 一律不动。
-//         B. 修红包文案K 两位数 bug: v1.6.0 用 afterPrefix.charAt(0) 只认 '1'-'4', "红包文案10 发红包" 误解析为档1+动作"0 发红包"。
-//            改为解析前导整数(1-2位)作 K, 其余 trim 作动作; 校验 1<=K<=RP_MAX_TIERS (否则"❌ 档号需 1-10")、动作非空 (否则格式提示)。
-//         C. 全量保存错误检测: rpSetThresholdsCmd (空/非整数→"阈值需整数"/<=0→"阈值需正整数"/重复/>10档→"最多10档"/乱序自动升序);
-//            rpAddTierCmd (缺阈值或动作→格式/非整数/<=0/重复→"该阈值已存在"/满→"最多10档"); rpDelTopTierCmd (仅1档→"至少保留1档");
-//            Dialog 多行解析逐行校验收集行号错误(缺动作/非整数/<=0/重复/超10档截断), 全部无效→不保存不破坏原表, 部分有效→存有效行+提示。
-//            所有入口 try/catch 兜底, 绝不抛异常打断 onClickSendBtn/Dialog。
-//         不碰: getTiers 回退/setTiers 升序/tierOf 分档/hbTierAndSend 发送/rpRecordStats 写库/onHandleMsg 热路径/队列/反射/定时/导出/ANR 铁律。
-//            onHandleMsg 热路径仍零 getTiers/setTiers 调用 (经审计确认)。
-//
-// v1.6.0: 档位 per-group 化 (键 rp_tiers_<groupId> = "阈值|动作;..."(升序), 未配置群回退全局三档 cfgT1/2/3+cfgTxt1/2/3, 旧行为不变)。
-//         新增 helper: getTiers/setTiers/sortTiers/tierOf/tierCent/sanitizeTierAction/rpTiersSummary 及命令 helper
-//         rpSetThresholdsCmd/rpSetTierActionCmd/rpAddTierCmd/rpDelTopTierCmd。
-//         命令(onClickSendBtn, 全作用当前群): 红包阈值 a [b c d](1-4个递增正整数)/红包文案K 文字(K=1-4)/
-//         红包增加档 <阈值> <动作>(档数<4)/红包减少档(删最高档,档数>1)。回执动态列档表。
-//         hbTierAndSend: 写死3档分档→getTiers(talker)的 N 档循环 (归最高满足档, 群规列全档, @条逐非空档, notice 用最低档阈值)。
-//         rpRecordStats: 写死3档判定→tierOf 循环 (达标=金额>最低档, qualifiers 档次 1..N)。
-//         状态 红包统计状态 按 getTiers(当前群) 动态列档; Dialog 群上下文用单多行 EditText(每行"阈值 动作")编辑本群档表(降级方案,无UI遍历/ANR), 无群上下文仍编辑全局默认三档。
-//         严格不碰 onHandleMsg 热路径 (getTiers 只在 bg worker/统计线程/UI 回调调); 队列/单飞/看门狗/重试/检测/专属/反射/排除/定时/导出格式/抖动/ANR/perf 全不动。
+// RedPacketStats — v1.5.0 — 在已验证的 v1.4.0 之上, 仅重写导出/每日发送的"组装文本+分条+发送循环", 改为按群分组、每群一条独立消息、清晰多行格式。
 //
 // v1.5.0: 只动 rpExportToday() 与 rpDailySend() 的【组装文本 + 分条 + 发送循环】, 外加 SQL ORDER BY 改 grp,ts (便于按群顺序遍历)。
 //         热路径 onHandleMsg / 写库 rpRecordStats / 录入范围(只记超档) / SQL WHERE 过滤(窗口/分组条件) —— 全部一行未动。
@@ -192,9 +149,9 @@
 // 群红包领完后, 自动开页读明细 → 按金额阈值分档 → 群内发一条 @ 消息圈出"手气好"的人。
 //
 // 完整链路 (SPEC §4):
-//   onHandleMsg(廉价, v1.6.3): 群聊 + (type==436207665 或含 <nativeurl>) → 本群启用? 否则 return
-//     → 廉价 key=k:talker:sender:msgid + 携原始 content 入队 (attempt=0, 不在热路径 parse nativeurl/exclusive/title)
-//   hbProcess(后台 worker, v1.6.3): 出队后解析原始 content — 专属早退(skip exclusive)/nativeurl/rpExtractTitle(回填 job) → 启动器拉封面页 NewReceiveUI。
+//   onHandleMsg(廉价): 群聊 + (type==436207665 或含 <nativeurl>) → 本群启用? 否则 return
+//     → 提 nativeurl/talker/sender/msgid → 存红包运行态(内存 Map, attempt=0) → delay(rp_first_sec×1000) → hbProcess
+//   hbProcess(nativeurl): 启动器拉封面页 NewReceiveUI。
 //   NewReceiveUI.onResume: delay 后 UI 有界查找 detail 入口("看看大家的手气"/"查看领取详情" 且可点)
 //     ├─ 可点且含"手气"(拼手气领完) → performClick → 微信流转 NewDetailUI
 //     ├─ 可点但不含"手气"="查看领取详情"(普通领完) → 不点击 → finish 封面 → 清状态跳过(不开详情/不发消息)
@@ -226,10 +183,6 @@ import de.robv.android.xposed.XposedHelpers;
 String K_ENABLED = "rp_enabled_groups";
 String K_T1 = "rp_t1"; String K_T2 = "rp_t2"; String K_T3 = "rp_t3";
 String K_TXT1 = "rp_txt1"; String K_TXT2 = "rp_txt2"; String K_TXT3 = "rp_txt3";
-// v1.6.0: 每群独立 1-4 档。键 rp_tiers_<groupId>, 序列化 "阈值|动作;阈值|动作;..."(升序)。
-//         未配置该键的群回退全局 cfgT1/2/3 + cfgTxt1/2/3 (三档), 保证旧行为不变。
-String K_TIERS_PREFIX = "rp_tiers_";
-int RP_MAX_TIERS = 10;
 String K_DELAY = "rp_first_sec"; String K_RETRY1 = "rp_retry1_sec"; String K_RETRY2 = "rp_retry2_sec";
 String K_AT_LIMIT = "rp_at_limit";
 String K_MSG_GAP = "rp_msg_min_gap_sec";          // 同群两条红包提醒最小间隔(秒, v1.0.6 §13.3)
@@ -305,12 +258,9 @@ java.util.Set OPENED = java.util.Collections.synchronizedSet(new java.util.HashS
 java.util.Map COVER_ACT = java.util.Collections.synchronizedMap(new java.util.HashMap());
 
 // ==================== v1.1.0 §15: 队列 + 单工作者(单飞) ====================
-// Job = Object[]{ key(=廉价去重key k:talker:sender:msgid, String), talker(String), sender(String), msgid(Long), dueAt(Long, ms), attempt(Integer), title(String), content(String 原始消息 XML) }
-// 索引常量 (BeanShell 无 enum, 用 int 常量映射)。v1.3.0: 加 JOB_TITLE 第 7 槽 (供后台写统计 DB 用)。
-// v1.6.3: 去重 key 改用廉价 k:talker:sender:msgid (不再依赖 nativeurl XML parse); 加 JOB_CONTENT 第 8 槽携原始 content,
-//         worker(hbProcess) 出队后才做 nativeurl/exclusive/title 的 XML 解析 (重活移出热路径, C-PERF-03)。
-//         入队时 JOB_TITLE 留空, 由 worker rpExtractTitle 后写回本 job 数组 (CUR_JOB), 供 rpRecordStats 读。
-int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5; int JOB_TITLE = 6; int JOB_CONTENT = 7;
+// Job = Object[]{ nativeurl(=去重key, String), talker(String), sender(String), msgid(Long), dueAt(Long, ms), attempt(Integer) }
+// 索引常量 (BeanShell 无 enum, 用 int 常量映射)。v1.3.0: 加回 JOB_TITLE 第 7 槽 (供后台写统计 DB 用), 恢复 7 元组。
+int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5; int JOB_TITLE = 6;
 // 待处理 Job 队列 (生产者 onHandleMsg 入队; 单工作者出队)。所有读写持 RP_QUEUE 自身锁 (synchronized(RP_QUEUE))。
 java.util.List RP_QUEUE = new java.util.ArrayList();
 int RP_QUEUE_MAX = 50;           // 队列上限: 满则丢最旧一条 + log
@@ -337,32 +287,6 @@ long PERF_N           = 0L;    // 当前窗口样本数 (onHandleMsg 调用数)
 long PERF_SUM_NS      = 0L;    // 窗口 onHandleMsg 累计耗时 (ns)
 long PERF_MAX_NS      = 0L;    // 窗口 onHandleMsg 最大耗时 (ns)
 
-// ==================== v1.6.2: spike 归因埋点 (诊断用, 仿上方 PERF_* 风格) ====================
-// 目的: 区分 "每 ~200 条出现 1 次 200-370ms onHandleMsg max spike" 是 (A)真红包那条在热路径做重活,
-//       还是 (B)GC/框架抖动落在普通消息上。判据: spike 几乎全落普通消息→GC/框架抖动(与本插件无关);
-//       spike 集中在红包消息→extract/入队在热路径做了重活, 需移后台。
-// 实现: 仍只 nanoTime + 顶层整型累加, 绝不在热路径加 IO/log/反射。分类由 onHandleMsgBody 设的 PERF_LAST_RP 标记驱动。
-// 分类: A 红包消息 = 命中检测(isHb)且本群启用, 走 extract title + 入队(或 skip exclusive)那条路径;
-//       B 普通消息 = 未命中或未启用, 快速 return。
-long PERF_RP_SUM_NS   = 0L;    // 窗口内 红包消息 累计 onHandleMsg 耗时 (ns)
-long PERF_RP_MAX_NS   = 0L;    // 窗口内 红包消息 最大单条耗时 (ns)
-long PERF_RP_N        = 0L;    // 窗口内 红包消息 条数
-long PERF_NORM_SUM_NS = 0L;    // 窗口内 普通消息 累计 onHandleMsg 耗时 (ns)
-long PERF_NORM_MAX_NS = 0L;    // 窗口内 普通消息 最大单条耗时 (ns)
-long PERF_NORM_N      = 0L;    // 窗口内 普通消息 条数
-long PERF_SPIKE_NS    = 50000000L; // spike 阈值 = 50ms = 50_000_000ns (>此值算一次 spike)
-long PERF_SPIKE_N     = 0L;    // 窗口内 spike 总数 (>阈值的条数)
-long PERF_SPIKE_RP_N  = 0L;    // 窗口内 spike 且是红包消息 的条数 (关键判据)
-long PERF_SPIKE_NORM_N= 0L;    // 窗口内 spike 且是普通消息 的条数 (关键判据)
-// onHandleMsgBody 把 "本条是否被当红包处理" 写进这个标记, 供 wrapper 在 finally 里按 A/B 分类计时。
-// 默认 false; body 入口处由 wrapper 清, body 内确认红包后置 true。
-boolean PERF_LAST_RP  = false;
-// (可选 §4) rpExtractTitle 耗时单独累加。v1.6.3: extract 已移到后台 worker(hbProcess), 此计时现在 worker 线程累加,
-//   不再计入 onHandleMsg 热路径 — 故热路径 rp_msg 耗时应大幅下降, rp_extract_* 仍可观测提取耗时但不再反噬热路径。
-long PERF_EXTRACT_SUM_NS = 0L; // 窗口内 rpExtractTitle 累计耗时 (ns, v1.6.3 后台 worker 侧)
-long PERF_EXTRACT_MAX_NS = 0L; // 窗口内 rpExtractTitle 最大单次耗时 (ns)
-long PERF_EXTRACT_N      = 0L; // 窗口内 rpExtractTitle 调用次数
-
 // v1.3.0 §17: 统计本地 SQLite (rp_record, 一红包一行)。库与 rp.log 同目录 (GroupAdmin 同级目录建库已验证可行)。
 String RP_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/redpacket_stats.db";
 android.database.sqlite.SQLiteDatabase RP_DB = null;   // 连接单例 (懒打开)
@@ -377,7 +301,7 @@ int HB_MSG_TYPE = 436207665;
 String[] DETAIL_TEXTS = {"看看大家的手气", "查看领取详情"};
 
 void onLoad() {
-    try { log("RedPacketStats v1.6.4 loaded."); } catch (Throwable t) {}
+    try { log("RedPacketStats v1.5.0 loaded."); } catch (Throwable t) {}
     // 旧毫秒键废弃, 清空避免残留混淆 (新键 rp_first_sec/rp_retry1_sec/rp_retry2_sec 为秒)
     try { putString("rp_delay_ms", ""); putString("rp_retry1_ms", ""); putString("rp_retry2_ms", ""); } catch (Throwable t) {}
     if (HOOKED) { try { log("RedPacketStats hook already registered, skip."); } catch (Throwable t) {} return; }
@@ -394,14 +318,14 @@ void onLoad() {
             try {
                 delay(RP_TICK_MS, new Runnable() { public void run() { rpWorkerTick(); } });
                 log("RedPacketStats worker started (queue+single-flight, tick=" + RP_TICK_MS + "ms).");
-                hbBgLog("[RP] " + hbNow() + " v1.6.0 worker started: queue(max=" + RP_QUEUE_MAX + ")+single-flight worker tick=" + RP_TICK_MS + "ms, watchdog=" + RP_WATCHDOG_MS + "ms, daily-check+perf-flush per tick.");
+                hbBgLog("[RP] " + hbNow() + " v1.5.0 worker started: queue(max=" + RP_QUEUE_MAX + ")+single-flight worker tick=" + RP_TICK_MS + "ms, watchdog=" + RP_WATCHDOG_MS + "ms, daily-check+perf-flush per tick.");
             } catch (Throwable t) { try { log("RedPacketStats worker start FAIL: " + t); } catch (Throwable t2) {} }
         }
         // v1.4.0 §20: 每日定时迁移 (一次性) — 首次把 rp_daily_groups 初始化 = 当前 rp_enabled_groups。
         try { rpDailyMigrateOnce(); } catch (Throwable t) {}
         try { log("RedPacketStats Activity.onResume hooked + onHandleMsg redpacket-stats enabled."); } catch (Throwable t) {}
-        hbBgLog("[RP] " + hbNow() + " v1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
-            + "[v1.6.3] detect(廉价 type/含<nativeurl>)→enqueue raw content(dedup k:talker:sender:msgid,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB,后台):parse[skip exclusive→nativeurl→extract title 回填 job]→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
+        hbBgLog("[RP] " + hbNow() + " v1.5.0 loaded (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
+            + "detect→[skip exclusive]→extract title→enqueue(dedup,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB)→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
             + "v1.3.0: 在 v1.2.0(队列+两条消息定版)之上加回统计 DB(§17, redpacket_stats.db, rp_record 一红包一行, 仅后台反射线程写, 可降级) + 导出今日红包统计→私聊(§18, Dialog 按钮, sendText 给 rp_export_target) + 标题提取(§17.3) + 嗅探调试日志(title usedField/len, stats-db opened, export sent N). DB 存真实昵称/金额/wxid(本地存储), hbBgLog 仍只记计数(脱敏). 两条消息逻辑一行未动. "
             + "v1.1.4: 发两条修正(§16) — 第一条(引用群规)=固定简洁(cfgRulePrefix+\"过{t}元{动作}\"三档, 无随机无语气); 第二条(@)=随机(pickConnector+pickActionPhrase+[AtWx=]), 隔 rp_two_msg_gap_sec 秒(默认3,可配)延迟发以保序(delay+final捕获,fire-and-forget,不进在飞锁). >at上限只发第一条无第二条无延迟. 只改 hbTierAndSend. "
             + "v1.1.2: 发提醒拆两条 — qualified>=1: rpSendQuote(talker,CUR_JOB.msgid,群规文本)引用原红包(无@,失败回退sendText); qualified 1~at_limit additionally rpSendAt(talker,@文本)真@(sendText). qualified==0不发; >at_limit只发引用群规条. 限频对整次提醒判一次. "
@@ -424,223 +348,6 @@ int cfgT3() { return cfgInt(K_T3, DEF_T3); }
 String cfgTxt1() { return cfgStr(K_TXT1, DEF_TXT1); }
 String cfgTxt2() { return cfgStr(K_TXT2, DEF_TXT2); }
 String cfgTxt3() { return cfgStr(K_TXT3, DEF_TXT3); }
-
-// ==================== v1.6.0: 每群独立档位 (1-4 档) ====================
-// 模型: 每群一个键 rp_tiers_<groupId>, 值 = "阈值|动作;阈值|动作;..." (升序)。
-// 元素类型 Object[]{Integer 阈值(元), String 动作}。BeanShell 无泛型, 用 ArrayList + 强转。
-// 整段 try/catch 可降级: 解析失败/键不存在 → 回退全局三档 (cfgT1/2/3 + cfgTxt1/2/3)。
-String tiersKey(String groupId) { return K_TIERS_PREFIX + normGroupId(groupId); }
-
-// 动作里的 | ; 会污染序列化分隔符 → 与 qualifiers 同款替换 (| → /, ; → ,)。
-String sanitizeTierAction(String a) {
-    if (a == null) return "";
-    return a.replace('|', '/').replace(';', ',').trim();
-}
-
-// 取某群档表 (升序, 长度 1-4)。键存在且解析出 >=1 档 → 用它; 否则回退全局三档。
-// 返回 List<Object[]{Integer,String}>。绝不返回空/null (兜底全局三档)。
-List getTiers(String groupId) {
-    List out = new java.util.ArrayList();
-    try {
-        String raw = getString(tiersKey(groupId), "");
-        if (raw != null && !raw.trim().isEmpty()) {
-            String[] segs = raw.split(";");
-            for (int i = 0; i < segs.length; i++) {
-                String seg = segs[i].trim();
-                if (seg.isEmpty()) continue;
-                int bar = seg.indexOf('|');
-                if (bar < 0) continue;
-                String tStr = seg.substring(0, bar).trim();
-                String act = seg.substring(bar + 1);   // 动作可能含空格, 不 trim 内部, 仅整体
-                act = (act == null) ? "" : act.trim();
-                int thr;
-                try { thr = Integer.parseInt(tStr); } catch (Throwable t) { continue; }
-                if (thr <= 0) continue;
-                if (act.isEmpty()) continue;
-                // 阈值去重
-                boolean dup = false;
-                for (int j = 0; j < out.size(); j++) { if (((Integer) ((Object[]) out.get(j))[0]).intValue() == thr) { dup = true; break; } }
-                if (dup) continue;
-                out.add(new Object[]{ Integer.valueOf(thr), act });
-                if (out.size() >= RP_MAX_TIERS) break;
-            }
-        }
-    } catch (Throwable t) { out = new java.util.ArrayList(); }
-    if (out.size() >= 1) { sortTiers(out); return out; }
-    // 回退: 全局三档 (旧行为)。
-    out = new java.util.ArrayList();
-    out.add(new Object[]{ Integer.valueOf(cfgT1()), cfgTxt1() });
-    out.add(new Object[]{ Integer.valueOf(cfgT2()), cfgTxt2() });
-    out.add(new Object[]{ Integer.valueOf(cfgT3()), cfgTxt3() });
-    sortTiers(out);
-    return out;
-}
-
-// 按阈值升序排序 (简单插入排序; 最多 RP_MAX_TIERS 元素)。
-void sortTiers(List tiers) {
-    try {
-        for (int i = 1; i < tiers.size(); i++) {
-            Object[] cur = (Object[]) tiers.get(i);
-            int cv = ((Integer) cur[0]).intValue();
-            int j = i - 1;
-            while (j >= 0 && ((Integer) ((Object[]) tiers.get(j))[0]).intValue() > cv) {
-                tiers.set(j + 1, tiers.get(j));
-                j--;
-            }
-            tiers.set(j + 1, cur);
-        }
-    } catch (Throwable t) {}
-}
-
-// 落盘某群档表 (升序去重序列化)。空列表 → 删键 (回退全局)。
-void setTiers(String groupId, List tiers) {
-    try {
-        if (tiers == null || tiers.isEmpty()) { putString(tiersKey(groupId), ""); return; }
-        sortTiers(tiers);
-        StringBuilder sb = new StringBuilder();
-        int n = 0;
-        for (int i = 0; i < tiers.size(); i++) {
-            Object[] e = (Object[]) tiers.get(i);
-            int thr = ((Integer) e[0]).intValue();
-            String act = sanitizeTierAction((String) e[1]);
-            if (thr <= 0 || act.isEmpty()) continue;
-            if (n > 0) sb.append(";");
-            sb.append(thr).append("|").append(act);
-            n++;
-            if (n >= RP_MAX_TIERS) break;
-        }
-        putString(tiersKey(groupId), sb.toString());
-    } catch (Throwable t) {}
-}
-
-// 档表里某档阈值 (cent 单位金额比较用)。
-long tierCent(Object[] tier) { return (long) ((Integer) tier[0]).intValue() * 100L; }
-
-// 把金额(分)归入最高满足档, 返回 1-based 档次 (0 = 未达最低档)。
-// tiers 已升序; 从最高档往低判: cent > 该档阈值×100 即归该档。
-int tierOf(List tiers, long cent) {
-    for (int i = tiers.size() - 1; i >= 0; i--) {
-        if (cent > tierCent((Object[]) tiers.get(i))) return i + 1;
-    }
-    return 0;
-}
-
-// 档表 → 人读字符串 "档1>5元 爆照 | 档2>10元 宣群" (回执/状态用)。
-String rpTiersSummary(List tiers) {
-    StringBuilder sb = new StringBuilder();
-    for (int i = 0; i < tiers.size(); i++) {
-        Object[] e = (Object[]) tiers.get(i);
-        if (i > 0) sb.append(" | ");
-        sb.append("档").append(i + 1).append(">").append(((Integer) e[0]).intValue()).append("元 ").append((String) e[1]);
-    }
-    return sb.toString();
-}
-
-// 红包阈值 a [b ...]: 设当前群 1-RP_MAX_TIERS 个递增阈值。保留原各档动作 (按档次对位), 新增档动作留空提示。
-String rpSetThresholdsCmd(String groupId, String rest) {
-    if (rest == null) rest = "";
-    String trimmed = rest.trim();
-    if (trimmed.isEmpty()) return "❌ 格式: 红包阈值 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
-    String[] parts = trimmed.split("\\s+");
-    List nums = new java.util.ArrayList();
-    for (int i = 0; i < parts.length; i++) {
-        String p = parts[i].trim();
-        if (p.isEmpty()) continue;
-        int v;
-        try { v = Integer.parseInt(p); } catch (Throwable t) { return "❌ 阈值需整数: 红包阈值 5 10 20"; }
-        if (v <= 0) return "❌ 阈值需正整数";
-        nums.add(Integer.valueOf(v));
-    }
-    if (nums.isEmpty()) return "❌ 格式: 红包阈值 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
-    if (nums.size() > RP_MAX_TIERS) return "❌ 最多 " + RP_MAX_TIERS + " 档";
-    // 升序排序 + 拒绝重复/相等
-    for (int i = 0; i < nums.size(); i++) {
-        for (int j = i + 1; j < nums.size(); j++) {
-            if (((Integer) nums.get(i)).intValue() == ((Integer) nums.get(j)).intValue()) return "❌ 阈值不能重复";
-        }
-    }
-    // 简单升序
-    for (int i = 1; i < nums.size(); i++) {
-        Integer cur = (Integer) nums.get(i); int cv = cur.intValue(); int k = i - 1;
-        while (k >= 0 && ((Integer) nums.get(k)).intValue() > cv) { nums.set(k + 1, nums.get(k)); k--; }
-        nums.set(k + 1, cur);
-    }
-    // 旧档表 (按档次对位保留动作)
-    List old = getTiers(groupId);
-    List out = new java.util.ArrayList();
-    int missingFrom = -1;
-    for (int i = 0; i < nums.size(); i++) {
-        int thr = ((Integer) nums.get(i)).intValue();
-        String act = "";
-        if (i < old.size()) act = (String) ((Object[]) old.get(i))[1];
-        if (act == null) act = "";
-        act = sanitizeTierAction(act);
-        if (act.isEmpty() && missingFrom < 0) missingFrom = i + 1;   // 1-based
-        out.add(new Object[]{ Integer.valueOf(thr), act.isEmpty() ? "未设" : act });
-    }
-    setTiers(groupId, out);
-    List saved = getTiers(groupId);
-    String msg = "✅ 本群已设 " + saved.size() + " 档: " + rpTiersSummary(saved);
-    if (missingFrom > 0) msg += "\n⚠️ 档" + missingFrom + "起动作未设, 请发 红包文案" + missingFrom + " <动作> 设置";
-    return msg;
-}
-
-// 红包文案K 文字: 设当前群第 K 档动作。
-String rpSetTierActionCmd(String groupId, int k, String v) {
-    if (v == null || v.trim().isEmpty()) return "❌ 格式: 红包文案" + k + " 爆照";
-    List tiers = getTiers(groupId);
-    if (k < 1 || k > tiers.size()) return "❌ 当前仅 " + tiers.size() + " 档, 请先发 红包增加档 <阈值> <动作> 增加档";
-    String act = sanitizeTierAction(v);
-    if (act.isEmpty()) return "❌ 动作不能为空";
-    Object[] e = (Object[]) tiers.get(k - 1);
-    e[1] = act;
-    setTiers(groupId, tiers);
-    List saved = getTiers(groupId);
-    return "✅ 档" + k + "动作(原样,措辞随机): " + act + "\n当前: " + rpTiersSummary(saved);
-}
-
-// 红包增加档 <阈值> <动作>: 当前群追加一档。
-String rpAddTierCmd(String groupId, String rest) {
-    if (rest == null) rest = "";
-    rest = rest.trim();
-    int sp = rest.indexOf(' ');
-    if (sp < 0) return "❌ 格式: 红包增加档 30 发红包";
-    String tStr = rest.substring(0, sp).trim();
-    String act = sanitizeTierAction(rest.substring(sp + 1));
-    int thr;
-    try { thr = Integer.parseInt(tStr); } catch (Throwable t) { return "❌ 阈值需整数: 红包增加档 30 发红包"; }
-    if (thr <= 0) return "❌ 阈值需正整数";
-    if (act.isEmpty()) return "❌ 格式: 红包增加档 30 发红包";
-    List tiers = getTiers(groupId);
-    if (tiers.size() >= RP_MAX_TIERS) return "❌ 最多 " + RP_MAX_TIERS + " 档";
-    for (int i = 0; i < tiers.size(); i++) {
-        if (((Integer) ((Object[]) tiers.get(i))[0]).intValue() == thr) return "❌ 该阈值已存在";
-    }
-    tiers.add(new Object[]{ Integer.valueOf(thr), act });
-    setTiers(groupId, tiers);
-    List saved = getTiers(groupId);
-    return "✅ 已增加档 (>" + thr + "元 " + act + "), 当前 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
-}
-
-// v1.6.1: Dialog 行解析错误收集 helper (前 5 条带分隔符追加, 简化调用点避免 BeanShell 深嵌套解析问题)。
-void rpAppendErr(StringBuilder errs, int curCount, String msg) {
-    try {
-        if (curCount >= 5) return;
-        if (curCount > 0) errs.append("; ");
-        errs.append(msg);
-    } catch (Throwable t) {}
-}
-
-// 红包减少档: 删当前群最高档 (档数需 >1)。
-String rpDelTopTierCmd(String groupId) {
-    List tiers = getTiers(groupId);
-    if (tiers.size() <= 1) return "❌ 至少保留 1 档, 无法再减少";
-    Object[] removed = (Object[]) tiers.remove(tiers.size() - 1);
-    setTiers(groupId, tiers);
-    List saved = getTiers(groupId);
-    return "✅ 已删除最高档 (>" + ((Integer) removed[0]).intValue() + "元 " + (String) removed[1] + "), 剩 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
-}
-
 long cfgDelay() { return cfgLong(K_DELAY, DEF_DELAY); }
 long cfgRetry1() { return cfgLong(K_RETRY1, DEF_RETRY1); }
 long cfgRetry2() { return cfgLong(K_RETRY2, DEF_RETRY2); }
@@ -721,46 +428,10 @@ String joinCsv(List list) {
     return sb.toString();
 }
 String normGroupId(String g) { if (g == null) return ""; return g.trim(); }
-
-// v1.6.4: [性能/C-PERF-01,03] 启用群集合内存缓存 — 消除红包消息热路径最后一处 per-红包 FUSE 读
-//   (isGroupEnabled → getEnabledGroups → getString(K_ENABLED) ~26ms/红包候选)。仿 GroupAdmin v1.16.2 同款。
-//   RP_ENABLED_CACHE 存 normGroupId 后的群 id; TTL 60s 兜底外部 adb 改 config.prop; enable/disable 变更后立即刷新保即时生效。
-//   加载失败保留旧缓存 (降级安全); isGroupEnabled 异常时回退直接读 getString (宁可慢不可错: 这是红包在本群是否处理的总闸门)。
-//   归一口径: 与原 isGroupEnabled 完全一致 = normGroupId(=trim)。
-java.util.HashSet RP_ENABLED_CACHE = null;   // 已启用群 id 集合 (normGroupId 后); null=尚未加载
-long RP_ENABLED_CACHE_TS = 0L;               // 上次加载毫秒
-long RP_ENABLED_TTL_MS   = 60000L;           // 缓存 TTL: 外部改 config.prop 最多此时长后生效
-
-// 从 config.prop 读 K_ENABLED, 全量 norm 后原子替换 RP_ENABLED_CACHE。失败保留旧缓存只 log。
-void rpLoadEnabledCache() {
-    try {
-        List l = parseCsv(getString(K_ENABLED, ""));
-        java.util.HashSet ns = new java.util.HashSet();
-        for (int i = 0; i < l.size(); i++) {
-            String g = normGroupId((String) l.get(i));
-            if (!g.isEmpty()) ns.add(g);
-        }
-        RP_ENABLED_CACHE = ns;            // 原子替换
-        RP_ENABLED_CACHE_TS = System.currentTimeMillis();
-    } catch (Throwable t) {
-        try { log("rpLoadEnabledCache failed (keep old cache): " + t); } catch (Throwable t2) {}
-    }
-}
-
 List getEnabledGroups() { return parseCsv(getString(K_ENABLED, "")); }
 boolean isGroupEnabled(String groupId) {
     String g = normGroupId(groupId);
     if (g.isEmpty()) return false;
-    try {
-        long now = System.currentTimeMillis();
-        if (RP_ENABLED_CACHE == null || (now - RP_ENABLED_CACHE_TS) > RP_ENABLED_TTL_MS) {
-            rpLoadEnabledCache();
-        }
-        if (RP_ENABLED_CACHE != null) return RP_ENABLED_CACHE.contains(g);
-    } catch (Throwable t) {
-        try { log("isGroupEnabled cache error, fallback to direct read: " + t); } catch (Throwable t2) {}
-    }
-    // 回退: 缓存出错时直接读 (保证正确性, 与原逻辑完全一致, 不因缓存错误误判)
     List l = getEnabledGroups();
     for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) return true;
     return false;
@@ -772,7 +443,6 @@ void enableGroup(String groupId) {
     boolean already = false;
     for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) { already = true; break; }
     if (!already) { l.add(g); putString(K_ENABLED, joinCsv(l)); }
-    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 开启后下一个红包立即按新状态判定
     // v1.4.0 §20: 开启红包统计时默认把该群加进每日定时 (可单独关)。
     try { enableDailyGroup(g); } catch (Throwable t) {}
 }
@@ -782,7 +452,6 @@ void disableGroup(String groupId) {
     boolean changed = false;
     for (int i = l.size() - 1; i >= 0; i--) if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
     if (changed) putString(K_ENABLED, joinCsv(l));
-    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 关闭后下一个红包立即不再处理该群
 }
 
 // ==================== 红包提醒排除名单 (按群, v1.0.6 §12) ====================
@@ -924,8 +593,6 @@ boolean rpHandleExcludeCmd(String groupId, String content, java.util.List atList
 void onHandleMsg(Object msg) {
     long _perfStart = 0L;
     boolean _perfOn = false;
-    // v1.6.2: 每条进入前清红包标记; body 内确认本条是红包(命中检测+启用)才置 true。整段 try/catch, 埋点出错不影响消息。
-    try { PERF_LAST_RP = false; } catch (Throwable t) {}
     try { _perfStart = System.nanoTime(); _perfOn = true; } catch (Throwable t) { _perfOn = false; }
     try {
         onHandleMsgBody(msg);
@@ -936,23 +603,6 @@ void onHandleMsg(Object msg) {
                 PERF_N++;
                 PERF_SUM_NS += dur;
                 if (dur > PERF_MAX_NS) PERF_MAX_NS = dur;
-                // v1.6.2: 按 A(红包)/B(普通) 分类累加 sum/max/count, 并标记 spike (>阈值)。
-                boolean wasRp = false;
-                try { wasRp = PERF_LAST_RP; } catch (Throwable t) { wasRp = false; }
-                if (wasRp) {
-                    PERF_RP_N++;
-                    PERF_RP_SUM_NS += dur;
-                    if (dur > PERF_RP_MAX_NS) PERF_RP_MAX_NS = dur;
-                } else {
-                    PERF_NORM_N++;
-                    PERF_NORM_SUM_NS += dur;
-                    if (dur > PERF_NORM_MAX_NS) PERF_NORM_MAX_NS = dur;
-                }
-                if (dur > PERF_SPIKE_NS) {
-                    PERF_SPIKE_N++;
-                    if (wasRp) PERF_SPIKE_RP_N++;
-                    else PERF_SPIKE_NORM_N++;
-                }
                 // 兜底: 窗口异常膨胀 (worker 长时间没跑) 时才在热路径 flush 一次, 防内存计数溢出/数据失真。
                 if (PERF_N >= (long) PERF_FLUSH_EVERY * 50L) perfFlush();
             } catch (Throwable t) { /* 埋点出错绝不影响消息 */ }
@@ -1005,25 +655,36 @@ void onHandleMsgBody(Object msg) {
         // ---- (3) 本群启用闸门: 没启用直接 return (不开页/不排 delay) ----
         if (!isGroupEnabled(groupId)) return;
 
-        // v1.6.2: 至此本条已确认 = 候选红包消息且本群启用, 后续只做"廉价判定+入队"。
-        //         给 wrapper 的 finally 分类用 (A 红包消息)。仅置标记, 不做任何 IO/反射。
-        try { PERF_LAST_RP = true; } catch (Throwable t) {}
+        // ---- (4) 命中才解析 nativeurl (红包频率极低) ----
+        final String nativeurl = hbGetElement(content, "wcpayinfo", "nativeurl");
 
-        // ---- (4) v1.6.3 (C-PERF-03): 热路径只做最廉价的判定 + 入队原始数据。----
-        //   不再在热路径解析 nativeurl / exclusive_recv_username / rpExtractTitle(XML parse)。
-        //   这些重活 (原占 ~267ms 热路径 spike, 其中 extract ~50ms) 全部移到 worker(hbProcess, 已在后台线程)。
-        //   去重 key 改用廉价的 k:talker:sender:msgid (不依赖任何 XML parse, 热路径就拿得到)。
-        //   原始 content 随 Job 携带 (JOB_CONTENT), worker 出队后再 parse nativeurl/exclusive/title。
+        // ---- (4a) 仅处理拼手气红包: 专属红包(指定某人领)检测即跳过, 不开页/不排程 ----
+        // 专属红包 wcpayinfo 里 exclusive_recv_username 非空 = 指定接收人。
+        // v1.0.6 §13.4: 移除 detect-fields 调试解析(原重复 parse 5 字段), 专属判定保留(只解析 exclusive_recv_username 一个)。
+        String exclusiveRecv = null;
+        try { exclusiveRecv = hbGetElement(content, "wcpayinfo", "exclusive_recv_username"); } catch (Throwable t) { exclusiveRecv = null; }
+
+        if (exclusiveRecv != null && !exclusiveRecv.trim().isEmpty()) {
+            hbBgLog("[RP] " + hbNow() + " skip exclusive (exclusive_recv_username present). not scheduling.");
+            return;
+        }
+
+        // ---- (4b) v1.3.0 §17.3: 红包标题/祝福语 (只在红包消息上 parse, 低频; 存进 Job 供后台写 DB)。----
+        // 候选字段取首个非空: sendertitle → receivertitle → scenetext → des (不同微信版本字段可能不同, 见 SPEC 存疑)。
+        // 只在已确认是红包的消息上 parse, 普通消息热路径不调用 (perf: 保持 v1.2.0 热路径不变)。
+        String hbTitle = rpExtractTitle(content);
+        final String fTitle = (hbTitle == null) ? "" : hbTitle;
+
         String sender0 = sender; if (sender0 == null) sender0 = groupId;
         final String fSender = sender0;
         final String fTalker = groupId;
         long msgid0 = 0L;
         try { msgid0 = ((Number) msg.getMsgId()).longValue(); } catch (Throwable t) { msgid0 = 0L; }
         final long fMsgid = msgid0;
-        final String fContent = content;
 
-        // 廉价去重 key (无 XML parse): k:talker:sender:msgid。同一红包 msgid 唯一, 不重复入队。
-        final String fKey = "k:" + fTalker + ":" + fSender + ":" + fMsgid;
+        String dkey = (nativeurl != null && nativeurl.length() > 0)
+            ? nativeurl : ("k:" + fTalker + ":" + fSender + ":" + fMsgid);
+        final String fKey = dkey;
         if (!OPENED.add(fKey)) return;
 
         // v1.1.0 §15.2: 生产者只入队, 不再 per-红包 delay。
@@ -1031,11 +692,11 @@ void onHandleMsgBody(Object msg) {
         // v1.0.6 §13.1: 首次延迟 ±25% 抖动 (base*0.75 ~ base*1.25), 去零方差。long 乘防溢出。
         long delayMs = hbJitter((long) (delaySec * 1000L * 0.75), (long) (delaySec * 1000L * 0.5));
         long dueAt = System.currentTimeMillis() + delayMs;
-        // Job = { key, talker, sender, msgid, dueAt, attempt=0, title(留空, worker填), content(原始) }  (v1.6.3: +JOB_CONTENT 第 8 槽)
-        Object[] job = new Object[]{ fKey, fTalker, fSender, Long.valueOf(fMsgid), Long.valueOf(dueAt), Integer.valueOf(0), "", fContent };
+        // Job = { key, talker, sender, msgid, dueAt, attempt=0, title }  (v1.3.0 §17.3: 加 title 第 7 槽)
+        Object[] job = new Object[]{ fKey, fTalker, fSender, Long.valueOf(fMsgid), Long.valueOf(dueAt), Integer.valueOf(0), fTitle };
         rpEnqueue(job);
-        hbBgLog("[RP] " + hbNow() + " redpacket candidate in enabled group (type=" + type
-            + "). enqueued raw (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ". (extract/exclusive deferred to worker)");
+        hbBgLog("[RP] " + hbNow() + " redpacket detected in enabled group (type=" + type
+            + ", hasNativeurl=" + (nativeurl != null) + "). enqueued (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ".");
     } catch (Throwable t) {
         try { log("RedPacketStats onHandleMsg err: " + t); } catch (Throwable t2) {}
     }
@@ -1099,49 +760,37 @@ boolean onClickSendBtn(String text) {
             try { rpDailyTest(); toast("📤 已触发每日测试 (过去24h → 私聊, 看 rp.log)"); } catch (Throwable t) { try { toast("❌ 测试失败: " + t); } catch (Throwable t2) {} }
             return true;
         }
-        // v1.6.0: 红包增加档 <阈值> <动作> — 当前群追加一档 (需档数 <4)。
-        if (content.startsWith("红包增加档")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            String rest = content.substring("红包增加档".length()).trim();
-            try { toast(rpAddTierCmd(groupId, rest)); } catch (Throwable t) { try { toast("❌ 格式: 红包增加档 20 发视频"); } catch (Throwable t2) {} }
-            return true;
-        }
-        // v1.6.0: 红包减少档 — 删当前群最高档 (档数需 >1)。
-        if (content.equals("红包减少档")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            try { toast(rpDelTopTierCmd(groupId)); } catch (Throwable t) { try { toast("❌ 操作失败"); } catch (Throwable t2) {} }
-            return true;
-        }
-        // v1.6.1: 红包阈值 a [b ...] — 接受 1-RP_MAX_TIERS 个正整数, 作用当前群; 自动升序、拒重复。
-        //   新档数 > 原档数: 新增档动作留空(沿用旧动作或提示设置); 新档数 < 原档数: 截断多余档动作。
+        // 红包阈值 5 10 20
         if (content.startsWith("红包阈值")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
             String rest = content.substring("红包阈值".length()).trim();
-            try { toast(rpSetThresholdsCmd(groupId, rest)); } catch (Throwable t) { try { toast("❌ 格式: 红包阈值 5 10 (1-" + RP_MAX_TIERS + "个递增正整数)"); } catch (Throwable t2) {} }
+            String[] parts = rest.split("\\s+");
+            if (parts.length >= 3) {
+                try {
+                    int a = Integer.parseInt(parts[0].trim());
+                    int b = Integer.parseInt(parts[1].trim());
+                    int c = Integer.parseInt(parts[2].trim());
+                    putString(K_T1, String.valueOf(a));
+                    putString(K_T2, String.valueOf(b));
+                    putString(K_T3, String.valueOf(c));
+                    toast("✅ 阈值已设: 档1>" + a + "元  档2>" + b + "元  档3>" + c + "元");
+                } catch (Exception e) { try { toast("❌ 格式: 红包阈值 5 10 20"); } catch (Throwable t) {} }
+            } else { try { toast("❌ 格式: 红包阈值 5 10 20"); } catch (Throwable t) {} }
             return true;
         }
-        // v1.6.1: 红包文案K 文字 (K=1..RP_MAX_TIERS) — 设当前群第 K 档动作。
-        //   解析前导整数(1-2位)作 K, 其余 trim 作动作 v。修 v1.6.0 charAt(0) 只认 '1'-'4' 的两位数 bug
-        //   (旧: "红包文案10 发红包" → K=1 动作="0 发红包"; 新: K=10 动作="发红包")。
-        if (content.startsWith("红包文案")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            try {
-                String afterPrefix = content.substring("红包文案".length());
-                // 取开头连续数字 (1-2 位) 作 K
-                int di = 0;
-                while (di < afterPrefix.length() && di < 2 && afterPrefix.charAt(di) >= '0' && afterPrefix.charAt(di) <= '9') di++;
-                if (di == 0) { try { toast("❌ 格式: 红包文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} return true; }
-                String kStr = afterPrefix.substring(0, di);
-                int k = Integer.parseInt(kStr);
-                if (k < 1 || k > RP_MAX_TIERS) { try { toast("❌ 档号需 1-" + RP_MAX_TIERS); } catch (Throwable t2) {} return true; }
-                String v = afterPrefix.substring(di).trim();
-                if (v.isEmpty()) { try { toast("❌ 格式: 红包文案" + k + " 爆照 (动作不能为空)"); } catch (Throwable t2) {} return true; }
-                try { toast(rpSetTierActionCmd(groupId, k, v)); } catch (Throwable t) { try { toast("❌ 格式: 红包文案" + k + " 爆照"); } catch (Throwable t2) {} }
-            } catch (Throwable t) { try { toast("❌ 格式: 红包文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} }
+        // v1.0.7 §14: 动作核心词 = 用户录入的内容, 单值原样存储, 不 split 不随机 (周围连接词+语气包裹自动随机)。
+        if (content.startsWith("红包文案1")) {
+            String v = content.substring("红包文案1".length()).trim();
+            try { if (!v.isEmpty()) { putString(K_TXT1, v); toast("✅ 档1动作核心词(原样, 周围措辞自动随机): " + v); } else toast("❌ 格式: 红包文案1 爆照"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.startsWith("红包文案2")) {
+            String v = content.substring("红包文案2".length()).trim();
+            try { if (!v.isEmpty()) { putString(K_TXT2, v); toast("✅ 档2动作核心词(原样, 周围措辞自动随机): " + v); } else toast("❌ 格式: 红包文案2 宣群"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.startsWith("红包文案3")) {
+            String v = content.substring("红包文案3".length()).trim();
+            try { if (!v.isEmpty()) { putString(K_TXT3, v); toast("✅ 档3动作核心词(原样, 周围措辞自动随机): " + v); } else toast("❌ 格式: 红包文案3 发视频"); } catch (Throwable t) {}
             return true;
         }
         // v1.0.7 §14: >上限通用群规消息前缀, 单值原样存储/发送 (不随机)。
@@ -1205,15 +854,11 @@ String rpCurrentGroupOrToast() {
 
 String rpStatusText(String groupId) {
     StringBuilder sb = new StringBuilder();
-    sb.append("📊 红包统计 v1.6.0\n");
+    sb.append("📊 红包统计 v1.5.0\n");
     sb.append("本群: ").append(isGroupEnabled(groupId) ? "✅ 已启用" : "🔴 未启用").append("\n");
     sb.append("本群每日定时: ").append(isDailyEnabled(groupId) ? ("✅ 开 (每天" + cfgDailyHour() + "点)") : "🔴 关").append("\n");
-    // v1.6.0: 每群独立 1-4 档 (未配置则回退全局默认三档)。
-    List _tiers = getTiers(groupId);
-    boolean _custom = false;
-    try { String _raw = getString(tiersKey(groupId), ""); _custom = (_raw != null && !_raw.trim().isEmpty()); } catch (Throwable t) {}
-    sb.append("本群档位 (").append(_tiers.size()).append("档").append(_custom ? "" : ",全局默认").append("): ").append(rpTiersSummary(_tiers)).append("\n");
-    sb.append("命令: 红包阈值 a b.. / 红包文案K 文字 / 红包增加档 阈值 动作 / 红包减少档\n");
+    sb.append("阈值: 档1>").append(cfgT1()).append("元  档2>").append(cfgT2()).append("元  档3>").append(cfgT3()).append("元\n");
+    sb.append("动作核心词(原样,措辞随机): 档1=").append(cfgTxt1()).append(" 档2=").append(cfgTxt2()).append(" 档3=").append(cfgTxt3()).append("\n");
     sb.append("延迟: 首次:").append(cfgDelay()).append("秒 重试1:").append(cfgRetry1()).append("秒 重试2:").append(cfgRetry2()).append("秒 (±抖动)\n");
     sb.append("at上限: ").append(cfgAtLimit()).append(" (超过则发无@群规消息)\n");
     sb.append("同群限频: ").append(cfgMsgGap()).append("秒\n");
@@ -1355,48 +1000,7 @@ void hbProcess(Object[] job) {
         int attempt = ((Integer) job[JOB_ATTEMPT]).intValue();
         String talker = (String) job[JOB_TALKER];
         String key = (String) job[JOB_KEY];
-        String content = (String) job[JOB_CONTENT];
-        hbBgLog("[RP] " + hbNow() + " hbProcess attempt=" + attempt + " -> (worker-side parse) opening cover " + UI_RECEIVE + ".");
-
-        // ---- v1.6.3 (C-PERF-03): 原热路径"重活"在此后台 worker 线程执行 (逻辑不变, 只换线程/时机)。----
-        //   出队后才解析: 专属判定(early-exit) → nativeurl(开页用) → title(写库用, 回填本 job)。
-        //   只在首跑(attempt==0)解析专属/title (重试时 job 已带回填的 title; 专属在首跑已被早退, 不会有重试)。
-        String nativeurl = null;
-        if (content != null) {
-            // (a) 专属红包早退: wcpayinfo.exclusive_recv_username 非空 = 指定接收人 → 跳过(不开页/不排程), 与改前行为一致。
-            //     只在首跑判 (attempt==0); 专属一旦命中即 return, 不会进入重试路径, 故重试时无需重判。
-            if (attempt == 0) {
-                String exclusiveRecv = null;
-                try { exclusiveRecv = hbGetElement(content, "wcpayinfo", "exclusive_recv_username"); } catch (Throwable t) { exclusiveRecv = null; }
-                if (exclusiveRecv != null && !exclusiveRecv.trim().isEmpty()) {
-                    hbBgLog("[RP] " + hbNow() + " skip exclusive (exclusive_recv_username present, worker-side). not opening. clear in-flight.");
-                    if (key != null) DONE.add(key);   // 专属: 标记完成, 避免再次入队
-                    SEEN.clear();
-                    rpClearInFlight();
-                    return;
-                }
-            }
-            // (b) nativeurl: 开封面页需要 (原热路径解析, 现移此)。
-            try { nativeurl = hbGetElement(content, "wcpayinfo", "nativeurl"); } catch (Throwable t) { nativeurl = null; }
-            if (nativeurl != null && nativeurl.length() == 0) nativeurl = null;
-            // (c) title: rpExtractTitle (原占 ~50ms 热路径 spike, 现在后台)。回填本 job[JOB_TITLE] 供 rpRecordStats 读。
-            //     首跑解析并回填; 重试时 job[JOB_TITLE] 已是首跑回填值, 不重复 parse。
-            if (attempt == 0) {
-                long _exStart = 0L; boolean _exOn = false;
-                try { _exStart = System.nanoTime(); _exOn = true; } catch (Throwable t) { _exOn = false; }
-                String hbTitle = null;
-                try { hbTitle = rpExtractTitle(content); } catch (Throwable t) { hbTitle = null; }
-                if (_exOn) {
-                    try {
-                        long exDur = System.nanoTime() - _exStart;
-                        PERF_EXTRACT_N++;
-                        PERF_EXTRACT_SUM_NS += exDur;
-                        if (exDur > PERF_EXTRACT_MAX_NS) PERF_EXTRACT_MAX_NS = exDur;
-                    } catch (Throwable t) {}
-                }
-                try { job[JOB_TITLE] = (hbTitle == null) ? "" : hbTitle; } catch (Throwable t) {}
-            }
-        }
+        hbBgLog("[RP] " + hbNow() + " hbProcess attempt=" + attempt + " -> opening cover " + UI_RECEIVE + ".");
 
         Object hostCtx = null;
         try { hostCtx = hostContext; } catch (Throwable t) { hostCtx = null; }
@@ -1405,6 +1009,7 @@ void hbProcess(Object[] job) {
         }
         if (hostCtx == null) { hbBgLog("[RP] " + hbNow() + " ABORT: no hostContext. clear in-flight."); rpClearInFlight(); return; }
 
+        String nativeurl = (key != null && key.startsWith("k:")) ? null : key;
         Intent intent = new Intent();
         if (nativeurl != null) intent.putExtra("key_native_url", nativeurl);
         if (talker != null) intent.putExtra("key_username", talker);
@@ -1682,7 +1287,7 @@ void afterCoverNoDetail() {
     long retryMs = hbJitter((long) (retrySec * 1000L * 0.75), (long) (retrySec * 1000L * 0.5));
     long dueAt = System.currentTimeMillis() + retryMs;
     // §15.5: job 重新入队 (新 dueAt + attempt+1); 复用 talker/sender/msgid/title。v1.3.0: 7 元组(含 title)。
-    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt), job[JOB_TITLE], job[JOB_CONTENT] };
+    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt), job[JOB_TITLE] };
     SEEN.clear(); // 清 Activity 去重, 下次重开封面是新实例
     rpClearInFlight();   // 先清在飞, 否则 rpEnqueue 会因"在飞"去重而拒绝重入
     rpEnqueue(reJob);
@@ -1807,13 +1412,11 @@ void rpRecordStats(String key, String talker, String senderWxid, String title, L
         if (key == null || key.isEmpty()) { hbBgLog("[RP] " + hbNow() + " stats-db: skip (key empty)."); return; }
         if (receivers == null || receivers.isEmpty()) return;
 
-        // v1.6.0: 每群独立 1-4 档 (未配置该群则 getTiers 回退全局三档, 旧行为不变)。
-        //         本函数在后台反射线程调 (写库点), 非 onHandleMsg 热路径, getTiers 读 store 满足约束。
-        List tiers = getTiers(talker);
-        int lowThr = ((Integer) ((Object[]) tiers.get(0))[0]).intValue();   // 最低档阈值(元)
+        int t1 = cfgT1(), t2 = cfgT2(), t3 = cfgT3();
+        long c1 = (long) t1 * 100L, c2 = (long) t2 * 100L, c3 = (long) t3 * 100L;
         List excl = getExcludeList(talker);   // 本群排除名单 (与 §6 同口径)
 
-        // qualifiers 序列化: 昵称|金额元|档次;...  (全部列出, >10 也全列)。档次 1..N, 严格大于、归最高满足档。
+        // qualifiers 序列化: 昵称|金额元|档次;...  (全部列出, >10 也全列)。档次 1/2/3, 严格大于、归最高档。
         StringBuilder qb = new StringBuilder();
         int qualified = 0;
         for (int i = 0; i < receivers.size(); i++) {
@@ -1826,8 +1429,11 @@ void rpRecordStats(String key, String talker, String senderWxid, String title, L
             boolean skip = false;
             for (int j = 0; j < excl.size(); j++) { if (wxid.equals(((String) excl.get(j)).trim())) { skip = true; break; } }
             if (skip) continue;
-            int tier = tierOf(tiers, cent);   // 1-based 最高满足档; 0 = 未达最低档
-            if (tier < 1) continue;   // 未超最低档, 不计入达标
+            int tier;
+            if (cent > c3) tier = 3;
+            else if (cent > c2) tier = 2;
+            else if (cent > c1) tier = 1;
+            else continue;   // 未超最低档, 不计入达标
             qualified++;
             String yuan = rpCentToYuan(cent);
             String nm = (nick == null) ? "" : nick.replace('|', '/').replace(';', ',');   // 防分隔符污染
@@ -1836,7 +1442,7 @@ void rpRecordStats(String key, String talker, String senderWxid, String title, L
         }
 
         if (qualified == 0) {
-            hbBgLog("[RP] " + hbNow() + " stats-db: 0 qualified (>" + lowThr + "元), not recorded.");
+            hbBgLog("[RP] " + hbNow() + " stats-db: 0 qualified (>" + t1 + "元), not recorded.");
             return;
         }
 
@@ -2449,20 +2055,16 @@ void hbTierAndSend(String talker, long msgid, List receivers) {
             }
         }
 
-        // v1.6.0: 每群独立 1-4 档 (未配置该群则 getTiers 回退全局三档, 旧行为不变)。
-        //         getTiers 读 store, 但此处在后台 worker 线程 (hbTierAndSend), 非 onHandleMsg 热路径, 满足约束。
-        List tiers = getTiers(talker);
-        int nTier = tiers.size();
-        int lowThr = ((Integer) ((Object[]) tiers.get(0))[0]).intValue();   // 最低档阈值(元)
-        long lowCent = (long) lowThr * 100L;
+        int t1 = cfgT1(), t2 = cfgT2(), t3 = cfgT3();
+        long c1 = (long) t1 * 100L, c2 = (long) t2 * 100L, c3 = (long) t3 * 100L;
 
         // ---- v1.0.6 §12: 分档前先剔除本群排除名单的 wxid (不 @、不计入达标总人数 → 影响 >上限 判定)。----
         List excl = getExcludeList(talker);
         int excludedHit = 0;
 
-        // 每档一个 wxid 列表 (index 0 = 档1 最低)。
-        List groups = new java.util.ArrayList();
-        for (int gi = 0; gi < nTier; gi++) groups.add(new java.util.ArrayList());
+        List g1 = new java.util.ArrayList();  // wxid 列表 (档1)
+        List g2 = new java.util.ArrayList();
+        List g3 = new java.util.ArrayList();
 
         for (int i = 0; i < receivers.size(); i++) {
             Object[] r = (Object[]) receivers.get(i);
@@ -2473,64 +2075,60 @@ void hbTierAndSend(String talker, long msgid, List receivers) {
             boolean skip = false;
             for (int j = 0; j < excl.size(); j++) { if (wxid.equals(((String) excl.get(j)).trim())) { skip = true; break; } }
             if (skip) { excludedHit++; continue; }
-            // 严格大于, 归最高满足档 (1-based)。tierOf 从最高档往低判。
-            int tn = tierOf(tiers, cent);
-            if (tn >= 1) ((List) groups.get(tn - 1)).add(wxid);
+            // 严格大于, 只归最高档
+            if (cent > c3) g3.add(wxid);
+            else if (cent > c2) g2.add(wxid);
+            else if (cent > c1) g1.add(wxid);
         }
 
-        // 达标总人数 = 各档之和 (金额 > 最低档阈值 的全部领取者, 已剔除排除名单)
-        int totalQualified = 0;
-        for (int gi = 0; gi < nTier; gi++) totalQualified += ((List) groups.get(gi)).size();
+        // 达标总人数 = 三档之和 (金额 > rp_t1 的全部领取者, 已剔除排除名单)
+        int totalQualified = g1.size() + g2.size() + g3.size();
 
         // 达标 0 人 → 不发 (维持现状)
         if (totalQualified == 0) {
-            hbBgLog("[RP] " + hbNow() + " tier: nobody qualified (>" + lowThr + "元, excluded=" + excludedHit + "). no message sent. (" + nTier + " tiers)");
+            hbBgLog("[RP] " + hbNow() + " tier: nobody qualified (>" + t1 + "元, excluded=" + excludedHit + "). no message sent.");
             return;
         }
 
         int atLimit = cfgAtLimit();
 
         // v1.1.4 §16: 发提醒拆两条 (达标≥1 才发), 严格顺序: 先第一条(引用群规) → 隔 rp_two_msg_gap_sec 秒 → 第二条(@)。
-        //   v1.6.0: 第一条群规改为 N 档循环 (列全档, 无随机无语气), 连接词固定"过X元", 动作用各档原样。
-        StringBuilder ruleSb = new StringBuilder();
-        ruleSb.append(cfgRulePrefix());
-        for (int gi = 0; gi < nTier; gi++) {
-            Object[] te = (Object[]) tiers.get(gi);
-            ruleSb.append("，过").append(((Integer) te[0]).intValue()).append("元");
-            // v1.6.0a: 动作未设(占位"未设")或空 → 只发阈值不发动作词, 不让"未设"泄漏进群消息。
-            String _act = (String) te[1];
-            if (_act != null && !_act.trim().isEmpty() && !"未设".equals(_act.trim())) ruleSb.append(_act);
-        }
-        String rule = ruleSb.toString();
+        //   1) 第一条(引用群规条): 达标≥1 (≤上限 与 >上限 都发) → rpSendQuote(talker, CUR_JOB.msgid 本地id, 固定简洁群规文本)。
+        //      v1.1.4 改动: 第一条为最简固定措辞, 不调 pickConnector/pickActionPhrase — 无随机、无语气词, 三档都列;
+        //      连接词固定写"过{X}元", 动作用配置核心词原样 (cfgTxt1/2/3), 前缀用 cfgRulePrefix() 原值。
+        //      ≤at上限 与 >at上限 两种情况都用同一条固定简洁文本 (>上限时它是唯一发的那条)。
+        //   2) 第二条(@条): 仅 1~at上限 时, 隔 rp_two_msg_gap_sec 秒后再发 → rpSendAt(talker, @文本)
+        //      (每档 [AtWx=wxid]...{连接词随机}{语气随机}, 只@达标且未排除的人)。仅第二条随机, 保持现状不变。
+        //   达标 == 0 上面已 return, 此处不会到。限频已在函数顶部判过一次 (整体一次提醒)。
+        // 第一条固定简洁群规文本 (无@, 列全三档, 无随机无语气): 前缀 + "过{t}元" + 动作核心(原样), 三档。
+        String rule = cfgRulePrefix()
+            + "，过" + t1 + "元" + cfgTxt1()
+            + "，过" + t2 + "元" + cfgTxt2()
+            + "，过" + t3 + "元" + cfgTxt3();
 
         // 第一条 (引用群规条): 达标≥1 必发。引用原红包, 失败回退 sendText(同一固定群规文本)。
         rpSendQuote(talker, msgid, rule);
 
         // v1.3.1 §16: 第二条文本 (msg2)。两种情况都带 【查包】 前缀、都隔 gap 秒延迟发 (同一机制)。
-        //   ≤ at上限 → 第二条 = 【查包】 + 逐档随机@文本 (真@到人, 仅非空档)。
-        //   > at上限 → 第二条 = 【查包】本次过{最低档阈值}元共{Y}人... (纯文字, 无@)。
+        //   ≤ at上限 → 第二条 = 【查包】 + 逐档随机@文本 (真@到人)。
+        //   > at上限 → 第二条 = 【查包】本次过{t1}元共{Y}人，人数较多不逐一提醒，请大家自觉。 (纯文字, 无@)。
         String msg2 = null;
         if (totalQualified > atLimit) {
-            // > at上限: 第二条为汇总 notice (无@, 纯文字)。{最低档阈值}(元), {Y}=达标总人数(已剔除排除名单)。
-            msg2 = "【查包】本次过" + lowThr + "元共" + totalQualified + "人，人数较多不逐一提醒，请大家自觉。";
+            // > at上限: 第二条为汇总 notice (无@, 纯文字)。{t1}=最低档阈值(元), {Y}=达标总人数(已剔除排除名单)。
+            msg2 = "【查包】本次过" + t1 + "元共" + totalQualified + "人，人数较多不逐一提醒，请大家自觉。";
             hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " > at_limit=" + atLimit
-                + " (excluded=" + excludedHit + ") -> 1.N-tier quoted group-rule (sent now), 2.【查包】summary notice (NO @, delayed " + cfgTwoMsgGap() + "s). tiers=" + nTier + ".");
+                + " (excluded=" + excludedHit + ") -> 1.fixed concise quoted group-rule (sent now), 2.【查包】summary notice (NO @, delayed " + cfgTwoMsgGap() + "s). counts: t1=" + g1.size() + " t2=" + g2.size() + " t3=" + g3.size() + ".");
         } else {
-            // 1 ~ at上限 → 第二条 (@条): 整体开头加 【查包】 前缀, 随后逐档 [AtWx=] 真@ (仅非空档)。
+            // 1 ~ at上限 → 第二条 (@条): 整体开头加 【查包】 前缀, 随后按档分组 [AtWx=] 真@ (v1.0.7 §14: 动作核心+档位原值不动, 仅连接词+语气包裹随机)。
             StringBuilder sb = new StringBuilder();
             boolean first = true;
-            for (int gi = 0; gi < nTier; gi++) {
-                List g = (List) groups.get(gi);
-                if (g.isEmpty()) continue;
-                Object[] te = (Object[]) tiers.get(gi);
-                if (!first) sb.append("\n");
-                appendTierLine(sb, g, ((Integer) te[0]).intValue(), (String) te[1]);
-                first = false;
-            }
+            if (!g1.isEmpty()) { if (!first) sb.append("\n"); appendTierLine(sb, g1, t1, cfgTxt1()); first = false; }
+            if (!g2.isEmpty()) { if (!first) sb.append("\n"); appendTierLine(sb, g2, t2, cfgTxt2()); first = false; }
+            if (!g3.isEmpty()) { if (!first) sb.append("\n"); appendTierLine(sb, g3, t3, cfgTxt3()); first = false; }
             String atText = sb.toString();
             if (atText.length() > 0) msg2 = "【查包】" + atText;   // v1.3.1: 整体开头加 【查包】 (在所有 [AtWx=]/逐档文本之前)
             hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " <= at_limit=" + atLimit
-                + " (excluded=" + excludedHit + ") -> 1.N-tier quoted group-rule (sent now), 2.【查包】+@msg via sendText (delayed " + cfgTwoMsgGap() + "s for ordering). tiers=" + nTier + ".");
+                + " (excluded=" + excludedHit + ") -> 1.fixed concise quoted group-rule (sent now), 2.【查包】+@msg via sendText (delayed " + cfgTwoMsgGap() + "s for ordering). counts: t1=" + g1.size() + " t2=" + g2.size() + " t3=" + g3.size() + ".");
         }
 
         // v1.3.1 §16: 第二条统一走"第一条后隔 rp_two_msg_gap_sec 秒发"的同一机制 (final 捕获进闭包, fire-and-forget, 不进在飞锁)。
@@ -2558,21 +2156,6 @@ void hbTierAndSend(String talker, long msgid, List receivers) {
 // v1.0.7 §14: 格式 = {@这些人}{随机连接词(已填阈值)}{随机语气包裹(已填动作原文)}。动作核心词+档位原样, 仅连接词+语气包裹随机。
 void appendTierLine(StringBuilder sb, List wxids, int threshold, String text) {
     for (int i = 0; i < wxids.size(); i++) sb.append("[AtWx=").append((String) wxids.get(i)).append("]");
-    // v1.6.0a: 动作未设(占位"未设")或空 → @文本只保留阈值连接词(去尾部逗号), 不带动作语气包裹, 不发"未设"二字。
-    String _t = (text == null) ? "" : text.trim();
-    if (_t.isEmpty() || "未设".equals(_t)) {
-        String conn = pickConnector(threshold);
-        if (conn != null) {
-            // 去掉连接词尾部的中/英文逗号 (无动作时收尾干净: "超过20元，" → "超过20元")
-            while (conn.length() > 0) {
-                char last = conn.charAt(conn.length() - 1);
-                if (last == '，' || last == ',' || last == ' ') conn = conn.substring(0, conn.length() - 1);
-                else break;
-            }
-        } else conn = "超过" + threshold + "元";
-        sb.append(" ").append(conn);
-        return;
-    }
     sb.append(" ").append(pickConnector(threshold)).append(pickActionPhrase(text));
 }
 
@@ -2747,7 +2330,7 @@ void showConfigDialog(final String groupId) {
     root.setBackground(_rpRound("#0F1115", 0));
 
     android.widget.TextView title = new android.widget.TextView(ctx);
-    title.setText("🧧 红包统计 v1.6.0 配置");
+    title.setText("🧧 红包统计 v1.5.0 配置");
     title.setTextColor(_rpC("#E8E9EC"));
     title.setTextSize(18);
     title.setPadding(0, 0, 0, 8 * dp);
@@ -2787,45 +2370,21 @@ void showConfigDialog(final String groupId) {
         root.addView(hint);
     }
 
-    // v1.6.0: 档位编辑。
-    //   groupId 非空 → 编辑本群档表 (1-RP_MAX_TIERS 档), 用单个多行 EditText (每行 "阈值 动作"), 保存按行解析 setTiers。
-    //     (降级方案: 避免动态成对输入框在 UI 线程的遍历/ANR 风险; 仅一个 EditText, 无主线程重活。)
-    //   groupId 为空 (全局面板) → 仍编辑全局默认三档 (cfgT1/2/3 + cfgTxt1/2/3), 作为未配置群的回退源。
-    final android.widget.EditText tierBox;
-    final android.widget.EditText e1; final android.widget.EditText e2; final android.widget.EditText e3;
-    final android.widget.EditText t1; final android.widget.EditText t2; final android.widget.EditText t3;
-    if (groupId != null) {
-        _rpLabel(root, ctx, "本群档位 (1-10 行, 每行: 阈值 动作; 阈值正整数递增)");
-        StringBuilder pre = new StringBuilder();
-        List _tt = getTiers(groupId);
-        for (int i = 0; i < _tt.size(); i++) {
-            Object[] te = (Object[]) _tt.get(i);
-            if (i > 0) pre.append("\n");
-            pre.append(((Integer) te[0]).intValue()).append(" ").append((String) te[1]);
-        }
-        android.widget.EditText tb = _rpEdit(ctx, pre.toString(), false);
-        tb.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        tb.setMinLines(2); tb.setMaxLines(11); tb.setSingleLine(false);
-        root.addView(tb);
-        tierBox = tb;
-        e1 = null; e2 = null; e3 = null; t1 = null; t2 = null; t3 = null;
-    } else {
-        tierBox = null;
-        // 阈值 (全局默认源)
-        _rpLabel(root, ctx, "全局默认三档阈值 (元, 严格大于; 仅作未配置群的回退)");
-        e1 = _rpEdit(ctx, String.valueOf(cfgT1()), true); root.addView(e1);
-        _rpSpacer(root, ctx, 4 * dp);
-        e2 = _rpEdit(ctx, String.valueOf(cfgT2()), true); root.addView(e2);
-        _rpSpacer(root, ctx, 4 * dp);
-        e3 = _rpEdit(ctx, String.valueOf(cfgT3()), true); root.addView(e3);
-        // 文案 (v1.0.7 §14: 动作核心词原样, 周围措辞会自动随机)
-        _rpLabel(root, ctx, "全局默认三档动作核心词 (原样, 周围措辞会自动随机)");
-        t1 = _rpEdit(ctx, cfgTxt1(), false); root.addView(t1);
-        _rpSpacer(root, ctx, 4 * dp);
-        t2 = _rpEdit(ctx, cfgTxt2(), false); root.addView(t2);
-        _rpSpacer(root, ctx, 4 * dp);
-        t3 = _rpEdit(ctx, cfgTxt3(), false); root.addView(t3);
-    }
+    // 阈值
+    _rpLabel(root, ctx, "三档阈值 (元, 严格大于)");
+    final android.widget.EditText e1 = _rpEdit(ctx, String.valueOf(cfgT1()), true); root.addView(e1);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText e2 = _rpEdit(ctx, String.valueOf(cfgT2()), true); root.addView(e2);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText e3 = _rpEdit(ctx, String.valueOf(cfgT3()), true); root.addView(e3);
+
+    // 文案 (v1.0.7 §14: 动作核心词原样, 周围措辞会自动随机)
+    _rpLabel(root, ctx, "三档动作核心词 (原样, 周围措辞会自动随机)");
+    final android.widget.EditText t1 = _rpEdit(ctx, cfgTxt1(), false); root.addView(t1);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText t2 = _rpEdit(ctx, cfgTxt2(), false); root.addView(t2);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText t3 = _rpEdit(ctx, cfgTxt3(), false); root.addView(t3);
 
     // 延迟
     _rpLabel(root, ctx, "首次延迟 / 重试1 / 重试2 (秒)");
@@ -2870,77 +2429,8 @@ void showConfigDialog(final String groupId) {
     saveBtn.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
             try {
-                if (groupId != null && tierBox != null) {
-                    // v1.6.1: 本群档表按行解析 (每行 "阈值 动作")。逐行校验, 收集行号错误;
-                    //   全部行无效 → 不保存(不破坏原档表), toast 提示; 部分有效 → 仅存有效行(与 v1.6.0 全有效才用一致, 这里保留有效行)。
-                    String raw = tierBox.getText().toString();
-                    List parsed = new java.util.ArrayList();
-                    String[] lines = raw.split("\n");
-                    StringBuilder errs = new StringBuilder();
-                    int errCount = 0;
-                    int nonEmptyLineNo = 0;
-                    boolean overflow = false;
-                    for (int i = 0; i < lines.length; i++) {
-                        String ln = lines[i].trim();
-                        if (ln.isEmpty()) continue;
-                        nonEmptyLineNo++;
-                        if (parsed.size() >= RP_MAX_TIERS) {
-                            overflow = true;
-                            continue;
-                        }
-                        int sp = ln.indexOf(' ');
-                        if (sp < 0) {
-                            rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行格式错(缺动作)");
-                            errCount++;
-                            continue;
-                        }
-                        String ts = ln.substring(0, sp).trim();
-                        String act = sanitizeTierAction(ln.substring(sp + 1));
-                        int thr;
-                        try {
-                            thr = Integer.parseInt(ts);
-                        } catch (Throwable t) {
-                            rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值非整数");
-                            errCount++;
-                            continue;
-                        }
-                        if (thr <= 0) {
-                            rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值需正整数");
-                            errCount++;
-                            continue;
-                        }
-                        if (act.isEmpty()) {
-                            rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行缺动作");
-                            errCount++;
-                            continue;
-                        }
-                        boolean dup = false;
-                        for (int j = 0; j < parsed.size(); j++) {
-                            if (((Integer) ((Object[]) parsed.get(j))[0]).intValue() == thr) {
-                                dup = true;
-                                break;
-                            }
-                        }
-                        if (dup) {
-                            rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值重复");
-                            errCount++;
-                            continue;
-                        }
-                        parsed.add(new Object[]{ Integer.valueOf(thr), act });
-                    }
-                    if (overflow) {
-                        rpAppendErr(errs, errCount, "最多 " + RP_MAX_TIERS + " 档, 超出已截断");
-                    }
-                    if (parsed.isEmpty()) {
-                        toast("❌ 档位为空或全部无效, 未保存档位 (其他配置已存)" + (errs.length() > 0 ? ": " + errs.toString() : ""));
-                    } else {
-                        setTiers(groupId, parsed);
-                        if (errCount > 0 || overflow) { toast("⚠️ 部分档位行有误已忽略 (" + errs.toString() + "), 已存 " + parsed.size() + " 档"); }
-                    }
-                } else {
-                    saveIntField(K_T1, e1); saveIntField(K_T2, e2); saveIntField(K_T3, e3);
-                    saveStrField(K_TXT1, t1); saveStrField(K_TXT2, t2); saveStrField(K_TXT3, t3);
-                }
+                saveIntField(K_T1, e1); saveIntField(K_T2, e2); saveIntField(K_T3, e3);
+                saveStrField(K_TXT1, t1); saveStrField(K_TXT2, t2); saveStrField(K_TXT3, t3);
                 saveLongField(K_DELAY, d0); saveLongField(K_RETRY1, d1); saveLongField(K_RETRY2, d2);
                 saveIntField(K_AT_LIMIT, al);
                 toast("✅ 配置已保存");
@@ -3058,25 +2548,8 @@ void perfFlush() {
         final long fN = n;
         final long fSum = PERF_SUM_NS;
         final long fMax = PERF_MAX_NS;
-        // v1.6.2: spike 归因字段快照。
-        final long fRpN = PERF_RP_N;
-        final long fRpSum = PERF_RP_SUM_NS;
-        final long fRpMax = PERF_RP_MAX_NS;
-        final long fNormN = PERF_NORM_N;
-        final long fNormSum = PERF_NORM_SUM_NS;
-        final long fNormMax = PERF_NORM_MAX_NS;
-        final long fSpikeN = PERF_SPIKE_N;
-        final long fSpikeRp = PERF_SPIKE_RP_N;
-        final long fSpikeNorm = PERF_SPIKE_NORM_N;
-        final long fExN = PERF_EXTRACT_N;
-        final long fExSum = PERF_EXTRACT_SUM_NS;
-        final long fExMax = PERF_EXTRACT_MAX_NS;
-        // 清零窗口 (快照后立即清, 新样本进下一窗口)。v1.6.2 新增组同步清零。
+        // 清零窗口 (快照后立即清, 新样本进下一窗口)。
         PERF_N = 0L; PERF_SUM_NS = 0L; PERF_MAX_NS = 0L;
-        PERF_RP_N = 0L; PERF_RP_SUM_NS = 0L; PERF_RP_MAX_NS = 0L;
-        PERF_NORM_N = 0L; PERF_NORM_SUM_NS = 0L; PERF_NORM_MAX_NS = 0L;
-        PERF_SPIKE_N = 0L; PERF_SPIKE_RP_N = 0L; PERF_SPIKE_NORM_N = 0L;
-        PERF_EXTRACT_N = 0L; PERF_EXTRACT_SUM_NS = 0L; PERF_EXTRACT_MAX_NS = 0L;
         new Thread() {
             public void run() {
                 try {
@@ -3084,19 +2557,8 @@ void perfFlush() {
                     long maxUs = fMax / 1000L;
                     long nowMs = System.currentTimeMillis();
                     String iso = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date(nowMs));
-                    // v1.6.2: A/B 分类均值/最大 (各自 n 为 0 时置 0, 防除零)。
-                    long rpAvgUs = (fRpN > 0L) ? ((fRpSum / fRpN) / 1000L) : 0L;
-                    long rpMaxUs = fRpMax / 1000L;
-                    long normAvgUs = (fNormN > 0L) ? ((fNormSum / fNormN) / 1000L) : 0L;
-                    long normMaxUs = fNormMax / 1000L;
-                    long exAvgUs = (fExN > 0L) ? ((fExSum / fExN) / 1000L) : 0L;
-                    long exMaxUs = fExMax / 1000L;
                     String line = "ts=" + nowMs + " iso=" + iso + " n=" + fN
-                        + " ohm_avg_us=" + avgUs + " ohm_max_us=" + maxUs
-                        + " rp_msg_n=" + fRpN + " rp_msg_avg_us=" + rpAvgUs + " rp_msg_max_us=" + rpMaxUs
-                        + " norm_avg_us=" + normAvgUs + " norm_max_us=" + normMaxUs
-                        + " spike_n=" + fSpikeN + " spike_rp=" + fSpikeRp + " spike_norm=" + fSpikeNorm
-                        + " rp_extract_n=" + fExN + " rp_extract_avg_us=" + exAvgUs + " rp_extract_max_us=" + exMaxUs + "\n";
+                        + " ohm_avg_us=" + avgUs + " ohm_max_us=" + maxUs + "\n";
                     java.io.FileWriter fw = new java.io.FileWriter(PERF_LOG, true);  // append
                     try { fw.write(line); } finally { fw.close(); }
                 } catch (Throwable t) {

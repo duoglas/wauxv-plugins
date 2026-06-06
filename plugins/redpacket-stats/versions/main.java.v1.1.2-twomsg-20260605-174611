@@ -1,0 +1,1809 @@
+// RedPacketStats — v1.1.2 (正式插件)
+//
+// v1.1.2: 发提醒拆"两条"(SPEC §16 终版)。实测结论(2026-06-05, 用户真机):
+//         · sendQuoteMsg(talker, 本地msgId(msg.getMsgId(), 小数字), content) 能成功引用原红包消息;
+//           但 content 里的 [AtWx=wxid] 在引用消息里**不会被解析成真@**, 被@者收不到提醒。
+//         · sendText(talker, "[AtWx=wxid] ...") 的 @ 真生效, 被@者收到提醒。
+//         → 引用 与 @ 不能一条兼得, 故拆两条 (同一次提醒, 共享 30s 同群限频, 限频判定在发两条之前):
+//           1) 引用条 (达标≥1 必发, ≤上限 与 >上限 都发): rpSendQuote(talker, CUR_JOB.msgid, 群规文本)。
+//              群规文本 = 前缀 + 三档组合规则 (列全配置三档, 无名字无@), 两种情况内容一致。
+//           2) @条 (仅 1~at上限 发): rpSendAt(talker, @文本) — 每档 [AtWx=wxid]...{连接词}{语气} 真@到人。
+//         · 达标 == 0 → 两条都不发。 > at上限 → 只发引用群规条 (不发@条)。
+//         健壮: 引用条 sendQuoteMsg 抛异常/msgid≤0 → 回退 sendText(不带引用的同一群规文本); @条始终 sendText。绝不因引用失败漏@。
+//         本基线 (queue-wip) 已无 v1.1.x 临时测试命令 (红包引用测试/rpRunQuoteTest/rpTryReflectMsgId/SvrId/rpTail/LAST_HB_*)。
+//         队列/单飞/看门狗/CUR_JOB归属/重试重新入队/检测/专属过滤/开页/封面三分支/反射/结构化提取/分档/排除/普通跳过/文案随机/finish精确/抖动/ANR上界/onClickSendBtn 全不动。
+//
+// v1.1.1(已被 v1.1.2 取代): @提醒尝试"引用红包+@"同条。实测证明引用条内 [AtWx=] 不解析, @未到人 → v1.1.2 改发两条。
+//
+// v1.1.0: 调度层重构(SPEC §15) + 发提醒引用原红包(SPEC §16)。主干(开页/封面三分支/反射/分档/排除/上限/文案随机/关页/抖动/限频/ANR上界)逻辑全不动, 只换调度驱动 + 末端发送方式。
+//         A. 队列+单工作者(单飞, §15): 旧"每红包各自 delay(hbProcess)"红包雨并发开页对撞、全局态被踩 → 改单工作者串行驱动。
+//            · Job={nativeurl(=去重key), talker, sender, msgid, dueAt(ms), attempt}。
+//            · 生产者(onHandleMsg): 检测→dueAt=now+首次延迟(秒×1000,抖动), attempt=0 → 入队(synchronized RP_QUEUE, 按 key 去重: 在队/在飞/已完成都不重入)。上限 RP_QUEUE_MAX=50 满则丢最旧+log。不再 per-红包 delay。
+//            · 单工作者 rpWorkerTick(): onLoad 启动, 每 tick 末 delay(RP_TICK_MS=3000,自己) 自重调度(仿 GroupAdmin l3FlushLoop; 整体 try/catch+finally 必重调度不停摆)。
+//              每 tick: 看门狗(在飞且 now-inflightStartMs>RP_WATCHDOG_MS=30000 → 强清在飞) → 有在飞 return(单飞) → 否则挑 dueAt≤now 最早 job 出队 → IN_FLIGHT=true+inflightStartMs=now+CUR_JOB=job → hbProcess(job)。
+//            · CUR_JOB 归属: 当前处理红包上下文统一成 CUR_JOB(Job 对象), onResume hook(路由/反射/发送/关页)全用 CUR_JOB 取。单飞下不会被踩; SEEN.clear() 只影响当前 job。
+//            · 退出点必清在飞: 发完成功/普通跳过/金额全等跳过/attempt≥2放弃/任何异常 → IN_FLIGHT=false;CUR_JOB=null。没领完重试 → job 重新入队(dueAt=now+重试间隔(秒×1000,抖动),attempt+1)+清在飞(重试不再独立 delay)。
+//         B. 发提醒(§16, v1.1.2 终版): 拆两条 — 引用条 rpSendQuote(talker,msgid,群规文本) + @条 rpSendAt(talker,@文本)。
+//            · 引用条: 达标≥1 必发, sendQuoteMsg 引用原红包(纯群规, 无@); msgid≤0/抛异常 → 回退 sendText(同一群规文本)。
+//            · @条: 仅 1~at上限 发, sendText 解析 [AtWx=] 真@到人 (引用条内 @ 实测不解析, 故拆开)。
+//            · msgid=本地 msg.getMsgId()(非 srvid), Job 里已存。达标0不发; >at上限只发引用条。
+//
+// v1.0.7: 措辞随机改造(SPEC §14)。撤销 v1.0.6 的动作多变体(| 分隔 + pickVariant); 动作核心词/群规前缀恢复单值原样录入。
+//         随机仅两处: pickConnector(阈值)=金额连接词随机(超过{X}元/过{X}/...), pickActionPhrase(动作原文)=语气包裹随机({A}/快点{A}啊/记得{A}哦/...)。
+//         动作核心词、金额档位、群规前缀始终原样, 不参与随机。主干(检测/专属/开页/封面三分支/反射/分档/排除/上限/重试/onClickSendBtn/抖动/限频/finish/ANR上界)全不动。
+// v1.0.6: 新增红包提醒排除名单(按群) + 反检测硬化。主干(检测/专属过滤/开页/封面三分支/反射/结构化提取/重试放弃/onClickSendBtn配置命令/秒级延迟/ANR上界)不动。
+//         A. 排除名单(SPEC §12): 按群 key rp_exclude_<groupId>(CSV wxid)。排除名单里的人永不被红包提醒@, 也不计入@上限人数。
+//            · @增删走 onHandleMsg 路径(onClickSendBtn 只收纯文本, 拿不到 @ 目标 wxid): sender==getLoginWxid() 且 atList 非空时,
+//              文本含"红包排除"(非取消)→加入名单+toast; 含"取消红包排除"/"红包取消排除"→移除+toast。命中即 return, 不当红包处理, 不发群回执(只 toast)。
+//            · Dialog(红包统计设置)加"排除名单"块, 列本群成员(lookupName 昵称)+每人"移除"按钮。
+//            · hbTierAndSend 分档前剔除本群排除名单 wxid(不@/不计入达标总人数→也影响 >上限 判定)。
+//         B. 反检测硬化(SPEC §13): ① hbJitter(base,span)=base+Math.random()*span 抖动: 首次/重试±25%, 点击 1500~2800ms, 反射 3000~4500ms。
+//            ② DEF_AT_LIMIT 20→10。③ 同群@限频 rp_msg_min_gap_sec(默认30s): 内存 Map 记每群上次发提醒时间, <间隔则跳过本次。
+//            ④ 删 detect-fields 调试解析(5字段重复 parse), 专属判定保留(只解析 exclusive_recv_username 一个)。
+//            ⑤ finish 精确: finish 前先确认 getTopActivity() 类名含 luckymoney 才 finish, 否则不 finish(避免误关用户正在看的页面)。
+//
+// v1.0.5: 普通红包封面阶段即跳过, 不再多开一次详情页。封面 receive-decide 找到【可点】detail 入口后, 按入口文字区分:
+//         · 含"手气"(看看大家的手气) → 拼手气领完 → 照旧 performClick 进详情(反射→分档→@)。
+//         · 不含"手气"(查看领取详情) → 普通红包领完 → 不点击、finish 封面、清状态、跳过, log `skip normal (cover=...)`, 不开详情/不发消息。
+//         · 没找到任何可点 detail 入口 → 维持原"没领完"逻辑(关页 + 重试两次后放弃), 不误判为普通。
+//         反射后"金额全等→跳过"(v1.0.4②) 保留作兜底安全网。其余已验证逻辑(检测/专属过滤/开页/反射/分档/@/>20群规/重试放弃/onClickSendBtn/延迟)不动。ANR 铁律不变。
+//
+// v1.0.4: 仅处理拼手气红包。新增三处过滤(其余已验证逻辑不动):
+//         ① 专属红包(wcpayinfo.exclusive_recv_username 非空)→ onHandleMsg 检测即跳过(不开页/不排程), log `skip exclusive`。
+//         ② 普通红包(均分)→ 反射读到领取者列表后、分档发消息前: 领取者≥2人 且 所有金额(分)全等 → 判普通, 清状态/关页/不发任何消息, log `skip normal(equal amounts)`; 金额有差异(拼手气)正常走分档+发消息; 1人无法判定按正常处理。
+//         ③ 检测时一行脱敏调试 log(detect-fields): 记 exclusive_recv 是否非空 + totalnum/scenetext/type/hbtype/sceneid 是否存在及短值(不记 wxid/sign 原文), 便于以后找"开页前识别普通红包"的字段。
+//         全程 try/catch; 普通过滤仅在已成功反射到列表后判断, 反射不到列表维持原逻辑不误判。ANR 铁律不动。
+//
+// v1.0.3: 延迟配置单位由毫秒改为秒。新键 rp_first_sec(默认120=2分)/rp_retry1_sec(300=5分)/rp_retry2_sec(600=10分),
+//         旧 rp_*_ms 毫秒键废弃不再读 (onLoad 清空避免残留)。delay() 内部 sec×1000L 换算 ms (long 防溢出)。
+//         命令『红包延迟』支持秒: 单参设首次 / 三参设首次+重试1+重试2 / 空参显示当前; Dialog+状态显示均改秒。
+//
+// v1.0.2: 配置命令改用 onClickSendBtn 拦截 (bot 一点发送即拦下, return true 阻止消息发到群里),
+//         就地执行 (弹 Dialog / 改配置) + toast 本地提示, 不再 sendText 回执到群 (不污染群)。
+//         当前会话群用 getTargetTalker() 获取 (仿 GroupAdmin)。
+//         onHandleMsg 移除全部配置命令与发群回执, 只保留红包检测/排程。
+//         修 `红包统计设置` Dialog: 经 onClickSendBtn (UI 线程上下文) 调 getTopActivity()+AlertDialog → 能正常弹出。
+//
+// v1.0.1: 达标总人数 (金额>rp_t1 的三档之和) > rp_at_limit(默认20) 时, 不再单独 @,
+//         改发一条无 @ 通用群规消息; 新增配置 rp_at_limit (Dialog + 命令『红包at上限 N』+ 状态显示)。
+//
+// 群红包领完后, 自动开页读明细 → 按金额阈值分档 → 群内发一条 @ 消息圈出"手气好"的人。
+//
+// 完整链路 (SPEC §4):
+//   onHandleMsg(廉价): 群聊 + (type==436207665 或含 <nativeurl>) → 本群启用? 否则 return
+//     → 提 nativeurl/talker/sender/msgid → 存红包运行态(内存 Map, attempt=0) → delay(rp_first_sec×1000) → hbProcess
+//   hbProcess(nativeurl): 启动器拉封面页 NewReceiveUI。
+//   NewReceiveUI.onResume: delay 后 UI 有界查找 detail 入口("看看大家的手气"/"查看领取详情" 且可点)
+//     ├─ 可点且含"手气"(拼手气领完) → performClick → 微信流转 NewDetailUI
+//     ├─ 可点但不含"手气"="查看领取详情"(普通领完) → 不点击 → finish 封面 → 清状态跳过(不开详情/不发消息)
+//     └─ 无可点入口(=没领完) → 绝不点领取/不抢 → finish() 关封面 → 按 attempt 重试(0→retry1, 1→retry2, 2→放弃)
+//   NewDetailUI.onResume: delay 后【后台反射】读领取者 List → 结构化提取(d/f/n 首选 + 抗版本兜底)
+//     → finish() 关详情页 → 分档 → 发一条 [AtWx=...] 消息到 talker → 清状态(去重, 每红包只成功处理一次)
+//
+// !!! ANR 铁律 (已 ANR 两次, 死守):
+//   1. 开页/启动器 = startActivity/callStaticMethod, 不遍历。
+//   2. 查找点击 = UI 线程一次性有界 BFS(节点 ≤800 / 深度 ≤50) + 单次 performClick + 零文件IO。
+//   3. 反射全在后台线程 + 强上界(MAX_VISIT=4000 / MAX_DEPTH=6) + identityHashCode 去重防环。
+//   4. 关页 finish() 在 UI 线程调, try/catch。
+//   5. 每个 Activity 实例 identityHashCode 去重; 每红包 nativeurl 去重。
+//   6. onHandleMsg 只廉价判定 + 判启用 + 存状态 + 排一个 delay。
+//   7. 全程 try/catch(Throwable), 任何异常不抛回微信。
+//
+// 隐私: 昵称/金额/wxid 是真实数据(用于发消息), 绝不写进明文日志文件; 调试 log 仍脱敏。
+
+import android.app.Activity;
+import android.content.Intent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodHook.MethodHookParam;
+import de.robv.android.xposed.XposedHelpers;
+
+// ==================== 配置 key 与默认值 (SPEC §3) ====================
+String K_ENABLED = "rp_enabled_groups";
+String K_T1 = "rp_t1"; String K_T2 = "rp_t2"; String K_T3 = "rp_t3";
+String K_TXT1 = "rp_txt1"; String K_TXT2 = "rp_txt2"; String K_TXT3 = "rp_txt3";
+String K_DELAY = "rp_first_sec"; String K_RETRY1 = "rp_retry1_sec"; String K_RETRY2 = "rp_retry2_sec";
+String K_AT_LIMIT = "rp_at_limit";
+String K_MSG_GAP = "rp_msg_min_gap_sec";          // 同群两条红包提醒最小间隔(秒, v1.0.6 §13.3)
+String K_EXCLUDE_PREFIX = "rp_exclude_";          // 按群排除名单前缀: rp_exclude_<groupId> (CSV wxid, v1.0.6 §12)
+
+int DEF_T1 = 5; int DEF_T2 = 10; int DEF_T3 = 20;
+// v1.0.7 §14: 动作文案 = 用户自定义录入的内容, 原样使用, 绝不随机/改动。每档单值。
+String DEF_TXT1 = "爆照";
+String DEF_TXT2 = "宣群";
+String DEF_TXT3 = "发视频";
+// 通用群规消息前缀(>at上限时发, 无@), 单值原样使用。
+String K_RULE_PREFIX = "rp_rule_prefix";
+String DEF_RULE_PREFIX = "领红包请遵守群规执行";
+// v1.0.7 §14: 只在"金额连接词"和"动作语气包裹"上随机, 去机器指纹。动作核心词/前缀/档位均不动(用户原样录入)。
+// 内置默认连接词变体 (带 {X} 占位, X=该档阈值)。
+String[] DEF_CONNECTORS = new String[] { "超过{X}元，", "过{X}元，", "过{X}，", "{X}元以上，", "领超{X}元，" };
+// 内置默认动作语气包裹变体 (带 {A} 占位, A=该档动作核心原文)。包裹只改语气词, {A} 始终原样。
+String[] DEF_ACTION_PHRASES = new String[] { "{A}", "快点{A}啊", "记得{A}哦", "需要{A}", "该{A}了", "麻烦{A}一下" };
+long DEF_DELAY = 120L;    // 首次延迟 120 秒 = 2 分钟 (正式默认; spike 测试可经命令/Dialog 临时设短如 60)
+long DEF_RETRY1 = 300L;   // 重试1 300 秒 = 5 分钟
+long DEF_RETRY2 = 600L;   // 重试2 600 秒 = 10 分钟
+int DEF_AT_LIMIT = 10;       // 达标总人数 > 此值则改发无 @ 通用群规消息 (SPEC §6.1; v1.0.6 默认 20→10)
+long DEF_MSG_GAP = 30L;      // 同群两条红包提醒最小间隔(秒, v1.0.6 §13.3)
+
+// ==================== 对象图遍历强上界 (ANR 防护) ====================
+int MAX_VISIT = 4000;
+int MAX_DEPTH = 6;
+
+// 详情页落地后, 后台反射等 cgi 数据到位 (v1.0.6: 抖动 3000~4500ms, 去零方差; 每次调用 hbJitter 现算)
+int REFLECT_DELAY_BASE_MS = 3000; int REFLECT_DELAY_SPAN_MS = 1500;
+// 封面页落地后, UI 线程有界查找 detail 入口 (v1.0.6: 抖动 1500~2800ms; 每次调用 hbJitter 现算)
+int RECEIVE_CLICK_DELAY_BASE_MS = 1500; int RECEIVE_CLICK_DELAY_SPAN_MS = 1300;
+
+// 随机抖动 helper (v1.0.6 §13.1): base + Math.random()*span。去零方差机器指纹。
+// BeanShell 设备上 Math.random() 可用; 任何异常退回 base (绝不返回负/0 异常值)。
+long hbJitter(long baseMs, long spanMs) {
+    try {
+        if (spanMs <= 0L) return baseMs;
+        return baseMs + (long) (Math.random() * (double) spanMs);
+    } catch (Throwable t) { return baseMs; }
+}
+
+// View 树查找强上界
+int CLICK_MAX_NODES = 800;
+int CLICK_MAX_DEPTH = 50;
+
+// 防重复注册守卫
+boolean HOOKED = false;
+
+// 每 Activity 实例只处理一次 (key = identityHashCode)
+java.util.Set SEEN = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+// 每红包只成功处理一次 (key = nativeurl)
+java.util.Set DONE = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+// v1.1.0: 旧"红包运行态 RP_STATE"已被 Job 队列(§15)取代; talker/sender/msgid/attempt 全部随 Job 在队列/CUR_JOB 中携带, 不再单独存 Map。
+
+// onHandleMsg 去重 (每红包只排一次首跑)
+java.util.Set OPENED = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+// bot 自己开的封面页 Activity (key = nativeurl -> identityHashCode of NewReceiveUI), 用于点详情成功后连封面一起 finish
+java.util.Map COVER_ACT = java.util.Collections.synchronizedMap(new java.util.HashMap());
+
+// ==================== v1.1.0 §15: 队列 + 单工作者(单飞) ====================
+// Job = Object[]{ nativeurl(=去重key, String), talker(String), sender(String), msgid(Long), dueAt(Long, ms), attempt(Integer) }
+// 索引常量 (BeanShell 无 enum, 用 int 常量映射)
+int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5;
+// 待处理 Job 队列 (生产者 onHandleMsg 入队; 单工作者出队)。所有读写持 RP_QUEUE 自身锁 (synchronized(RP_QUEUE))。
+java.util.List RP_QUEUE = new java.util.ArrayList();
+int RP_QUEUE_MAX = 50;           // 队列上限: 满则丢最旧一条 + log
+int RP_TICK_MS = 3000;           // 单工作者自重调度间隔
+long RP_WATCHDOG_MS = 30000L;    // 看门狗: 在飞超过此值强清 (防卡死)
+boolean WORKER_STARTED = false;  // 防重复启动工作者
+// 在飞态 (单飞: 同一时刻只一个红包流水线)。CUR_JOB = 当前处理的 Job 对象 (旧 CUR_NATIVEURL 升级)。
+boolean IN_FLIGHT = false;
+Object[] CUR_JOB = null;
+long inflightStartMs = 0L;
+
+// 同群红包提醒上次发送时间 (groupId -> lastSentMs), 用于 @ 限频 (v1.0.6 §13.3, 内存, 不落盘)
+java.util.Map RP_LAST_MSG = java.util.Collections.synchronizedMap(new java.util.HashMap());
+
+String HB_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/rp.log";
+
+String UI_RECEIVE = "LuckyMoneyNewReceiveUI";
+String UI_DETAIL  = "LuckyMoneyNewDetailUI";
+String LM_PKG = "com.tencent.mm.plugin.luckymoney";
+int HB_MSG_TYPE = 436207665;
+
+// detail 入口文案 (已领完才有这种"可点"入口)
+String[] DETAIL_TEXTS = {"看看大家的手气", "查看领取详情"};
+
+void onLoad() {
+    try { log("RedPacketStats v1.1.1 loaded."); } catch (Throwable t) {}
+    // 旧毫秒键废弃, 清空避免残留混淆 (新键 rp_first_sec/rp_retry1_sec/rp_retry2_sec 为秒)
+    try { putString("rp_delay_ms", ""); putString("rp_retry1_ms", ""); putString("rp_retry2_ms", ""); } catch (Throwable t) {}
+    if (HOOKED) { try { log("RedPacketStats hook already registered, skip."); } catch (Throwable t) {} return; }
+    try {
+        XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                try { hbOnActivityResume(param.thisObject); } catch (Throwable t) {}
+            }
+        });
+        HOOKED = true;
+        // v1.1.0 §15: 启动单工作者 tick (串行驱动红包流水线)。仿 GroupAdmin l3FlushLoop 自重调度。
+        if (!WORKER_STARTED) {
+            WORKER_STARTED = true;
+            try {
+                delay(RP_TICK_MS, new Runnable() { public void run() { rpWorkerTick(); } });
+                log("RedPacketStats worker started (queue+single-flight, tick=" + RP_TICK_MS + "ms).");
+                hbBgLog("[RP] " + hbNow() + " v1.1.2 worker started: queue(max=" + RP_QUEUE_MAX + ")+single-flight worker tick=" + RP_TICK_MS + "ms, watchdog=" + RP_WATCHDOG_MS + "ms.");
+            } catch (Throwable t) { try { log("RedPacketStats worker start FAIL: " + t); } catch (Throwable t2) {} }
+        }
+        try { log("RedPacketStats Activity.onResume hooked + onHandleMsg redpacket-stats enabled."); } catch (Throwable t) {}
+        hbBgLog("[RP] " + hbNow() + " v1.1.2 loaded. per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
+            + "detect→[skip exclusive]→enqueue(dedup,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB)→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered)→[skip normal/equal]→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
+            + "v1.1.2: 发提醒拆两条 — qualified>=1: rpSendQuote(talker,CUR_JOB.msgid,群规文本)引用原红包(无@,失败回退sendText); qualified 1~at_limit additionally rpSendAt(talker,@文本)真@(sendText). qualified==0不发; >at_limit只发引用群规条. 限频对整次提醒判一次. (实测:引用条内[AtWx=]不解析,sendText的@真生效→拆两条). "
+            + "v1.1.0: queue+single-flight worker(§15, CUR_JOB归属/看门狗/重试重新入队/退出点清在飞). v1.0.7: per-group exclude, jitter, at_limit=10, rate-limit, finish精确. 措辞随机=pickConnector+pickActionPhrase. ANR rules enforced.");
+    } catch (Throwable t) {
+        try { log("RedPacketStats hook register FAIL: " + t); } catch (Throwable t2) {}
+    }
+}
+
+void onUnload() {}
+
+// ==================== 配置 getter ====================
+int cfgT1() { return cfgInt(K_T1, DEF_T1); }
+int cfgT2() { return cfgInt(K_T2, DEF_T2); }
+int cfgT3() { return cfgInt(K_T3, DEF_T3); }
+String cfgTxt1() { return cfgStr(K_TXT1, DEF_TXT1); }
+String cfgTxt2() { return cfgStr(K_TXT2, DEF_TXT2); }
+String cfgTxt3() { return cfgStr(K_TXT3, DEF_TXT3); }
+long cfgDelay() { return cfgLong(K_DELAY, DEF_DELAY); }
+long cfgRetry1() { return cfgLong(K_RETRY1, DEF_RETRY1); }
+long cfgRetry2() { return cfgLong(K_RETRY2, DEF_RETRY2); }
+int cfgAtLimit() { return cfgInt(K_AT_LIMIT, DEF_AT_LIMIT); }
+long cfgMsgGap() { return cfgLong(K_MSG_GAP, DEF_MSG_GAP); }
+
+int cfgInt(String key, int def) {
+    try { String s = getString(key, ""); if (s == null || s.isEmpty()) return def; return Integer.parseInt(s.trim()); }
+    catch (Throwable t) { return def; }
+}
+long cfgLong(String key, long def) {
+    try { String s = getString(key, ""); if (s == null || s.isEmpty()) return def; return Long.parseLong(s.trim()); }
+    catch (Throwable t) { return def; }
+}
+String cfgStr(String key, String def) {
+    try { String s = getString(key, ""); if (s == null || s.isEmpty()) return def; return s; }
+    catch (Throwable t) { return def; }
+}
+String cfgRulePrefix() { return cfgStr(K_RULE_PREFIX, DEF_RULE_PREFIX); }
+
+// 统计 "A|B|C" 里的非空变体数 (toast 提示用)。
+int rpVariantCount(String raw) {
+    try {
+        if (raw == null || raw.isEmpty()) return 0;
+        if (raw.indexOf('|') < 0) return 1;
+        String[] arr = raw.split("\\|");
+        int n = 0;
+        for (int i = 0; i < arr.length; i++) if (!arr[i].trim().isEmpty()) n++;
+        return n == 0 ? 1 : n;
+    } catch (Throwable t) { return 1; }
+}
+
+// v1.0.7 §14: 只随机"连接词"(金额与动作之间的措辞), 去机器指纹。
+// 从内置 DEF_CONNECTORS 随机挑一条, 把 {X} 占位替换为该档阈值, 返回已填阈值的连接词。
+// 动作文案 / 群规前缀 / 档位均不参与随机, 用户录入什么就原样发什么。
+String pickConnector(int threshold) {
+    try {
+        String[] arr = DEF_CONNECTORS;
+        if (arr == null || arr.length == 0) return "超过" + threshold + "元，";
+        int idx = (int) (Math.random() * (double) arr.length);
+        if (idx < 0) idx = 0; if (idx >= arr.length) idx = arr.length - 1;
+        String c = arr[idx];
+        if (c == null || c.isEmpty()) return "超过" + threshold + "元，";
+        return c.replace("{X}", String.valueOf(threshold));
+    } catch (Throwable t) { return "超过" + threshold + "元，"; }
+}
+
+// v1.0.7 §14: 只随机"动作语气包裹"(动作核心词周围的语气措辞), 去机器指纹。
+// 从内置 DEF_ACTION_PHRASES 随机挑一条, 把 {A} 占位替换为该档动作核心原文, 返回已填动作原文的语气包裹。
+// 动作核心词本身用户录入什么就原样发什么, 不参与随机; 档位/前缀同样不动。
+String pickActionPhrase(String actionCore) {
+    String core = (actionCore == null) ? "" : actionCore;
+    try {
+        String[] arr = DEF_ACTION_PHRASES;
+        if (arr == null || arr.length == 0) return core;
+        int idx = (int) (Math.random() * (double) arr.length);
+        if (idx < 0) idx = 0; if (idx >= arr.length) idx = arr.length - 1;
+        String p = arr[idx];
+        if (p == null || p.isEmpty()) return core;
+        return p.replace("{A}", core);
+    } catch (Throwable t) { return core; }
+}
+
+// ==================== 按群启用 (仿 GroupAdmin) ====================
+List parseCsv(String csv) {
+    List r = new java.util.ArrayList();
+    if (csv == null || csv.isEmpty()) return r;
+    String[] arr = csv.split(",");
+    for (int i = 0; i < arr.length; i++) { String s = arr[i].trim(); if (!s.isEmpty()) r.add(s); }
+    return r;
+}
+String joinCsv(List list) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < list.size(); i++) { if (i > 0) sb.append(","); sb.append(list.get(i)); }
+    return sb.toString();
+}
+String normGroupId(String g) { if (g == null) return ""; return g.trim(); }
+List getEnabledGroups() { return parseCsv(getString(K_ENABLED, "")); }
+boolean isGroupEnabled(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return false;
+    List l = getEnabledGroups();
+    for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) return true;
+    return false;
+}
+void enableGroup(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return;
+    List l = getEnabledGroups();
+    for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) return;
+    l.add(g);
+    putString(K_ENABLED, joinCsv(l));
+}
+void disableGroup(String groupId) {
+    String g = normGroupId(groupId);
+    List l = getEnabledGroups();
+    boolean changed = false;
+    for (int i = l.size() - 1; i >= 0; i--) if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
+    if (changed) putString(K_ENABLED, joinCsv(l));
+}
+
+// ==================== 红包提醒排除名单 (按群, v1.0.6 §12) ====================
+// key = rp_exclude_<groupId> (CSV wxid)。名单里的人永不被红包提醒@, 也不计入@上限人数。
+String excludeKey(String groupId) { return K_EXCLUDE_PREFIX + normGroupId(groupId); }
+List getExcludeList(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return new java.util.ArrayList();
+    return parseCsv(getString(excludeKey(g), ""));
+}
+boolean isExcluded(String groupId, String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    String w = wxid.trim();
+    List l = getExcludeList(groupId);
+    for (int i = 0; i < l.size(); i++) if (w.equals(((String) l.get(i)).trim())) return true;
+    return false;
+}
+// 加入若干 wxid, 返回新增数量。
+int addExclude(String groupId, List wxids) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty() || wxids == null || wxids.isEmpty()) return 0;
+    List l = getExcludeList(g);
+    int added = 0;
+    for (int i = 0; i < wxids.size(); i++) {
+        String w = ((String) wxids.get(i)).trim();
+        if (w.isEmpty()) continue;
+        boolean exist = false;
+        for (int j = 0; j < l.size(); j++) if (w.equals(((String) l.get(j)).trim())) { exist = true; break; }
+        if (!exist) { l.add(w); added++; }
+    }
+    if (added > 0) putString(excludeKey(g), joinCsv(l));
+    return added;
+}
+// 移除若干 wxid, 返回移除数量。
+int removeExclude(String groupId, List wxids) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty() || wxids == null || wxids.isEmpty()) return 0;
+    List l = getExcludeList(g);
+    int removed = 0;
+    for (int k = 0; k < wxids.size(); k++) {
+        String w = ((String) wxids.get(k)).trim();
+        if (w.isEmpty()) continue;
+        for (int i = l.size() - 1; i >= 0; i--) if (w.equals(((String) l.get(i)).trim())) { l.remove(i); removed++; }
+    }
+    if (removed > 0) putString(excludeKey(g), joinCsv(l));
+    return removed;
+}
+
+// 处理 "@某人 红包排除 / 取消红包排除" 命令 (v1.0.6 §12, 走 onHandleMsg 路径)。
+// 返回 true=已处理(调用方 return, 不当红包/不发群回执, 只 toast); false=不是排除命令(继续走红包检测)。
+// atList = bot @ 的 wxid 列表(去掉 bot 自己)。命令文本本身会显示在群里(一次性设置, 可接受); 处理后只 toast 不发群。
+boolean rpHandleExcludeCmd(String groupId, String content, java.util.List atList) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty() || g.indexOf("@chatroom") < 0) return false;   // 仅群聊
+        if (content == null) return false;
+
+        // 收集 @ 目标 wxid, 去掉 bot 自己。
+        String me = null;
+        try { me = getLoginWxid(); } catch (Throwable t) { me = null; }
+        java.util.List wxids = new java.util.ArrayList();
+        for (int i = 0; i < atList.size(); i++) {
+            Object o = atList.get(i);
+            if (o == null) continue;
+            String w = o.toString().trim();
+            if (w.isEmpty()) continue;
+            if (me != null && w.equals(me)) continue;   // 去掉 bot 自己
+            wxids.add(w);
+        }
+        if (wxids.isEmpty()) return false;   // 只 @ 了自己 / 无有效目标 → 不当排除命令
+
+        boolean isCancel = (content.indexOf("取消红包排除") >= 0) || (content.indexOf("红包取消排除") >= 0);
+        if (isCancel) {
+            int n = removeExclude(g, wxids);
+            try { toast("✅ 已移出红包排除名单: " + n + " 人 (恢复正常 @ 提醒)"); } catch (Throwable t) {}
+            hbBgLog("[RP] " + hbNow() + " exclude-cmd: removed " + n + " from group exclude list (count target=" + wxids.size() + ").");
+            return true;
+        }
+        // 含 "红包排除" 且非取消 → 加入
+        int n = addExclude(g, wxids);
+        try { toast("✅ 已加入红包排除名单: " + n + " 人 (此后红包提醒不再 @ TA)"); } catch (Throwable t) {}
+        hbBgLog("[RP] " + hbNow() + " exclude-cmd: added " + n + " to group exclude list (count target=" + wxids.size() + ").");
+        return true;
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " exclude-cmd err: " + t);
+        return false;
+    }
+}
+
+// ================================================================
+// ============ onHandleMsg: 命令 + 红包检测 + 排程 ============
+// ================================================================
+void onHandleMsg(Object msg) {
+    try {
+        if (msg == null) return;
+        try { if (!msg.isChatroom()) return; } catch (Throwable t) { return; }
+
+        String groupId = null, sender = null, content = null;
+        try { groupId = msg.getTalker(); } catch (Throwable t) {}
+        try { sender = msg.getSendTalker(); } catch (Throwable t) {}
+        try { content = msg.getContent(); } catch (Throwable t) {}
+
+        // ---- (1) 配置命令不在这里处理 ----
+        // v1.0.2: 全部配置命令 (红包统计设置/开启/关闭/阈值/文案/延迟/at上限/状态) 改由 onClickSendBtn 拦截,
+        //         bot 一点发送即 return true 阻止消息进群 + 就地执行 + toast 本地提示。onHandleMsg 不再碰命令/不再发群回执。
+
+        // ---- (1b) 排除名单 @ 增删 (v1.0.6 §12): bot 自己发 + atList 非空 + 文本含关键字 ----
+        //   onClickSendBtn 只收纯文本拿不到 @ 目标 wxid, 故走这里。命中即处理 + toast + return (不当红包/不发群回执)。
+        //   "@某人 红包排除" 这条命令本身会显示在群里(一次性设置动作, 可接受)。廉价: 仅在 bot 自己发且有 @ 时才解析 atList。
+        try {
+            if (content != null && sender != null && sender.equals(getLoginWxid()) && content.indexOf("红包排除") >= 0) {
+                java.util.List atList = null;
+                try { atList = msg.getAtUserList(); } catch (Throwable t) { atList = null; }
+                if (atList != null && !atList.isEmpty()) {
+                    boolean handled = rpHandleExcludeCmd(groupId, content, atList);
+                    if (handled) return;
+                }
+            }
+        } catch (Throwable t) {}
+
+        // ---- (2) 红包检测 (廉价: type 或 字符串包含) ----
+        boolean isHb = false;
+        int type = 0;
+        try { type = ((Number) msg.getType()).intValue(); } catch (Throwable t) { type = 0; }
+        if (type == HB_MSG_TYPE) isHb = true;
+        if (!isHb) {
+            if (content == null) return;
+            if (content.indexOf("<nativeurl>") < 0) return;
+            isHb = true;
+        }
+        if (content == null) return;
+
+        // ---- (3) 本群启用闸门: 没启用直接 return (不开页/不排 delay) ----
+        if (!isGroupEnabled(groupId)) return;
+
+        // ---- (4) 命中才解析 nativeurl (红包频率极低) ----
+        final String nativeurl = hbGetElement(content, "wcpayinfo", "nativeurl");
+
+        // ---- (4a) 仅处理拼手气红包: 专属红包(指定某人领)检测即跳过, 不开页/不排程 ----
+        // 专属红包 wcpayinfo 里 exclusive_recv_username 非空 = 指定接收人。
+        // v1.0.6 §13.4: 移除 detect-fields 调试解析(原重复 parse 5 字段), 专属判定保留(只解析 exclusive_recv_username 一个)。
+        String exclusiveRecv = null;
+        try { exclusiveRecv = hbGetElement(content, "wcpayinfo", "exclusive_recv_username"); } catch (Throwable t) { exclusiveRecv = null; }
+
+        if (exclusiveRecv != null && !exclusiveRecv.trim().isEmpty()) {
+            hbBgLog("[RP] " + hbNow() + " skip exclusive (exclusive_recv_username present). not scheduling.");
+            return;
+        }
+
+        String sender0 = sender; if (sender0 == null) sender0 = groupId;
+        final String fSender = sender0;
+        final String fTalker = groupId;
+        long msgid0 = 0L;
+        try { msgid0 = ((Number) msg.getMsgId()).longValue(); } catch (Throwable t) { msgid0 = 0L; }
+        final long fMsgid = msgid0;
+
+        String dkey = (nativeurl != null && nativeurl.length() > 0)
+            ? nativeurl : ("k:" + fTalker + ":" + fSender + ":" + fMsgid);
+        final String fKey = dkey;
+        if (!OPENED.add(fKey)) return;
+
+        // v1.1.0 §15.2: 生产者只入队, 不再 per-红包 delay。
+        long delaySec = cfgDelay();
+        // v1.0.6 §13.1: 首次延迟 ±25% 抖动 (base*0.75 ~ base*1.25), 去零方差。long 乘防溢出。
+        long delayMs = hbJitter((long) (delaySec * 1000L * 0.75), (long) (delaySec * 1000L * 0.5));
+        long dueAt = System.currentTimeMillis() + delayMs;
+        // Job = { key, talker, sender, msgid, dueAt, attempt=0 }
+        Object[] job = new Object[]{ fKey, fTalker, fSender, Long.valueOf(fMsgid), Long.valueOf(dueAt), Integer.valueOf(0) };
+        rpEnqueue(job);
+        hbBgLog("[RP] " + hbNow() + " redpacket detected in enabled group (type=" + type
+            + ", hasNativeurl=" + (nativeurl != null) + "). enqueued (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ".");
+    } catch (Throwable t) {
+        try { log("RedPacketStats onHandleMsg err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ================================================================
+// ============ onClickSendBtn: 拦截配置命令 (不发群) ============
+// ================================================================
+// v1.0.2: bot 在输入框打配置命令点发送 → 本方法拦截。命中即就地执行 + toast 本地提示 + return true
+//         (return true 阻止该消息发到群里, 不污染群)。不命中 return false (正常发送, 不影响普通聊天)。
+// 当前会话群: getTargetTalker() (仿 GroupAdmin onClickSendBtn)。本方法运行在 UI 线程上下文,
+// getTopActivity() 拿得到前台 Activity, 故 `红包统计设置` 能正常弹 Dialog (修复在消息线程弹失败)。
+boolean onClickSendBtn(String text) {
+    try {
+        if (text == null) return false;
+        String content = text.trim();
+        if (content.isEmpty()) return false;
+
+        // 设置入口: 弹本群配置 Dialog (UI 线程, getTopActivity)
+        if (content.equals("红包统计设置")) {
+            String groupId = rpCurrentTalker();
+            showConfigDialog(groupId);   // groupId 可能为 null(非群聊) → Dialog 走全局配置分支
+            return true;
+        }
+        if (content.equals("开启红包统计")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            enableGroup(groupId);
+            try { toast("✅ 已开启本群红包统计 (领完后按金额分档 @ 圈人)"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.equals("关闭红包统计")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            disableGroup(groupId);
+            try { toast("🔕 已关闭本群红包统计"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.equals("红包统计状态")) {
+            String groupId = rpCurrentTalker();
+            try { toast(rpStatusText(groupId)); } catch (Throwable t) {}
+            return true;
+        }
+        // 红包阈值 5 10 20
+        if (content.startsWith("红包阈值")) {
+            String rest = content.substring("红包阈值".length()).trim();
+            String[] parts = rest.split("\\s+");
+            if (parts.length >= 3) {
+                try {
+                    int a = Integer.parseInt(parts[0].trim());
+                    int b = Integer.parseInt(parts[1].trim());
+                    int c = Integer.parseInt(parts[2].trim());
+                    putString(K_T1, String.valueOf(a));
+                    putString(K_T2, String.valueOf(b));
+                    putString(K_T3, String.valueOf(c));
+                    toast("✅ 阈值已设: 档1>" + a + "元  档2>" + b + "元  档3>" + c + "元");
+                } catch (Exception e) { try { toast("❌ 格式: 红包阈值 5 10 20"); } catch (Throwable t) {} }
+            } else { try { toast("❌ 格式: 红包阈值 5 10 20"); } catch (Throwable t) {} }
+            return true;
+        }
+        // v1.0.7 §14: 动作核心词 = 用户录入的内容, 单值原样存储, 不 split 不随机 (周围连接词+语气包裹自动随机)。
+        if (content.startsWith("红包文案1")) {
+            String v = content.substring("红包文案1".length()).trim();
+            try { if (!v.isEmpty()) { putString(K_TXT1, v); toast("✅ 档1动作核心词(原样, 周围措辞自动随机): " + v); } else toast("❌ 格式: 红包文案1 爆照"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.startsWith("红包文案2")) {
+            String v = content.substring("红包文案2".length()).trim();
+            try { if (!v.isEmpty()) { putString(K_TXT2, v); toast("✅ 档2动作核心词(原样, 周围措辞自动随机): " + v); } else toast("❌ 格式: 红包文案2 宣群"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.startsWith("红包文案3")) {
+            String v = content.substring("红包文案3".length()).trim();
+            try { if (!v.isEmpty()) { putString(K_TXT3, v); toast("✅ 档3动作核心词(原样, 周围措辞自动随机): " + v); } else toast("❌ 格式: 红包文案3 发视频"); } catch (Throwable t) {}
+            return true;
+        }
+        // v1.0.7 §14: >上限通用群规消息前缀, 单值原样存储/发送 (不随机)。
+        if (content.startsWith("红包群规前缀")) {
+            String v = content.substring("红包群规前缀".length()).trim();
+            try { if (!v.isEmpty()) { putString(K_RULE_PREFIX, v); toast("✅ 群规前缀(原样发送): " + v); } else toast("❌ 格式: 红包群规前缀 领红包请遵守群规执行"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.startsWith("红包延迟")) {
+            String v = content.substring("红包延迟".length()).trim();
+            try {
+                if (v.isEmpty()) {
+                    toast("当前延迟(秒): 首次=" + cfgDelay() + " 重试1=" + cfgRetry1() + " 重试2=" + cfgRetry2());
+                } else {
+                    String[] parts = v.split("\\s+");
+                    if (parts.length == 1) {
+                        long s = Long.parseLong(parts[0]); putString(K_DELAY, String.valueOf(s));
+                        toast("✅ 首次开页延迟: " + s + "秒");
+                    } else if (parts.length >= 3) {
+                        long s0 = Long.parseLong(parts[0]); long s1 = Long.parseLong(parts[1]); long s2 = Long.parseLong(parts[2]);
+                        putString(K_DELAY, String.valueOf(s0)); putString(K_RETRY1, String.valueOf(s1)); putString(K_RETRY2, String.valueOf(s2));
+                        toast("✅ 延迟(秒): 首次=" + s0 + " 重试1=" + s1 + " 重试2=" + s2);
+                    } else {
+                        toast("❌ 格式: 红包延迟 120 (秒) 或 红包延迟 120 300 600 (首次/重试1/重试2 秒)");
+                    }
+                }
+            }
+            catch (Exception e) { try { toast("❌ 格式: 红包延迟 120 (秒) 或 红包延迟 120 300 600 (首次/重试1/重试2 秒)"); } catch (Throwable t) {} }
+            return true;
+        }
+        if (content.startsWith("红包at上限")) {
+            String v = content.substring("红包at上限".length()).trim();
+            try { int n = Integer.parseInt(v); putString(K_AT_LIMIT, String.valueOf(n)); toast("✅ 达标总人数上限: " + n + " (超过则改发无@群规消息)"); }
+            catch (Exception e) { try { toast("❌ 格式: 红包at上限 20"); } catch (Throwable t) {} }
+            return true;
+        }
+    } catch (Throwable t) {
+        try { log("RedPacketStats onClickSendBtn err: " + t); } catch (Throwable t2) {}
+    }
+    return false;   // 非配置命令: 正常发送, 不影响普通聊天/红包
+}
+
+// 当前会话 talker (群=@chatroom; 非群聊返回原值)。仿 GroupAdmin getTargetTalker()。
+String rpCurrentTalker() {
+    try {
+        String t = getTargetTalker();
+        if (t != null && !t.isEmpty()) return normGroupId(t);
+    } catch (Throwable t) {}
+    return null;
+}
+
+// 取当前群 id; 不在群聊里则 toast 提示并返回 null (调用方据此放弃, 但仍 return true 不发群)。
+String rpCurrentGroupOrToast() {
+    String t = rpCurrentTalker();
+    if (t == null || t.indexOf("@chatroom") < 0) {
+        try { toast("请在目标群里发该命令"); } catch (Throwable t2) {}
+        return null;
+    }
+    return t;
+}
+
+String rpStatusText(String groupId) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("📊 红包统计 v1.1.1\n");
+    sb.append("本群: ").append(isGroupEnabled(groupId) ? "✅ 已启用" : "🔴 未启用").append("\n");
+    sb.append("阈值: 档1>").append(cfgT1()).append("元  档2>").append(cfgT2()).append("元  档3>").append(cfgT3()).append("元\n");
+    sb.append("动作核心词(原样,措辞随机): 档1=").append(cfgTxt1()).append(" 档2=").append(cfgTxt2()).append(" 档3=").append(cfgTxt3()).append("\n");
+    sb.append("延迟: 首次:").append(cfgDelay()).append("秒 重试1:").append(cfgRetry1()).append("秒 重试2:").append(cfgRetry2()).append("秒 (±抖动)\n");
+    sb.append("at上限: ").append(cfgAtLimit()).append(" (超过则发无@群规消息)\n");
+    sb.append("同群限频: ").append(cfgMsgGap()).append("秒\n");
+    sb.append("本群排除名单: ").append(getExcludeList(groupId).size()).append(" 人");
+    return sb.toString();
+}
+
+// ================================================================
+// ============ v1.1.0 §15: 队列辅助 + 单工作者 tick ============
+// ================================================================
+// 当前 Job 的去重 key (nativeurl)。CUR_JOB 为空返回 null。
+String curKey() {
+    try { Object[] j = CUR_JOB; if (j == null) return null; return (String) j[JOB_KEY]; } catch (Throwable t) { return null; }
+}
+int rpQueueSize() { synchronized (RP_QUEUE) { return RP_QUEUE.size(); } }
+
+// 入队 (§15.2): 按 key 去重 (在队/在飞/已完成都不重入); 满 RP_QUEUE_MAX 丢最旧。
+void rpEnqueue(Object[] job) {
+    try {
+        if (job == null) return;
+        String key = (String) job[JOB_KEY];
+        synchronized (RP_QUEUE) {
+            // 去重: 已在队
+            for (int i = 0; i < RP_QUEUE.size(); i++) {
+                Object[] q = (Object[]) RP_QUEUE.get(i);
+                if (q != null && key != null && key.equals((String) q[JOB_KEY])) {
+                    hbBgLog("[RP] " + hbNow() + " enqueue dedup: key already queued, skip.");
+                    return;
+                }
+            }
+            // 去重: 在飞
+            try { if (IN_FLIGHT && key != null && key.equals(curKey())) { hbBgLog("[RP] " + hbNow() + " enqueue dedup: key in-flight, skip."); return; } } catch (Throwable t) {}
+            // 去重: 已完成
+            try { if (key != null && DONE.contains(key)) { hbBgLog("[RP] " + hbNow() + " enqueue dedup: key already done, skip."); return; } } catch (Throwable t) {}
+            // 上限: 丢最旧
+            if (RP_QUEUE.size() >= RP_QUEUE_MAX) {
+                try { RP_QUEUE.remove(0); } catch (Throwable t) {}
+                hbBgLog("[RP] " + hbNow() + " enqueue: queue full (max=" + RP_QUEUE_MAX + "), dropped oldest job.");
+            }
+            RP_QUEUE.add(job);
+        }
+    } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " enqueue err: " + t); }
+}
+
+// 单工作者 tick (§15.3): 看门狗 → 单飞 return → 否则挑最早到期 job 开跑。末尾必自重调度 (finally)。
+void rpWorkerTick() {
+    try {
+        long now = System.currentTimeMillis();
+        // 1) 看门狗: 在飞超时强清
+        if (IN_FLIGHT && (now - inflightStartMs) > RP_WATCHDOG_MS) {
+            hbBgLog("[RP] " + hbNow() + " WATCHDOG: in-flight " + ((now - inflightStartMs) / 1000L) + "s > " + (RP_WATCHDOG_MS / 1000L) + "s. force-clear in-flight (key=" + curKey() + ").");
+            try { SEEN.clear(); } catch (Throwable t) {}
+            IN_FLIGHT = false; CUR_JOB = null;
+        }
+        // 2) 单飞: 有在飞则等
+        if (IN_FLIGHT) return;
+        // 3) 挑 dueAt<=now 最早的 job 出队
+        Object[] picked = null;
+        synchronized (RP_QUEUE) {
+            int bestIdx = -1; long bestDue = Long.MAX_VALUE;
+            for (int i = 0; i < RP_QUEUE.size(); i++) {
+                Object[] q = (Object[]) RP_QUEUE.get(i);
+                if (q == null) continue;
+                long due = ((Long) q[JOB_DUEAT]).longValue();
+                if (due <= now && due < bestDue) { bestDue = due; bestIdx = i; }
+            }
+            if (bestIdx >= 0) { picked = (Object[]) RP_QUEUE.get(bestIdx); RP_QUEUE.remove(bestIdx); }
+        }
+        if (picked == null) return;   // 无到期 job, 等下个 tick
+        // 出队成功 → 进入在飞
+        IN_FLIGHT = true; inflightStartMs = System.currentTimeMillis(); CUR_JOB = picked;
+        try { SEEN.clear(); } catch (Throwable t) {}   // 新 job 开始, 清上一 job 残留页面去重 (单飞下安全)
+        int attempt = ((Integer) picked[JOB_ATTEMPT]).intValue();
+        hbBgLog("[RP] " + hbNow() + " worker: pick job (attempt=" + attempt + ", queue left=" + rpQueueSize() + ") -> hbProcess.");
+        try { hbProcess(picked); }
+        catch (Throwable t) {
+            hbBgLog("[RP] " + hbNow() + " worker hbProcess err: " + t + ". clear in-flight.");
+            IN_FLIGHT = false; CUR_JOB = null;
+        }
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " worker tick err: " + t);
+    } finally {
+        // §15.3: 任何情况下必重调度, 工作者绝不停摆。
+        try { delay(RP_TICK_MS, new Runnable() { public void run() { rpWorkerTick(); } }); } catch (Throwable t) {}
+    }
+}
+
+// v1.1.0 §15.5: 统一清在飞 (流水线退出点调用)。可选重新入队 (没领完重试)。
+void rpClearInFlight() { IN_FLIGHT = false; CUR_JOB = null; }
+
+// v1.1.2 §16: 发提醒拆两条 (引用条 + @条)。实测结论(2026-06-05, 用户真机):
+//   · sendQuoteMsg(talker, 本地msgId(msg.getMsgId(), 小数字), content) 能成功引用原红包消息;
+//     但 content 里的 [AtWx=wxid] 在引用消息里**不会被解析成真@**, 被@者收不到提醒。
+//   · sendText(talker, "[AtWx=wxid] ...") 的 @ 真生效, 被@者收到提醒。
+//   → 引用 与 @ 不能一条兼得, 故拆两条: 引用条放无@群规文本; @条 sendText 真@到人。
+// 引用条: sendQuoteMsg(talker, msgid, 群规文本) 引用原红包; msgid<=0 或抛异常 → 回退 sendText(不带引用的同一群规文本), 绝不漏发。
+void rpSendQuote(String talker, long msgid, String text) {
+    if (talker == null || text == null || text.length() == 0) return;
+    // 优先引用原红包 (纯引用, 文本内本就无 @)。msgid 有效才能引用。
+    if (msgid > 0L) {
+        try {
+            sendQuoteMsg(talker, msgid, text);
+            hbBgLog("[RP] " + hbNow() + " rpSendQuote: sendQuoteMsg ok (quoted original redpacket, no @).");
+            return;
+        } catch (Throwable t) {
+            hbBgLog("[RP] " + hbNow() + " rpSendQuote: sendQuoteMsg failed (" + t + "), fallback sendText (no quote).");
+        }
+    } else {
+        hbBgLog("[RP] " + hbNow() + " rpSendQuote: msgid<=0, use sendText (no valid msgid to quote).");
+    }
+    // 回退: 引用不可用/失败 → 普通发送同一群规文本 (绝不因引用失败漏发)。
+    try { sendText(talker, text); } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " rpSendQuote fallback sendText err: " + t); }
+}
+
+// v1.1.2 §16: @条 — 真@到人 (sendText 解析 [AtWx=], 实测 @ 真生效)。不引用 (引用条内 @ 无效, 故拆两条)。
+void rpSendAt(String talker, String text) {
+    if (talker == null || text == null || text.length() == 0) return;
+    try {
+        sendText(talker, text);
+        hbBgLog("[RP] " + hbNow() + " rpSendAt: sendText ok ([AtWx=] @ should land).");
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " rpSendAt: sendText err: " + t);
+    }
+}
+
+// ================================================================
+// ============ hbProcess: 开封面页 (一次尝试) ============
+// ================================================================
+void hbProcess(Object[] job) {
+    try {
+        if (job == null) { hbBgLog("[RP] " + hbNow() + " hbProcess: job null, skip. clear in-flight."); rpClearInFlight(); return; }
+        int attempt = ((Integer) job[JOB_ATTEMPT]).intValue();
+        String talker = (String) job[JOB_TALKER];
+        String key = (String) job[JOB_KEY];
+        hbBgLog("[RP] " + hbNow() + " hbProcess attempt=" + attempt + " -> opening cover " + UI_RECEIVE + ".");
+
+        Object hostCtx = null;
+        try { hostCtx = hostContext; } catch (Throwable t) { hostCtx = null; }
+        if (hostCtx == null) {
+            try { Activity top = getTopActivity(); if (top != null) hostCtx = top.getApplicationContext(); } catch (Throwable t) {}
+        }
+        if (hostCtx == null) { hbBgLog("[RP] " + hbNow() + " ABORT: no hostContext. clear in-flight."); rpClearInFlight(); return; }
+
+        String nativeurl = (key != null && key.startsWith("k:")) ? null : key;
+        Intent intent = new Intent();
+        if (nativeurl != null) intent.putExtra("key_native_url", nativeurl);
+        if (talker != null) intent.putExtra("key_username", talker);
+        intent.putExtra("key_is_self_sent", false);
+
+        startLuckyMoneyReceive(hostCtx, intent);
+        // 成功开页后, 在飞由 onResume 链路(封面/详情→各退出点)负责清; 若版本漂移开页失败, 看门狗 30s 兜底强清。
+    } catch (Throwable t) {
+        try { log("RedPacketStats hbProcess err: " + t); } catch (Throwable t2) {}
+        hbBgLog("[RP] " + hbNow() + " hbProcess err: " + t + ". clear in-flight.");
+        rpClearInFlight();
+    }
+}
+
+// ============ 启动器 (源: 自动抢红包) — 目标 NewReceiveUI ============
+void startLuckyMoneyReceive(Object hostCtx, Intent intent) {
+    boolean success = false;
+    String landedOn = "?";
+    try {
+        String[] possibleClasses = {"nk4.l", "oq4.l", "pn4.l", "qm4.l", "rm4.l", "sm4.l", "tm4.l", "um4.l", "vm4.l", "wl4.l"};
+        String[] possibleMethods = {"A", "B", "C", "D"};
+        String activity = ".ui.LuckyMoneyNewReceiveUI";
+
+        for (int ci = 0; ci < possibleClasses.length && !success; ci++) {
+            String className = possibleClasses[ci];
+            for (int mi = 0; mi < possibleMethods.length && !success; mi++) {
+                String methodName = possibleMethods[mi];
+                try {
+                    Class clazz = XposedHelpers.findClass(className, hostCtx.getClassLoader());
+                    XposedHelpers.callStaticMethod(clazz, methodName, hostCtx, "luckymoney", activity, intent);
+                    success = true;
+                    landedOn = className + "." + methodName;
+                } catch (Throwable ignored) {}
+            }
+        }
+        if (!success) {
+            try {
+                String pkg = hostCtx.getPackageName();
+                intent.setClassName(pkg, "com.tencent.mm.plugin.luckymoney" + activity);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                hostCtx.startActivity(intent);
+                success = true;
+                landedOn = "fallback startActivity";
+            } catch (Throwable ignored2) {}
+        }
+        if (!success) hbBgLog("[RP] " + hbNow() + " OPEN FAIL: launcher + fallback both failed (version drift?).");
+        else hbBgLog("[RP] " + hbNow() + " OPEN OK via " + landedOn + " -> " + UI_RECEIVE + ".onResume will route.");
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " startLuckyMoneyReceive err: " + t);
+    }
+}
+
+// 轻量 XML 取值 (源: 自动抢红包), 仅红包命中时调用一次
+String hbGetElement(String xmlString, String elementName, String tagName) {
+    try {
+        if (xmlString == null) return null;
+        javax.xml.parsers.DocumentBuilderFactory factory = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+        javax.xml.parsers.DocumentBuilder builder = factory.newDocumentBuilder();
+        org.xml.sax.InputSource is = new org.xml.sax.InputSource(
+            new java.io.StringReader(xmlString.replaceAll("^[^:]+:\n", "")));
+        org.w3c.dom.Document document = builder.parse(is);
+        org.w3c.dom.NodeList list = document.getElementsByTagName(elementName);
+        if (list.getLength() > 0) {
+            org.w3c.dom.Node parent = list.item(0);
+            org.w3c.dom.NodeList children = parent.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                org.w3c.dom.Node child = children.item(i);
+                if (child.getNodeName().equalsIgnoreCase(tagName)) return child.getTextContent();
+            }
+        }
+    } catch (Throwable t) { return null; }
+    return null;
+}
+
+// ================================================================
+// ============ onResume 路由: NewReceiveUI / NewDetailUI ============
+// ================================================================
+void hbOnActivityResume(Object thisObject) {
+    try {
+        if (thisObject == null) return;
+        final Activity act = (Activity) thisObject;
+        String cn = act.getClass().getName();
+        if (cn == null) return;
+        boolean isReceive = cn.indexOf(UI_RECEIVE) >= 0;
+        boolean isDetail  = cn.indexOf(UI_DETAIL) >= 0;
+        if (!isReceive && !isDetail) return;
+
+        // 只处理 bot 自己正在跟的红包 (CUR_JOB 非空说明工作者刚开了页; 单飞下只一个)
+        String curKey = curKey();
+        if (CUR_JOB == null || curKey == null) return;
+
+        Integer idHash = Integer.valueOf(System.identityHashCode(act));
+        if (!SEEN.add(idHash)) return;
+        final String fcn = cn;
+
+        if (isReceive) {
+            COVER_ACT.put(curKey, idHash);
+            final int clickDelay = (int) hbJitter((long) RECEIVE_CLICK_DELAY_BASE_MS, (long) RECEIVE_CLICK_DELAY_SPAN_MS);
+            hbBgLog("[RP] " + hbNow() + " HIT " + fcn + " (cover). schedule UI find detail-entry in " + clickDelay + "ms (jittered).");
+            delay(clickDelay, new Runnable() {
+                public void run() {
+                    try { hbReceiveDecide(act); }
+                    catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " receive-decide err: " + t); }
+                }
+            });
+            return;
+        }
+
+        // NewDetailUI: 后台反射读明细
+        final String fKey = curKey;
+        final int reflectDelay = (int) hbJitter((long) REFLECT_DELAY_BASE_MS, (long) REFLECT_DELAY_SPAN_MS);
+        hbBgLog("[RP] " + hbNow() + " HIT " + fcn + " (detail). schedule bg-reflect in " + reflectDelay + "ms (jittered).");
+        delay(reflectDelay, new Runnable() {
+            public void run() {
+                try {
+                    new Thread() {
+                        public void run() {
+                            try { hbDetailExtract(act, fKey); }
+                            catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " detail extract bg err: " + t); }
+                        }
+                    }.start();
+                } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " detail reflect schedule err: " + t); }
+            }
+        });
+    } catch (Throwable t) {
+        try { log("RedPacketStats onResume route err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ================================================================
+// ============ 封面页判定: 领完→点详情 / 没领完→关页+重试 ============
+// ================================================================
+// UI 线程, 一次性有界 BFS。找"看看大家的手气"/"查看领取详情" 且【可点击】=已领完。
+// 找不到可点入口 = 没领完: 绝不点领取按钮(不抢), finish 封面, 按 attempt 重试或放弃。
+void hbReceiveDecide(Activity act) {
+    int[] nodes = new int[]{0};
+    View hitView = null;
+    String hitText = null;
+    try {
+        View root = null;
+        try { root = act.getWindow().getDecorView(); } catch (Throwable t) { root = null; }
+        if (root == null) { hbBgLog("[RP] " + hbNow() + " receive-decide: no DecorView."); afterCoverNoDetail(); return; }
+
+        java.util.ArrayDeque queue = new java.util.ArrayDeque();
+        queue.add(new Object[]{ root, Integer.valueOf(0) });
+
+        while (!queue.isEmpty()) {
+            if (nodes[0] >= CLICK_MAX_NODES) break;
+            Object[] entry = (Object[]) queue.poll();
+            View v = (View) entry[0];
+            int depth = ((Integer) entry[1]).intValue();
+            if (v == null) continue;
+            nodes[0]++;
+
+            String text = null;
+            if (v instanceof TextView) {
+                try { CharSequence cs = ((TextView) v).getText(); if (cs != null) text = cs.toString(); } catch (Throwable t) { text = null; }
+            }
+            if (text != null && text.length() > 0) {
+                boolean matchDetail = false;
+                for (int i = 0; i < DETAIL_TEXTS.length; i++) { if (text.indexOf(DETAIL_TEXTS[i]) >= 0) { matchDetail = true; break; } }
+                if (matchDetail) {
+                    // 该文本本身或最近可点祖先可点 → 视为"已领完, 有详情入口"
+                    View target = findClickableSelfOrAncestor(v);
+                    if (target != null) { hitView = target; hitText = text; break; }
+                    // 文案在但不可点 → 继续找(也可能别处有可点入口)
+                }
+            }
+            if (depth < CLICK_MAX_DEPTH && v instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) v;
+                int cc = 0;
+                try { cc = vg.getChildCount(); } catch (Throwable t) { cc = 0; }
+                for (int i = 0; i < cc; i++) {
+                    if (nodes[0] >= CLICK_MAX_NODES) break;
+                    View child = null;
+                    try { child = vg.getChildAt(i); } catch (Throwable t) { child = null; }
+                    if (child != null) queue.add(new Object[]{ child, Integer.valueOf(depth + 1) });
+                }
+            }
+        }
+
+        if (hitView == null) {
+            // 没找到可点的详情入口 = 没领完。绝不点领取/不抢。
+            hbBgLog("[RP] " + hbNow() + " receive-decide: NO clickable detail-entry (not finished, nodes=" + nodes[0] + "). will NOT grab; finish + retry/give-up.");
+            afterCoverNoDetail();
+            return;
+        }
+
+        // 已找到可点 detail 入口 = 已领完。按入口文字区分拼手气/普通:
+        //   含"手气"(看看大家的手气) → 拼手气 → 照旧点进详情(反射→分档→@)。
+        //   不含"手气"(查看领取详情) → 普通红包 → 不点击、关封面、清状态、跳过, 不开详情/不发消息。
+        // (反射后"金额全等→跳过"仍作兜底, 见 hbDetailExtract。)
+        boolean isLucky = (hitText != null && hitText.indexOf("手气") >= 0);
+        if (!isLucky) {
+            hbBgLog("[RP] " + hbNow() + " receive-decide: skip normal (cover='" + hbTextSkeleton(hitText)
+                + "') -> NOT clicking; finish cover + drop (nodes=" + nodes[0] + ").");
+            afterCoverNormalSkip();
+            return;
+        }
+
+        boolean clicked = false;
+        try { clicked = hitView.performClick(); } catch (Throwable t) { clicked = false; }
+        hbBgLog("[RP] " + hbNow() + " receive-decide: finished -> clicked detail-entry '" + hbTextSkeleton(hitText)
+            + "' clicked=" + clicked + " (nodes=" + nodes[0] + "). NewDetailUI.onResume will follow.");
+        // 不在此 finish 封面: 等详情页提取成功后连封面一起 finish (COVER_ACT)。
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " receive-decide err: " + t + " (nodes=" + nodes[0] + ").");
+        afterCoverNoDetail();
+    }
+}
+
+// 普通红包(封面入口"查看领取详情", 不含手气): 已领完, 但不需开详情/不发消息。
+// finish 封面 + 清状态/去重, 直接结束本红包流转。不重试(已领完, 不是没领完)。
+// v1.1.0 §15.5: 这是流水线退出点 → 必清在飞。
+void afterCoverNormalSkip() {
+    Object[] job = CUR_JOB;
+    final String key = (job != null) ? (String) job[JOB_KEY] : null;
+    finishActivityByHash(COVER_ACT.get(key));
+    if (key != null) COVER_ACT.remove(key);
+    if (key != null) DONE.add(key);   // 普通红包: 标记完成, 避免再次入队
+    SEEN.clear(); // 本红包流转结束, 清 Activity 去重防内存增长
+    rpClearInFlight();
+    hbBgLog("[RP] " + hbNow() + " skip normal: cover finished, in-flight cleared, no detail/no msg.");
+}
+
+// 没领完: finish 封面 + 按 attempt 重试(重新入队)或放弃。
+// v1.1.0 §15.5: 重试不再独立 delay → job 重新入队(dueAt=now+重试间隔抖动, attempt+1) + 清在飞; attempt≥2 放弃也清在飞。
+void afterCoverNoDetail() {
+    Object[] job = CUR_JOB;
+    final String key = (job != null) ? (String) job[JOB_KEY] : null;
+    // 先 finish 封面页 (UI 线程)
+    finishActivityByHash(COVER_ACT.get(key));
+    if (key != null) COVER_ACT.remove(key);
+
+    if (job == null) { SEEN.clear(); rpClearInFlight(); return; }
+    int attempt = ((Integer) job[JOB_ATTEMPT]).intValue();
+
+    if (attempt >= 2) {
+        // attempt2 (10 分钟后) 还没领完 → 放弃
+        if (key != null) DONE.add(key);   // 放弃: 标记完成, 避免再次入队
+        SEEN.clear(); // 该红包流转结束, 清 Activity 去重防内存增长 (下一个红包重新建)
+        rpClearInFlight();
+        hbBgLog("[RP] " + hbNow() + " GIVE UP: attempt=" + attempt + " still not finished. drop this redpacket. in-flight cleared.");
+        return;
+    }
+
+    final int nextAttempt = attempt + 1;
+    long retrySec = (attempt == 0) ? cfgRetry1() : cfgRetry2();
+    // v1.0.6 §13.1: 重试间隔 ±25% 抖动 (base*0.75 ~ base*1.25)。long 乘防溢出。
+    long retryMs = hbJitter((long) (retrySec * 1000L * 0.75), (long) (retrySec * 1000L * 0.5));
+    long dueAt = System.currentTimeMillis() + retryMs;
+    // §15.5: job 重新入队 (新 dueAt + attempt+1); 复用 talker/sender/msgid。
+    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt) };
+    SEEN.clear(); // 清 Activity 去重, 下次重开封面是新实例
+    rpClearInFlight();   // 先清在飞, 否则 rpEnqueue 会因"在飞"去重而拒绝重入
+    rpEnqueue(reJob);
+    hbBgLog("[RP] " + hbNow() + " not finished at attempt=" + attempt + ". RE-ENQUEUE retry in " + (retryMs / 1000L) + "s (cfg=" + retrySec + "s, jittered, attempt=" + nextAttempt + "). in-flight cleared, queue size=" + rpQueueSize() + ".");
+}
+
+View findClickableSelfOrAncestor(View v) {
+    try {
+        if (v == null) return null;
+        if (v.isClickable()) return v;
+        Object p = v.getParent();
+        int up = 0;
+        while (p != null && up < CLICK_MAX_DEPTH) {
+            if (p instanceof View) {
+                View pv = (View) p;
+                if (pv.isClickable()) return pv;
+                p = pv.getParent();
+            } else break;
+            up++;
+        }
+    } catch (Throwable t) {}
+    return null;
+}
+
+// finish 一个 Activity (按 identityHashCode 在当前 task 找) — 简化: 直接 finish topActivity 若 hash 匹配,
+// 否则 finish getTopActivity (bot 自己开的页一般就是前台)。UI 线程, try/catch。
+void finishActivityByHash(Object hashObj) {
+    try {
+        final Activity top = getTopActivity();
+        if (top == null) return;
+        // v1.0.6 §13.5: finish 精确 — 仅当前台 Activity 类名含 luckymoney(bot 开的红包页)才 finish,
+        //              否则不 finish(避免误关用户正在看的非红包页面)。
+        if (!hbIsLuckyMoneyTop(top)) {
+            hbBgLog("[RP] " + hbNow() + " finish skipped: top activity not luckymoney (avoid closing user's page).");
+            return;
+        }
+        top.runOnUiThread(new Runnable() {
+            public void run() {
+                try { top.finish(); } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " finish err: " + t); }
+            }
+        });
+    } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " finishActivityByHash err: " + t); }
+}
+
+// v1.0.6 §13.5: 判定前台 Activity 是否红包页 (类名含 luckymoney, 大小写不敏感)。
+boolean hbIsLuckyMoneyTop(Activity top) {
+    try {
+        if (top == null) return false;
+        String cn = top.getClass().getName();
+        if (cn == null) return false;
+        return cn.toLowerCase().indexOf("luckymoney") >= 0;
+    } catch (Throwable t) { return false; }
+}
+
+// ================================================================
+// ============ 详情页: 后台反射读明细 → 提取 → 关页 → 分档 @ ============
+// ================================================================
+void hbDetailExtract(Object root, String key) {
+    try {
+        if (key == null) { hbBgLog("[RP] " + hbNow() + " detail: key null, skip. clear in-flight."); rpClearInFlight(); return; }
+        if (DONE.contains(key)) { hbBgLog("[RP] " + hbNow() + " detail: already done, skip. clear in-flight."); rpClearInFlight(); return; }
+
+        // v1.1.0 §15.4: 归属信息从 CUR_JOB 取 (单飞下即当前 job)。
+        Object[] job = CUR_JOB;
+        String talker = (job != null) ? (String) job[JOB_TALKER] : null;
+        long msgid = 0L;
+        try { if (job != null) msgid = ((Long) job[JOB_MSGID]).longValue(); } catch (Throwable t) { msgid = 0L; }
+        final long fMsgid = msgid;
+
+        // BFS 找领取者 List
+        Object listObj = hbFindReceiverList(root);
+        if (listObj == null) {
+            hbBgLog("[RP] " + hbNow() + " detail: no receiver list found (reflect). clear in-flight.");
+            // 关页, 不重试 (已到详情页说明领完, 列表没读到是版本漂移问题)
+            finishDetailAndCover(key);
+            DONE.add(key);   // 已到详情页=领完, 不重入队
+            SEEN.clear();
+            rpClearInFlight();
+            return;
+        }
+
+        // 提取每个元素
+        List receivers = new java.util.ArrayList();  // Object[]{nickname, amountCent(long), wxid}
+        int size = 0;
+        boolean isArr = false;
+        java.util.List asList = null;
+        if (listObj instanceof java.util.List) { asList = (java.util.List) listObj; size = asList.size(); }
+        else if (listObj.getClass().isArray()) { isArr = true; size = java.lang.reflect.Array.getLength(listObj); }
+
+        String pathLog = null;
+        for (int i = 0; i < size; i++) {
+            Object el = isArr ? java.lang.reflect.Array.get(listObj, i) : asList.get(i);
+            if (el == null) continue;
+            Object[] tri = hbExtractTriple(el);
+            if (tri == null) continue;
+            if (pathLog == null) pathLog = (String) tri[3];
+            receivers.add(new Object[]{ tri[0], tri[1], tri[2] });
+        }
+
+        hbBgLog("[RP] " + hbNow() + " detail: extracted " + receivers.size() + "/" + size
+            + " receivers (path=" + pathLog + "). nicknames/amounts/wxids NOT logged (privacy).");
+
+        // ---- 普通红包(均分)过滤: 仅处理拼手气。已成功反射到列表后、分档发消息之前判断。----
+        // 拼手气 = 金额随机各不同; 普通 = 每人金额相等。
+        // 领取者 >=2 人 且所有金额(分, f 字段)全部相等 → 普通红包 → 不发任何消息。
+        // 1 人无法判定按正常处理(继续发, 概率极低且无害); 反射不到列表的情况上面已 return, 不在此误判。
+        try {
+            int rn = receivers.size();
+            if (rn >= 2) {
+                long firstCent = ((Long) ((Object[]) receivers.get(0))[1]).longValue();
+                boolean allEqual = true;
+                for (int i = 1; i < rn; i++) {
+                    long c = ((Long) ((Object[]) receivers.get(i))[1]).longValue();
+                    if (c != firstCent) { allEqual = false; break; }
+                }
+                if (allEqual) {
+                    hbBgLog("[RP] " + hbNow() + " skip normal(equal amounts): " + rn + " receivers all equal. no message sent. clear in-flight.");
+                    // 清状态、关页, 不发任何消息。§15.5 退出点 → 清在飞。
+                    finishDetailAndCover(key);
+                    DONE.add(key);
+                    SEEN.clear();
+                    rpClearInFlight();
+                    return;
+                }
+            }
+        } catch (Throwable t) {
+            hbBgLog("[RP] " + hbNow() + " normal-filter err: " + t + " (treat as 拼手气, continue).");
+        }
+
+        // 关页 (详情 + 封面)
+        finishDetailAndCover(key);
+
+        // 分档 + 发一条提醒 (v1.1.0 §16: 传 msgid 用于引用原红包)
+        if (talker != null) hbTierAndSend(talker, fMsgid, receivers);
+        else hbBgLog("[RP] " + hbNow() + " detail: talker null, cannot send.");
+
+        // 标记完成 + 清状态 (§15.5 退出点 → 清在飞)
+        DONE.add(key);
+        SEEN.clear();
+        rpClearInFlight();
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " detail extract err: " + t + ". finish + clear in-flight.");
+        try { finishDetailAndCover(key); } catch (Throwable t2) {}
+        try { if (key != null) DONE.add(key); SEEN.clear(); rpClearInFlight(); } catch (Throwable t2) {}
+    }
+}
+
+void finishDetailAndCover(String key) {
+    try {
+        final Activity top = getTopActivity();
+        // v1.0.6 §13.5: 仅当前台是红包页(类名含 luckymoney)才 finish, 避免误关用户正在看的页面。
+        if (top != null && hbIsLuckyMoneyTop(top)) {
+            top.runOnUiThread(new Runnable() {
+                public void run() { try { top.finish(); } catch (Throwable t) {} }
+            });
+        } else if (top != null) {
+            hbBgLog("[RP] " + hbNow() + " finishDetailAndCover skipped: top not luckymoney.");
+        }
+    } catch (Throwable t) {}
+    if (key != null) COVER_ACT.remove(key);
+}
+
+// ============ 结构化字段提取 (抗版本) — 见 SPEC §5 ============
+// 返回 Object[]{nickname(String), amountCent(Long), wxid(String), pathLog(String)}; 失败返回 null。
+Object[] hbExtractTriple(Object el) {
+    try {
+        java.util.Map fields = hbReadFields(el);  // name -> value (含继承链)
+        if (fields == null || fields.isEmpty()) return null;
+
+        // 金额: 首选名为 f 的 long/int, 值>=0; 否则遍历 long/int 找合理值。
+        Long amount = null;
+        String amtPath = "?";
+        Object fv = fields.get("f");
+        if (fv instanceof Number && ((Number) fv).longValue() >= 0) { amount = Long.valueOf(((Number) fv).longValue()); amtPath = "f"; }
+        if (amount == null) {
+            java.util.Iterator it = fields.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry e = (java.util.Map.Entry) it.next();
+                Object val = e.getValue();
+                String nm = (String) e.getKey();
+                if (nm.equals("g")) continue; // g = 领取时间戳, 排除
+                if (val instanceof Long || val instanceof Integer) {
+                    long lv = ((Number) val).longValue();
+                    if (lv >= 0 && lv < 100000000L) { amount = Long.valueOf(lv); amtPath = nm + "(struct)"; break; }
+                }
+            }
+        }
+
+        // wxid: 首选名为 n 的 String 且像 wxid; 否则遍历 String 找 wxid_ 开头。
+        String wxid = null;
+        String wxPath = "?";
+        Object nv = fields.get("n");
+        if (nv instanceof String && hbLooksWxid((String) nv)) { wxid = (String) nv; wxPath = "n"; }
+        if (wxid == null) {
+            java.util.Iterator it = fields.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry e = (java.util.Map.Entry) it.next();
+                Object val = e.getValue();
+                if (val instanceof String && hbLooksWxid((String) val)) { wxid = (String) val; wxPath = (String) e.getKey() + "(struct)"; break; }
+            }
+        }
+
+        // 昵称: 首选名为 d 的 String (非 wxid/非纯数字/非"手气最佳"); 否则遍历。
+        String nick = null;
+        String nkPath = "?";
+        Object dv = fields.get("d");
+        if (dv instanceof String && hbLooksNick((String) dv)) { nick = (String) dv; nkPath = "d"; }
+        if (nick == null) {
+            java.util.Iterator it = fields.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry e = (java.util.Map.Entry) it.next();
+                Object val = e.getValue();
+                String nm = (String) e.getKey();
+                if (nm.equals("n")) continue; // n 是 wxid
+                if (val instanceof String && hbLooksNick((String) val)) { nick = (String) val; nkPath = nm + "(struct)"; break; }
+            }
+        }
+
+        if (amount == null && wxid == null) return null;
+        if (nick == null) nick = (wxid != null ? wxid : "?");
+        if (amount == null) amount = Long.valueOf(0L);
+        String pathLog = "amt=" + amtPath + ",wx=" + wxPath + ",nk=" + nkPath;
+        return new Object[]{ nick, amount, wxid, pathLog };
+    } catch (Throwable t) { return null; }
+}
+
+// 读元素所有非 static 字段 (含继承链 ≤3 层) → name->value Map。
+java.util.Map hbReadFields(Object el) {
+    java.util.LinkedHashMap m = new java.util.LinkedHashMap();
+    try {
+        Class ec = el.getClass();
+        int hops = 0;
+        while (ec != null && hops <= 3) {
+            java.lang.reflect.Field[] fs = null;
+            try { fs = ec.getDeclaredFields(); } catch (Throwable t) { fs = null; }
+            if (fs != null) {
+                for (int i = 0; i < fs.length; i++) {
+                    java.lang.reflect.Field f = fs[i];
+                    try {
+                        if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                        f.setAccessible(true);
+                        String nm = f.getName();
+                        if (!m.containsKey(nm)) {
+                            Object v = null;
+                            try { v = f.get(el); } catch (Throwable t) { v = null; }
+                            m.put(nm, v);
+                        }
+                    } catch (Throwable t) {}
+                }
+            }
+            try { ec = ec.getSuperclass(); } catch (Throwable t) { ec = null; }
+            hops++;
+        }
+    } catch (Throwable t) {}
+    return m;
+}
+
+boolean hbLooksWxid(String s) {
+    if (s == null || s.isEmpty()) return false;
+    if (s.startsWith("wxid_")) return true;
+    // 像 wxid: 全英数下划线, 长度合理, 含字母 (排除纯数字时间戳/金额)
+    if (s.length() < 6 || s.length() > 40) return false;
+    boolean hasLetter = false;
+    for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        boolean ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '-';
+        if (!ok) return false;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) hasLetter = true;
+    }
+    return hasLetter;
+}
+
+boolean hbLooksNick(String s) {
+    if (s == null || s.isEmpty()) return false;
+    if (hbLooksWxid(s)) return false;          // 非 wxid
+    if (s.indexOf("@chatroom") >= 0) return false;
+    if (s.indexOf("http") >= 0 || s.indexOf("://") >= 0) return false;
+    if (s.equals("手气最佳")) return false;
+    // 非纯数字 (排除时间戳)
+    boolean allDigit = true;
+    for (int i = 0; i < s.length(); i++) { char c = s.charAt(i); if (c < '0' || c > '9') { allDigit = false; break; } }
+    if (allDigit) return false;
+    if (s.length() > 30) return false;          // 昵称一般不长
+    return true;
+}
+
+// ============ 分档 + 发一条提醒 (SPEC §6; v1.1.0 §16: 引用原红包) ============
+// msgid = 原红包消息的本地 msgId (来自 Job), 用于 rpSend 引用。无@群规消息走引用; 含[AtWx=]@消息也先试引用+@(v1.1.1), 失败回退 sendText 保@。
+void hbTierAndSend(String talker, long msgid, List receivers) {
+    try {
+        // ---- v1.0.6 §13.3: 同群 @ 限频。两条红包提醒间隔 < rp_msg_min_gap_sec 则跳过本次。----
+        // 在分档/构造前就判, 避免无谓计算; talker = 群 id。
+        long gapMs = cfgMsgGap() * 1000L;
+        if (gapMs > 0L && talker != null) {
+            Object lastObj = RP_LAST_MSG.get(talker);
+            if (lastObj != null) {
+                long last = ((Long) lastObj).longValue();
+                long since = System.currentTimeMillis() - last;
+                if (since < gapMs) {
+                    hbBgLog("[RP] " + hbNow() + " rate-limit: same-group last msg " + (since / 1000L) + "s ago < gap "
+                        + cfgMsgGap() + "s. skip this reminder.");
+                    return;
+                }
+            }
+        }
+
+        int t1 = cfgT1(), t2 = cfgT2(), t3 = cfgT3();
+        long c1 = (long) t1 * 100L, c2 = (long) t2 * 100L, c3 = (long) t3 * 100L;
+
+        // ---- v1.0.6 §12: 分档前先剔除本群排除名单的 wxid (不 @、不计入达标总人数 → 影响 >上限 判定)。----
+        List excl = getExcludeList(talker);
+        int excludedHit = 0;
+
+        List g1 = new java.util.ArrayList();  // wxid 列表 (档1)
+        List g2 = new java.util.ArrayList();
+        List g3 = new java.util.ArrayList();
+
+        for (int i = 0; i < receivers.size(); i++) {
+            Object[] r = (Object[]) receivers.get(i);
+            long cent = ((Long) r[1]).longValue();
+            String wxid = (String) r[2];
+            if (wxid == null || wxid.isEmpty()) continue;   // @ 需要 wxid
+            // 排除名单: 永不 @、不计入达标 (本群)
+            boolean skip = false;
+            for (int j = 0; j < excl.size(); j++) { if (wxid.equals(((String) excl.get(j)).trim())) { skip = true; break; } }
+            if (skip) { excludedHit++; continue; }
+            // 严格大于, 只归最高档
+            if (cent > c3) g3.add(wxid);
+            else if (cent > c2) g2.add(wxid);
+            else if (cent > c1) g1.add(wxid);
+        }
+
+        // 达标总人数 = 三档之和 (金额 > rp_t1 的全部领取者, 已剔除排除名单)
+        int totalQualified = g1.size() + g2.size() + g3.size();
+
+        // 达标 0 人 → 不发 (维持现状)
+        if (totalQualified == 0) {
+            hbBgLog("[RP] " + hbNow() + " tier: nobody qualified (>" + t1 + "元, excluded=" + excludedHit + "). no message sent.");
+            return;
+        }
+
+        int atLimit = cfgAtLimit();
+
+        // v1.1.2 §16: 发提醒拆两条 (达标≥1 才发)。
+        //   群规文本 = 前缀 + 三档组合规则 (全配置三档, 无名字无@), 两种情况内容一致;
+        //   1) 引用条: 达标≥1 (≤上限 与 >上限 都发) → rpSendQuote(talker, CUR_JOB.msgid 本地id, 群规文本)。
+        //   2) @条:    仅 1~at上限 时再发 → rpSendAt(talker, @文本) (每档 [AtWx=wxid]...{连接词}{语气}, 只@达标且未排除的人)。
+        //   达标 == 0 上面已 return, 此处不会到。限频已在函数顶部判过一次 (整体一次提醒)。
+        // 群规文本 (无@, 列全三档; v1.0.7 §14: 前缀+动作核心+档位=原值不动, 仅连接词+语气包裹随机)
+        String rule = cfgRulePrefix() + "，" + pickConnector(t1) + pickActionPhrase(cfgTxt1())
+            + "，" + pickConnector(t2) + pickActionPhrase(cfgTxt2())
+            + "，" + pickConnector(t3) + pickActionPhrase(cfgTxt3());
+
+        // 第一条 (引用群规条): 达标≥1 必发。引用原红包, 失败回退 sendText(同一群规文本)。
+        rpSendQuote(talker, msgid, rule);
+
+        if (totalQualified > atLimit) {
+            // > at上限 → 只发引用群规条 (不发@条)。
+            hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " > at_limit=" + atLimit
+                + " (excluded=" + excludedHit + ") -> sent ONLY quoted group-rule msg (NO @; random connector+action-phrase, action-core/prefix/tier verbatim). counts: t1=" + g1.size() + " t2=" + g2.size() + " t3=" + g3.size() + ".");
+        } else {
+            // 1 ~ at上限 → 第二条 (@条): 按档分组 [AtWx=] 真@ (v1.0.7 §14: 动作核心+档位原值不动, 仅连接词+语气包裹随机)。
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            if (!g1.isEmpty()) { if (!first) sb.append("\n"); appendTierLine(sb, g1, t1, cfgTxt1()); first = false; }
+            if (!g2.isEmpty()) { if (!first) sb.append("\n"); appendTierLine(sb, g2, t2, cfgTxt2()); first = false; }
+            if (!g3.isEmpty()) { if (!first) sb.append("\n"); appendTierLine(sb, g3, t3, cfgTxt3()); first = false; }
+            String atText = sb.toString();
+            if (atText.length() > 0) rpSendAt(talker, atText);   // §16: 真@ → sendText (引用条已单发)
+            hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " <= at_limit=" + atLimit
+                + " (excluded=" + excludedHit + ") -> sent TWO msgs (1.quoted group-rule, 2.@msg via sendText). random connector+action-phrase, action-core/tier verbatim. counts: t1=" + g1.size() + " t2=" + g2.size() + " t3=" + g3.size() + ".");
+        }
+
+        // v1.0.6 §13.3: 本次提醒 (整体) 发出后更新本群上次发送时间 (限频; 两条算一次)。
+        if (talker != null) RP_LAST_MSG.put(talker, Long.valueOf(System.currentTimeMillis()));
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " tier+send err: " + t);
+    }
+}
+
+// v1.0.7 §14: 格式 = {@这些人}{随机连接词(已填阈值)}{随机语气包裹(已填动作原文)}。动作核心词+档位原样, 仅连接词+语气包裹随机。
+void appendTierLine(StringBuilder sb, List wxids, int threshold, String text) {
+    for (int i = 0; i < wxids.size(); i++) sb.append("[AtWx=").append((String) wxids.get(i)).append("]");
+    sb.append(" ").append(pickConnector(threshold)).append(pickActionPhrase(text));
+}
+
+// ================================================================
+// ============ 反射: BFS 找领取者 List (后台线程, 强上界) ============
+// ================================================================
+Object hbFindReceiverList(Object root) {
+    if (root == null) return null;
+    java.util.Set visited = new java.util.HashSet();
+    java.util.ArrayDeque queue = new java.util.ArrayDeque();
+    queue.add(new Object[]{ root, Integer.valueOf(0) });
+    visited.add(Integer.valueOf(System.identityHashCode(root)));
+    int visitCount = 0;
+    try {
+        while (!queue.isEmpty()) {
+            if (visitCount >= MAX_VISIT) break;
+            Object[] entry = (Object[]) queue.poll();
+            Object obj = entry[0];
+            int depth = ((Integer) entry[1]).intValue();
+            visitCount++;
+            if (obj == null) continue;
+
+            if (hbIsReceiverList(obj)) return obj;
+            if (depth >= MAX_DEPTH) continue;
+            if (hbIsLeaf(obj)) continue;
+
+            Class c = obj.getClass();
+            int superHops = 0;
+            while (c != null && superHops <= 3) {
+                if (visitCount >= MAX_VISIT) break;
+                java.lang.reflect.Field[] fields = null;
+                try { fields = c.getDeclaredFields(); } catch (Throwable t) { fields = null; }
+                if (fields != null) {
+                    for (int i = 0; i < fields.length; i++) {
+                        if (visitCount >= MAX_VISIT) break;
+                        java.lang.reflect.Field f = fields[i];
+                        try {
+                            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                            f.setAccessible(true);
+                            Object child = null;
+                            try { child = f.get(obj); } catch (Throwable t) { continue; }
+                            if (child == null) continue;
+                            Integer h = Integer.valueOf(System.identityHashCode(child));
+                            if (visited.contains(h)) continue;
+                            visited.add(h);
+                            if (hbIsLeaf(child)) continue;
+                            queue.add(new Object[]{ child, Integer.valueOf(depth + 1) });
+                        } catch (Throwable t) { continue; }
+                    }
+                }
+                try { c = c.getSuperclass(); } catch (Throwable t) { c = null; }
+                superHops++;
+            }
+        }
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " find-list BFS err: " + t + " (visited=" + visitCount + ").");
+    }
+    return null;
+}
+
+// 候选判定: 非空 List/数组, 元素类名匹配领取者特征 (luckymoney 包 或 含 receiver/detail/hb/member)。
+boolean hbIsReceiverList(Object obj) {
+    try {
+        Object firstElem = null;
+        int size = 0;
+        if (obj instanceof java.util.List) {
+            java.util.List lst = (java.util.List) obj;
+            size = lst.size();
+            if (size == 0) return false;
+            firstElem = lst.get(0);
+        } else if (obj.getClass().isArray()) {
+            size = java.lang.reflect.Array.getLength(obj);
+            if (size == 0) return false;
+            firstElem = java.lang.reflect.Array.get(obj, 0);
+        } else return false;
+        if (firstElem == null) return false;
+        String ecn = firstElem.getClass().getName();
+        if (ecn == null) return false;
+        if (ecn.startsWith(LM_PKG)) return true;
+        String low = ecn.toLowerCase();
+        if (low.indexOf("receiver") >= 0 || low.indexOf("detail") >= 0
+            || low.indexOf("hb") >= 0 || low.indexOf("member") >= 0
+            || low.indexOf("luckymoney") >= 0) return true;
+        return false;
+    } catch (Throwable t) { return false; }
+}
+
+boolean hbIsLeaf(Object o) {
+    if (o == null) return true;
+    if (o instanceof Number) return true;
+    if (o instanceof String) return true;
+    if (o instanceof Boolean) return true;
+    if (o instanceof Character) return true;
+    if (o instanceof Enum) return true;
+    if (o instanceof Class) return true;
+    if (o instanceof java.math.BigDecimal) return true;
+    return false;
+}
+
+// ================================================================
+// ============ 配置 Dialog (参考 GroupAdmin) ============
+// ================================================================
+int _rpC(String s) { return android.graphics.Color.parseColor(s); }
+android.graphics.drawable.GradientDrawable _rpRound(String fill, int radius) {
+    android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
+    d.setColor(_rpC(fill));
+    d.setCornerRadius(radius);
+    return d;
+}
+android.widget.Button _rpBtn(Activity ctx, String text, String fillColor) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.Button b = new android.widget.Button(ctx);
+    b.setText(text);
+    b.setTextColor(_rpC("#E8E9EC"));
+    b.setBackground(_rpRound(fillColor, 24));
+    b.setAllCaps(false);
+    b.setTextSize(14);
+    b.setPadding(20 * dp, 12 * dp, 20 * dp, 12 * dp);
+    b.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+    return b;
+}
+android.widget.EditText _rpEdit(Activity ctx, String val, boolean numeric) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.EditText e = new android.widget.EditText(ctx);
+    e.setText(val);
+    e.setTextColor(_rpC("#E8E9EC"));
+    e.setHintTextColor(_rpC("#7C828E"));
+    e.setBackground(_rpRound("#252934", 12));
+    e.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    e.setTextSize(14);
+    if (numeric) e.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+    e.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+    return e;
+}
+void _rpLabel(android.widget.LinearLayout root, Activity ctx, String text) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.TextView tv = new android.widget.TextView(ctx);
+    tv.setText(text);
+    tv.setTextColor(_rpC("#E8E9EC"));
+    tv.setTextSize(13);
+    tv.setPadding(0, 8 * dp, 0, 4 * dp);
+    root.addView(tv);
+}
+void _rpSpacer(android.widget.LinearLayout root, Activity ctx, int h) {
+    android.view.View v = new android.view.View(ctx);
+    v.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, h));
+    root.addView(v);
+}
+
+// WAuxiliary 设置入口
+void openSettings() {
+    try {
+        // 无 groupId 上下文 → 全局配置 Dialog (启用开关那一行用提示文字代替)
+        showConfigDialog(null);
+    } catch (Throwable t) { try { toast("打开设置失败: " + t); } catch (Throwable t2) {} }
+}
+
+// 配置 Dialog: groupId 非空时显示并可改本群启用开关。
+void showConfigDialog(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_rpRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("🧧 红包统计 v1.1.0 配置");
+    title.setTextColor(_rpC("#E8E9EC"));
+    title.setTextSize(18);
+    title.setPadding(0, 0, 0, 8 * dp);
+    root.addView(title);
+
+    // 本群启用开关 (仅 groupId 非空)
+    final boolean[] enabledHolder = new boolean[]{ groupId != null && isGroupEnabled(groupId) };
+    if (groupId != null) {
+        android.widget.TextView gid = new android.widget.TextView(ctx);
+        gid.setText("群: " + groupId);
+        gid.setTextColor(_rpC("#7C828E"));
+        gid.setTextSize(11);
+        root.addView(gid);
+        final android.widget.Button toggleBtn = _rpBtn(ctx, enabledHolder[0] ? "🔕 关闭本群红包统计" : "✅ 开启本群红包统计", enabledHolder[0] ? "#FF6B6B" : "#5CB6FF");
+        toggleBtn.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) {
+                if (enabledHolder[0]) { disableGroup(groupId); enabledHolder[0] = false; toggleBtn.setText("✅ 开启本群红包统计"); toggleBtn.setBackground(_rpRound("#5CB6FF", 24)); toast("已关闭本群"); }
+                else { enableGroup(groupId); enabledHolder[0] = true; toggleBtn.setText("🔕 关闭本群红包统计"); toggleBtn.setBackground(_rpRound("#FF6B6B", 24)); toast("已开启本群"); }
+            }
+        });
+        root.addView(toggleBtn);
+    } else {
+        android.widget.TextView hint = new android.widget.TextView(ctx);
+        hint.setText("提示: 按群启用请在目标群内用 bot 账号发『开启红包统计』。本面板配置全局阈值/文案/延迟。");
+        hint.setTextColor(_rpC("#7C828E"));
+        hint.setTextSize(11);
+        root.addView(hint);
+    }
+
+    // 阈值
+    _rpLabel(root, ctx, "三档阈值 (元, 严格大于)");
+    final android.widget.EditText e1 = _rpEdit(ctx, String.valueOf(cfgT1()), true); root.addView(e1);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText e2 = _rpEdit(ctx, String.valueOf(cfgT2()), true); root.addView(e2);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText e3 = _rpEdit(ctx, String.valueOf(cfgT3()), true); root.addView(e3);
+
+    // 文案 (v1.0.7 §14: 动作核心词原样, 周围措辞会自动随机)
+    _rpLabel(root, ctx, "三档动作核心词 (原样, 周围措辞会自动随机)");
+    final android.widget.EditText t1 = _rpEdit(ctx, cfgTxt1(), false); root.addView(t1);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText t2 = _rpEdit(ctx, cfgTxt2(), false); root.addView(t2);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText t3 = _rpEdit(ctx, cfgTxt3(), false); root.addView(t3);
+
+    // 延迟
+    _rpLabel(root, ctx, "首次延迟 / 重试1 / 重试2 (秒)");
+    final android.widget.EditText d0 = _rpEdit(ctx, String.valueOf(cfgDelay()), true); root.addView(d0);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText d1 = _rpEdit(ctx, String.valueOf(cfgRetry1()), true); root.addView(d1);
+    _rpSpacer(root, ctx, 4 * dp);
+    final android.widget.EditText d2 = _rpEdit(ctx, String.valueOf(cfgRetry2()), true); root.addView(d2);
+
+    // at 上限: 达标总人数超此值改发无 @ 群规消息
+    _rpLabel(root, ctx, "at 上限 (达标总人数超此值改发无@群规消息)");
+    final android.widget.EditText al = _rpEdit(ctx, String.valueOf(cfgAtLimit()), true); root.addView(al);
+
+    // v1.0.6 §12: 红包提醒排除名单 (按群; 名单里的人永不被红包提醒 @, 也不计入 @ 上限)。仅 groupId 非空时显示。
+    if (groupId != null) {
+        _rpLabel(root, ctx, "红包提醒排除名单 (此名单的人永不被 @ / 不计入上限)");
+        final android.widget.LinearLayout exclBox = new android.widget.LinearLayout(ctx);
+        exclBox.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.addView(exclBox);
+        rpRebuildExcludeRows(ctx, exclBox, groupId);
+    } else {
+        _rpLabel(root, ctx, "排除名单");
+        android.widget.TextView eh = new android.widget.TextView(ctx);
+        eh.setText("提示: 在目标群内用 bot 账号 @某人 发『红包排除』可加入; 『@某人 取消红包排除』移除。本面板无群上下文。");
+        eh.setTextColor(_rpC("#7C828E"));
+        eh.setTextSize(11);
+        root.addView(eh);
+    }
+
+    _rpSpacer(root, ctx, 10 * dp);
+    android.widget.Button saveBtn = _rpBtn(ctx, "💾 保存配置", "#5CB6FF");
+    saveBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            try {
+                saveIntField(K_T1, e1); saveIntField(K_T2, e2); saveIntField(K_T3, e3);
+                saveStrField(K_TXT1, t1); saveStrField(K_TXT2, t2); saveStrField(K_TXT3, t3);
+                saveLongField(K_DELAY, d0); saveLongField(K_RETRY1, d1); saveLongField(K_RETRY2, d2);
+                saveIntField(K_AT_LIMIT, al);
+                toast("✅ 配置已保存");
+            } catch (Throwable t) { toast("保存失败: " + t); }
+        }
+    });
+    root.addView(saveBtn);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_rpRound("#0F1115", 0));
+
+    new android.app.AlertDialog.Builder(ctx)
+        .setView(sv)
+        .setNegativeButton("关闭", null)
+        .create()
+        .show();
+}
+
+// v1.0.6 §12: 重建排除名单行 (每人一行: 昵称/wxid + "移除"按钮)。移除后即时刷新本块。
+void rpRebuildExcludeRows(final Activity ctx, final android.widget.LinearLayout box, final String groupId) {
+    try {
+        box.removeAllViews();
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        List l = getExcludeList(groupId);
+        if (l == null || l.isEmpty()) {
+            android.widget.TextView empty = new android.widget.TextView(ctx);
+            empty.setText("(本群暂无排除名单)");
+            empty.setTextColor(_rpC("#7C828E"));
+            empty.setTextSize(12);
+            empty.setPadding(0, 4 * dp, 0, 4 * dp);
+            box.addView(empty);
+            return;
+        }
+        for (int i = 0; i < l.size(); i++) {
+            final String wxid = ((String) l.get(i)).trim();
+            if (wxid.isEmpty()) continue;
+            String nick = null;
+            try { nick = lookupName(wxid, groupId); } catch (Throwable t) { nick = null; }
+            if (nick == null || nick.isEmpty() || nick.equals("未知")) {
+                nick = (wxid.length() > 14) ? (wxid.substring(0, 14) + "…") : wxid;   // 拿不到昵称显示 wxid 截断
+            }
+
+            android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+            row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            row.setPadding(0, 3 * dp, 0, 3 * dp);
+            row.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            android.widget.TextView name = new android.widget.TextView(ctx);
+            name.setText(nick);
+            name.setTextColor(_rpC("#E8E9EC"));
+            name.setTextSize(13);
+            android.widget.LinearLayout.LayoutParams nlp = new android.widget.LinearLayout.LayoutParams(
+                0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            nlp.gravity = android.view.Gravity.CENTER_VERTICAL;
+            name.setLayoutParams(nlp);
+            row.addView(name);
+
+            android.widget.Button rm = new android.widget.Button(ctx);
+            rm.setText("移除");
+            rm.setTextColor(_rpC("#E8E9EC"));
+            rm.setBackground(_rpRound("#FF6B6B", 18));
+            rm.setAllCaps(false);
+            rm.setTextSize(12);
+            rm.setPadding(16 * dp, 6 * dp, 16 * dp, 6 * dp);
+            rm.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    try {
+                        java.util.List one = new java.util.ArrayList(); one.add(wxid);
+                        removeExclude(groupId, one);
+                        toast("✅ 已移出排除名单");
+                        rpRebuildExcludeRows(ctx, box, groupId);   // 即时刷新
+                    } catch (Throwable t) { try { toast("移除失败: " + t); } catch (Throwable t2) {} }
+                }
+            });
+            row.addView(rm);
+            box.addView(row);
+        }
+    } catch (Throwable t) {
+        try { hbBgLog("[RP] " + hbNow() + " rebuild-exclude-rows err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+void saveIntField(String key, android.widget.EditText e) {
+    try { String s = e.getText().toString().trim(); if (!s.isEmpty()) { Integer.parseInt(s); putString(key, s); } } catch (Throwable t) {}
+}
+void saveLongField(String key, android.widget.EditText e) {
+    try { String s = e.getText().toString().trim(); if (!s.isEmpty()) { Long.parseLong(s); putString(key, s); } } catch (Throwable t) {}
+}
+void saveStrField(String key, android.widget.EditText e) {
+    try { String s = e.getText().toString().trim(); if (!s.isEmpty()) putString(key, s); } catch (Throwable t) {}
+}
+
+// ================================================================
+// ============ 工具 ============
+// ================================================================
+String hbTextSkeleton(String s) {
+    try {
+        if (s == null) return "null";
+        String t = s.replace('\n', ' ').trim();
+        if (t.length() <= 12) return t;
+        return t.substring(0, 12) + "…(len=" + t.length() + ")";
+    } catch (Throwable t) { return "?"; }
+}
+
+void hbBgLog(final String content) {
+    try {
+        new Thread() {
+            public void run() {
+                try {
+                    java.io.FileWriter fw = new java.io.FileWriter(HB_LOG, true);
+                    try { fw.write(content); fw.write("\n"); } finally { fw.close(); }
+                } catch (Throwable t) {
+                    try { log("RedPacketStats bg write fail: " + t); } catch (Throwable t2) {}
+                }
+            }
+        }.start();
+    } catch (Throwable t) {}
+}
+
+String hbNow() {
+    try { return new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date()); }
+    catch (Throwable t) { return "?"; }
+}

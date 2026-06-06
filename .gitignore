@@ -9,6 +9,7 @@
 *.db-shm
 # Harness 运行期产物
 .harness/observations.jsonl
+.harness/pretool-observations.jsonl
 .harness/session-*.md
 .harness/*.tmp
 # 系统

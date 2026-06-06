@@ -1,7 +1,9 @@
 # RedPacketStats SPEC（正式版 v1.0）
 
 > 插件行为规格（C-PLUGIN-03 要求）。**改行为先改本文件，再改 `main.java`。**
-> 当前版本：**v1.0.6** — v1.0.4 起仅处理拼手气红包（见 §11）。v1.0.6 新增**红包提醒排除名单（按群）**（§12）+ **反检测硬化**（§13）。从 v0.8 spike（检测→开封面→点"看看大家的手气"→反射 NewDetailUI，全真机验证通过）升级为正式插件。
+> 当前版本：**v1.4.0（待部署）**——在已验证的 v1.3.0 之上做三件：① 发包人昵称修复（用群昵称 `getFriendDisplayName`→`getFriendNickName`→wxid，§17.1b）；② 每日定时统计 → 私聊（按群开关 `rp_daily_groups` + 一次性迁移默认 + 7点-7点窗口 + `rpWorkerTick` 触发 + 手动测试命令，§20）；③ 轻量 perf 埋点（`onHandleMsg` 只 nanoTime+累加，聚合落盘独立 `perf.log`，§21）。
+>
+> 历史版本：**v1.3.1（曾为开发版）** — v1.0.4 起仅处理拼手气红包（见 §11）。v1.0.6 新增**红包提醒排除名单（按群）**（§12）+ **反检测硬化**（§13）。v1.0.7 措辞随机（§14）。v1.1.0 调度层改"队列 + 单工作者（单飞）"（§15）。v1.1.2 发提醒改"引用群规条 + @ 条"两条（§16；实测引用条内 `[AtWx=]` 不解析、sendText 的 @ 真生效，故拆两条）。**v1.1.4 发两条修正（§16）：第一条（引用群规）改固定简洁、无随机无语气；第二条（@）保持随机，且第一条发出后隔 `rp_two_msg_gap_sec` 秒（默认 3，可配）再发以保证到达顺序。** **v1.2.0：两条消息定版，剥离统计（统计本地 DB §17、导出 §18、标题提取整体剥离，状态曾改「待实现」）。** **v1.3.0：在 v1.2.0（已真机验证的"队列 + 两条消息"定版）之上重新加回统计本地 DB（§17）、导出今日红包统计 → 私聊（§18）、红包标题提取（§17.3），并加 3 处嗅探调试日志（§17.5）以在真机一验时探明 3 个未知点（标题取自哪个字段 / DB 建库是否可行 / 私聊是否送达）。v1.2.0 的两条消息逻辑一行未动。** **v1.3.1（开发版，未部署）：三处增量——① 统计 `rp_record` 加 `group_name` 列（记录时仿 GroupAdmin `getGroupList()`→`getRoomId()`/`getName()` 取当前群名，导出每行行首带 `[群名]`，§17.1a）；② 第二条 @ 消息整体开头加 `【查包】` 前缀（§16）；③ `> rp_at_limit` 由"只发第一条"改为"第一条 + 隔 gap 秒发汇总 notice `【查包】本次过{t1}元共{Y}人，人数较多不逐一提醒，请大家自觉。`（无 @）"（§6.1/§16）。第一条/队列/统计写入点/热路径/两条消息的"隔 gap 秒"机制一行未动。** 从 v0.8 spike（检测→开封面→点"看看大家的手气"→反射 NewDetailUI，全真机验证通过）升级为正式插件。
 
 ## 1. 概述
 
@@ -34,9 +36,15 @@
 | `rp_first_sec` | 首次开页延迟（秒，内部 ×1000 换算 ms） | 120（2 分钟）|
 | `rp_retry1_sec` | attempt0 失败后重试间隔（秒） | 300（5 分钟）|
 | `rp_retry2_sec` | attempt1 失败后重试间隔（秒） | 600（10 分钟）|
-| `rp_at_limit` | 需提醒的达标总人数上限：超过则改发**无 @ 通用群规消息** | 10（v1.0.6，原 20）|
+| `rp_at_limit` | @ 人数上限：达标 1~此值发**两条（引用群规条 + @ 条）**；超过则**只发引用群规条**（不 @） | 10（v1.0.6，原 20）|
 | `rp_exclude_<groupId>` | 按群红包提醒排除名单（CSV wxid，§12） | 空 |
 | `rp_msg_min_gap_sec` | 同群两条红包提醒最小间隔（秒，§13.3） | 30 |
+| `rp_two_msg_gap_sec` | 同一次提醒内第一条（引用群规）与第二条（@）之间的延迟（秒，§16，保证到达顺序） | 3 |
+| `rp_export_target` | 导出今日红包统计私聊目标 wxid（§18；v1.3.0 恢复）。默认 `wxid_REDACTED`，可经命令/Dialog 覆盖。**公开提示**：此默认值为可配置默认（非密钥），真实采集数据落在本地 DB、不入仓 | `wxid_REDACTED` |
+| `rp_daily_groups` | 开了每日定时统计的群（CSV groupId，§20），与红包统计开关 `rp_enabled_groups` 独立 | 空（首次加载由 `rp_daily_migrated` 迁移=当前 enabled_groups）|
+| `rp_daily_migrated` | 一次性迁移 flag（§20）：首次加载把 `rp_daily_groups` 初始化 = 当前 `rp_enabled_groups`，跑过置 `1` 不再覆盖 | 空 → `1` |
+| `rp_daily_hour` | 每日定时发送的小时（本地时间，§20）；窗口为 `[今天 hour:00 往前 24h, 今天 hour:00)` | 7 |
+| `rp_daily_last_sent` | 上次每日发送的日期串 `yyyy-MM-dd`（§20）；抗重启不重发不漏发 | 空 |
 
 > **单位说明**：所有延迟配置项、命令、Dialog、状态显示统一用**秒**（v1.0.3 起；旧 `rp_*_ms` 毫秒键已废弃不再读，用新键名 `rp_first_sec`/`rp_retry1_sec`/`rp_retry2_sec` 避免误读旧值）。`delay()` 内部以 `sec * 1000L` 换算为 ms。
 > **spike 临时短延迟**：测试期可把 `rp_first_sec` 临时设短（如 60=1 分钟）方便端到端验。main.java 默认值仍为正式 120，临时值通过命令/Dialog 设置。
@@ -50,7 +58,9 @@
   - `红包文案1 爆照` / `红包文案2 宣群` / `红包文案3 发视频` → 设对应档文案
   - `红包延迟 120` → 设首次延迟（秒）；`红包延迟 120 300 600` → 三参数分别设首次/重试1/重试2（秒）；空参显示当前三值（秒）
   - `红包at上限 20` → 设达标总人数上限 `rp_at_limit`（超过则改发无 @ 通用群规消息）
-  - `红包统计状态` → toast 显示当前本群启用状态 + 全部配置（含 `rp_at_limit`），不发群
+  - `红包统计状态` → toast 显示当前本群启用状态 + 本群每日定时开关（§20）+ 全部配置（含 `rp_at_limit`），不发群
+  - `开启红包定时` / `关闭红包定时`（v1.4.0 §20）→ 对当前群开/关每日定时统计（独立于红包统计开关）
+  - `红包每日测试`（v1.4.0 §20）→ bot 自己发；立即按"过去 24 小时（now-24h ~ now）"窗口对 `rp_daily_groups` 跑一次每日发送 → 私聊 `rp_export_target`（便于不等到 7 点验证）
 
 ## 4. 完整处理流程（核心状态机）
 
@@ -106,16 +116,16 @@ NewDetailUI.onResume (类名过滤 + 去重):
   文案 = `超过<阈值>元，<rp_txtN>`。
 - 没有任何人达标 → 不发消息。
 
-### 6.1 达标总人数超 `rp_at_limit`（默认 20）→ 改发无 @ 通用群规消息
+### 6.1 发提醒按达标总人数分三种情况（v1.1.4 终版）
 
-- **达标总人数** = 金额严格 `> rp_t1` 的所有领取者人数（三档之和，即上面会被圈进任意一档的人数）。
-- **≤ rp_at_limit**：走 §6 现有逻辑（一条消息、按档分组、`[AtWx=]` 单独 @）。
-- **> rp_at_limit**：发**一条通用群规消息，无任何 @**，拼三档规则，格式：
-  ```
-  领红包请遵守群规执行，过{rp_t1}元{rp_txt1}，过{rp_t2}元{rp_txt2}，过{rp_t3}元{rp_txt3}
-  ```
-  一条 `sendText` 到该群（talker）。
-- **达标 0 人** → 不发（维持现状）。
+- **达标总人数** = 金额严格 `> rp_t1`、不在本群排除名单、且有 wxid 的所有领取者人数（三档之和）。
+- **第一条群规文本（v1.1.4：固定简洁、无随机、无语气词）**（无 @，列全配置三档）= `rp_rule_prefix(原值)` + 各档 `过{阈值}元{动作核心(cfgTxt 原样)}` 拼接，连接词固定写 `过X元`，例：`领红包请遵守群规执行，过5元爆照，过10元宣群，过20元发视频`。**不调 `pickConnector`/`pickActionPhrase`**，≤ 上限与 > 上限两种发送情况都用同一条固定文本。
+- **达标 0 人** → 两条都不发（维持现状）。
+- **达标 1 ~ `rp_at_limit`** → 发**两条**（严格顺序：先第一条，隔 `rp_two_msg_gap_sec` 秒再发第二条；详见 §16）：
+  1. **引用群规条**：`sendQuoteMsg(talker, CUR_JOB.msgid, 固定简洁群规文本)` —— 引用原红包，列全三档，无名字无 @，无随机无语气。
+  2. **@ 条**（隔 `rp_two_msg_gap_sec` 秒延迟发，保证到达顺序）：`sendText(talker, @文本)` —— **整体开头加固定前缀 `【查包】`**（在所有 `[AtWx=]`/逐档文本之前），随后每档一行 `[AtWx=wxid]...{pickConnector}{pickActionPhrase}`（**仅第二条随机**），只 @ 达标且未排除的人。**v1.3.1：第二条 @ 文本统一加 `【查包】` 前缀。**
+- **达标 > `rp_at_limit`** → 第一条照发（固定简洁引用群规条，同上），**v1.3.1 起也发第二条**（隔 `rp_two_msg_gap_sec` 秒，与 ≤ 上限同一延迟机制）：**纯文字、无 @**，格式 `【查包】本次过{t1}元共{Y}人，人数较多不逐一提醒，请大家自觉。`（`{t1}` = 最低档阈值 `cfgT1` 元；`{Y}` = 达标总人数 `totalQualified`，即超最低档、剔除排除名单后的人数）。**v1.3.1：> 上限不再"只发一条"，第二条为带 `【查包】` 的汇总 notice（无 @）。**
+- **限频**（§13.3）对"这一次提醒"**整体判定一次**（发第一条之前判，不把两条算两次）。
 
 ## 7. ANR 铁律（已 ANR 两次，死守）
 
@@ -191,13 +201,210 @@ NewDetailUI.onResume (类名过滤 + 去重):
 例：`过5元，记得爆照哦` / `超过5元，快点爆照啊`。动作核心「爆照」和阈值「5」始终原样，变的只是连接词和语气词。
 
 - **存储**：每档动作单值键（`rp_txt1`/`rp_txt2`/`rp_txt3`，默认 `爆照`/`宣群`/`发视频`）；群规前缀单值键（`rp_rule_prefix`，默认 `领红包请遵守群规执行`）。命令/Dialog 录入什么就原样存什么，不 split、不随机。
-- **@ 消息每行**（≤ `rp_at_limit`）：`{@这些人}` + `pickConnector(该档阈值)` + `pickActionPhrase(该档动作原文)`。
-- **通用群规消息**（`> rp_at_limit` 时发，无 @）：`rp_rule_prefix(原值)` + 各档 `pickConnector(阈值)+pickActionPhrase(动作)` 拼接（如 `领红包请遵守群规执行，过5元记得爆照哦，超过10元宣群，10元以上该发视频了`）—— 前缀和各动作核心恒定，连接词/语气随机。
+- **@ 消息每行（仅第二条 @ 条用，≤ `rp_at_limit`）**：`{@这些人}` + `pickConnector(该档阈值)` + `pickActionPhrase(该档动作原文)`。措辞随机**只作用于第二条**。
+- **第一条引用群规条（v1.1.4 改固定简洁，不再随机）**：`rp_rule_prefix(原值)` + 各档 `过{阈值}元{动作核心(原值)}` 拼接（如 `领红包请遵守群规执行，过5元爆照，过10元宣群，过20元发视频`）—— **不调 `pickConnector`/`pickActionPhrase`，无语气词无随机**；`≤ rp_at_limit` 与 `> rp_at_limit` 两种情况都用同一条固定文本。
 - **命令配置**：`红包文案1 X`（单个动作核心原值，不再讲 `|` 分隔）、`红包群规前缀 X`（单值原值）直接存原串；Dialog 动作字段说明「动作核心词（原样，周围措辞会自动随机）」。
 - **helper**：`pickConnector(threshold)` 从内置连接词变体随机选并填入 `{X}`=阈值；`pickActionPhrase(actionCore)` 从内置语气包裹变体随机选并填入 `{A}`=动作原文。各用 `Math.random()`，异常各自退回安全默认。**仅在 `hbTierAndSend` 发送时调用，不动检测/反射/分档主干。**
+
+## 15. 调度层：队列 + 单工作者（单飞，v1.1.0）
+
+**问题（v1.0.x）**：每个红包各自 `delay(首次延迟, hbProcess)`。红包雨时多个红包并发开封面页 → 互相对撞，全局态（`SEEN` / `CUR_NATIVEURL` / `COVER_ACT`）被踩 → 错乱 / 发错群 / ANR。
+
+**改为单工作者串行驱动**（仿 GroupAdmin `l3FlushLoop` 的自重调度 tick）：
+
+### 15.1 Job 模型
+`Job = {nativeurl(=去重 key), talker, sender, msgid, dueAt(ms), attempt}`。内存对象，不落盘。
+
+### 15.2 生产者（`onHandleMsg`，仍廉价）
+检测到红包（本群启用、非专属）后：
+- `dueAt = now + 首次延迟（cfgDelay 秒 ×1000，±25% 抖动）`，`attempt = 0`。
+- **入队**（`RP_QUEUE`，`synchronized`）。**按 nativeurl/去重 key 去重**：若该 key 已在队 / 在飞（`CUR_JOB`）/ 已完成（`DONE`）→ 不重复入队。
+- **队列上限 `RP_QUEUE_MAX = 50`**：满了 → 丢弃**最旧**一条 + log，再入新的。
+- **不再 per-红包 `delay(hbProcess)`**（彻底移除生产者侧定时）。
+
+### 15.3 单工作者 `rpWorkerTick()`
+- `onLoad` 启动一次；每次 tick 末尾 **`delay(RP_TICK_MS=3000, rpWorkerTick)` 自重调度**。整体 `try { … } catch(Throwable) {} finally { 必重调度 }` —— **任何异常都不能让 tick 停摆**。
+- 每 tick 逻辑：
+  1. **看门狗**：若有在飞 job 且 `now - inflightStartMs > RP_WATCHDOG_MS(30000)` → 强清在飞（`IN_FLIGHT=false; CUR_JOB=null`，log `watchdog`），让卡死的流水线被解开。
+  2. **单飞**：若仍有在飞（`IN_FLIGHT==true`）→ `return`（同一时刻只跑一个红包流水线）。
+  3. 否则从队列里挑 **`dueAt ≤ now` 中 `dueAt` 最早**的 job：出队 → `IN_FLIGHT=true; inflightStartMs=now; CUR_JOB=job` → `hbProcess(CUR_JOB)` 开封面。队列里没有到期 job → `return` 等下个 tick。
+
+### 15.4 CUR_JOB 归属
+把"当前正在处理的红包"上下文从旧的 `CUR_NATIVEURL`（裸字符串）统一成 **`CUR_JOB`（Job 对象，含 nativeurl/talker/msgid/attempt）**。`onResume` hook（路由 / 反射 / 发送 / 关页）全部从 `CUR_JOB` 取归属信息。单飞保证不会被踩；`SEEN.clear()` 只影响当前 job 的页面去重。
+
+### 15.5 退出点必清在飞（否则工作者卡死）
+**每一个流水线退出点都必须 `IN_FLIGHT=false; CUR_JOB=null`**：
+- 发完提醒成功 / 普通红包跳过（封面"查看领取详情"或反射金额全等）/ `attempt≥2` 放弃 / 任何异常 → **清在飞**（不重新入队，本红包终结）。
+- **"没领完"重试**：不再用独立 `delay`，改为 **job 重新入队**（`dueAt = now + 重试间隔(cfgRetry1/2 秒 ×1000，±25% 抖动)`，`attempt+1`）+ 清在飞。由工作者下个到期 tick 再领出来。
+- 重试上界仍是 attempt0→retry1、attempt1→retry2、attempt2 放弃（语义不变，只是改走队列）。
+
+### 15.6 ANR / 单飞正确性
+- `onHandleMsg` 仍只廉价判定 + 入队（O(1) `synchronized`），不开页/不反射。
+- 单飞 → 同一时刻只有一个红包页面流转 → 全局态不再被并发踩。
+- 看门狗保证：即使某个流水线异常未清在飞（理论上不该发生，因退出点已全覆盖），30s 后强清，工作者不会永久卡死。
+
+## 16. 发提醒：引用群规条 + @ 条（两条，v1.1.4 终版）
+
+让群里看到提醒是针对哪个红包（引用原红包），同时真 @ 到达标的人。**第一条固定简洁（无随机无语气），第二条随机；两条严格顺序，第二条延迟发以保序。**
+
+- **实测结论（2026-06-05，用户真机）**：
+  - `sendQuoteMsg(talker, long localMsgId, content)` 用**本地 msgId**（`msg.getMsgId()`，小数字，已存入 Job；**不是 srvid**）**能成功引用原红包消息**；
+  - 但 `content` 里的 `[AtWx=wxid]` 在引用消息里**不会被解析成真 @**（@ 不到人）；
+  - `sendText(talker, "[AtWx=wxid] ...")` 的 @ **真生效**（被 @ 者收到提醒）。
+  - **结论：引用与 @ 不能一条兼得 → 拆两条发。**
+- **发送规则**（达标 0 上面已不发）：
+  - **达标 1 ~ `rp_at_limit`** → 发**两条**（严格顺序）：
+    1. **第一条（引用群规条，固定简洁）**：`rpSendQuote(talker, CUR_JOB.msgid, 固定简洁群规文本)` —— `sendQuoteMsg` 引用原红包；文本 = `rp_rule_prefix(原值)` + `过{阈值}元{动作核心(cfgTxt 原样)}` 三档拼接（连接词固定 `过X元`），**不调 `pickConnector`/`pickActionPhrase`，无随机无语气词**。
+    2. **第二条（@ 条，随机，延迟发）**：第一条发出后 `delay(rp_two_msg_gap_sec × 1000, Runnable)` 再 `rpSendAt(talker, @文本)` —— `sendText` 解析 `[AtWx=]` 真 @ 到人（每档一行，`{pickConnector}{pickActionPhrase}` **仍随机**），**整体开头加 `【查包】` 前缀**（v1.3.1）。隔几秒保证到达顺序。
+  - **达标 > `rp_at_limit`** → 第一条照发（固定简洁引用群规条），**v1.3.1 起也发第二条**：第一条发出后同样 `delay(rp_two_msg_gap_sec × 1000, Runnable)` 再 `rpSendAt(talker, notice)`，`notice` = `【查包】本次过{t1}元共{Y}人，人数较多不逐一提醒，请大家自觉。`（`{t1}`=`cfgT1` 元，`{Y}`=`totalQualified`），**无 @、纯文字**。走与 ≤ 上限同一"第一条后隔 gap 秒发第二条"机制（`final` 捕获进闭包，`fire-and-forget`，不进在飞锁）。
+- **延迟与顺序/单飞**：
+  - `rp_two_msg_gap_sec`（默认 **3** 秒，可配）= 第一条与第二条间隔。
+  - 第二条为延迟 `fire-and-forget`：@文本 / talker 用 **final 捕获**进闭包（BeanShell 闭包坑），回调整段 `try/catch`。**不进在飞锁**——主流程（`rpClearInFlight` / `finishDetailAndCover`）发完第一条后照常继续，不等第二条。
+- **健壮性回退**：
+  - `rpSendQuote`：`msgId > 0` 时 `try sendQuoteMsg(...)`；**抛异常 / `msgId ≤ 0` → catch 回退 `sendText`（发不带引用的同一固定群规文本）**，绝不漏发。
+  - `rpSendAt`：始终 `sendText`（@ 由它保证）。引用条失败**绝不影响** @ 条。
+- **限频**（§13.3）对"这一次提醒"整体判定一次（在发第一条之前），不把两条算两次。措辞随机（§14）仅作用于第二条 @ 条。
+- **历史**：v1.1.0/v1.1.1 曾试图"引用 + @ 同一条"（`rpSend`），实测引用条内 `[AtWx=]` 不解析、@ 未到人，v1.1.2 改为拆两条。**v1.1.4**：第一条改固定简洁（去随机去语气）、第二条延迟 `rp_two_msg_gap_sec` 秒发以保序。**v1.3.1**：两种第二条都加 `【查包】` 前缀、都隔 gap 秒延迟发；`> rp_at_limit` 由"只发第一条"改为"第一条 + 隔 gap 秒发汇总 notice（`【查包】本次过{t1}元共{Y}人…`，无 @）"。即——达标 0 不发；达标 ≥1 都发第一条；第二条 ≤ 上限=`【查包】`逐档 @、> 上限=`【查包】`汇总 notice，两种都带 `【查包】`、都隔 gap 秒。
 
 ## 10. 数据存储
 
 - 配置 + 启用名单走 `getString`/`putString`（WAuxiliary KV）。
 - 红包运行态（nativeurl→talker/sender/msgid/attempt）存**内存 Map**（红包生命周期短，无需落盘；进程重启丢弃可接受 = 降级）。
-- **不落任何昵称/金额/wxid 到文件**。
+- **运行日志（`rp.log`）不落任何昵称/金额/wxid，仍只记计数（脱敏）。**
+- **统计明细本地 SQLite（§17）：v1.3.0 已恢复。** 这是**本地数据存储**（与脱敏日志是两回事），DB 里存真实昵称/金额/wxid 是允许的（用于导出）；但 `hbBgLog` 日志**仍只记计数，绝不打明文 wxid/昵称/金额**。§17.5 的嗅探调试日志同样脱敏（只记字段名/长度/计数/目标尾4位）。
+
+## 17. 统计本地 DB（SQLite）— ✅ v1.3.0 已实现
+
+> **状态（v1.3.0）：本节统计 DB 功能已在 v1.2.0 定版之上重新加回并生效。** 写入点严格遵守下面铁律（仅后台反射线程、可降级）。§17.5 新增 3 处嗅探调试日志，真机一验即可探明此前的未知点。
+>
+> 设计依据：独立 perf review 结论——热路径（`onHandleMsg`）保持干净、不碰 VH-01；统计 DB 写入**只在后台反射线程、拿到领取者明细 + 算出达标人数之后**进行，SQLite 单行 `INSERT OR REPLACE`，整段 `try/catch(Throwable)` 可降级，**绝不影响关页 / `rpClearInFlight` / 发提醒**，失败只 `hbBgLog` 一行（脱敏）。
+
+### 17.1 库与表
+
+- 库文件：插件目录下 `redpacket_stats.db`（路径 = `…/WAuxiliary/Plugin/RedPacketStats/redpacket_stats.db`）。
+- 打开方式：`android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(path, null)`（仿 GroupAdmin `l3Db()`）。WAL 在 FUSE 文件系统可能回退 `delete` 模式，无碍（GroupAdmin 经验）。连接懒打开单例，**只允许后台反射线程写**。
+- 表 schema（**一红包一行**，便于"每红包一行"导出）：
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS rp_record(
+      key TEXT,              -- 红包 nativeurl 或 msgid（去重，同一红包只记一次）
+      date TEXT,             -- yyyy-MM-dd（本地）
+      ts INTEGER,            -- 领完处理时刻 epoch ms
+      grp TEXT,              -- 群 id
+      group_name TEXT,       -- 群名（v1.3.1；记录时取当前群显示名，取不到留空串或 grp）
+      sender_wxid TEXT,      -- 发红包的人 wxid
+      sender_name TEXT,      -- 发红包的人【群昵称】（v1.4.0：getFriendDisplayName 群名片/群昵称 → getFriendNickName → wxid；见 §17.1b）
+      title TEXT,            -- 红包标题/祝福语（见 17.3）
+      qualified_count INTEGER, -- 超最低档（档1阈值）人数（全量，不截断）
+      qualifiers TEXT,       -- 超最低档的人明细序列化文本（见 17.4）
+      PRIMARY KEY(key)
+  );
+  ```
+
+### 17.1a 群名 `group_name`（v1.3.1）
+
+- `rp_record` 新增列 `group_name TEXT`（群 id 已有 `grp=talker`）。`CREATE TABLE` 已含该列；对**老库无该列**的情况，`rpDb()` 建表后额外 `try { ALTER TABLE rp_record ADD COLUMN group_name TEXT } catch`（已存在则忽略），保证升级安全（本库尚未在真机建过，CREATE 直接含列即可，ALTER 仅作稳妥兜底）。
+- 记录时取**当前群显示名**：在 `rpRecordStats` 里用 `talker`（群 id）查群名。实现仿 GroupAdmin —— 遍历 `getGroupList()`，对每个 info 调 `getRoomId()` 匹配 `talker`，命中则取 `getName()`。取不到 → 存空串（导出时回退用群 id）。整段 `try/catch`，绝不因取群名失败而漏记/抛异常。
+- 导出（§18）每行行首带 `[群名]`，便于多群区分。
+
+### 17.1b 发包人昵称 `sender_name` 用群昵称（v1.4.0，bug 修复）
+
+- **现状 bug**：v1.3.x 的 `rpRecordStats` 用 `lookupName(senderWxid, talker)` 取发包人名，在本设备上显示成了 wxid（统计/导出里发包人显示为 wxid 而非群昵称）。
+- **修复**：改用 `rpSenderName(senderWxid, talker)`，优先 `getFriendDisplayName(senderWxid, talker)`（群名片/群昵称）→ 取不到退 `getFriendNickName(senderWxid)`（微信昵称）→ 再退 `senderWxid`（wxid 原值）。整段 `try/catch`，绝不抛。
+- **领取者昵称不动**：领取者昵称走反射 `d` 字段（`hbExtractTriple`），那条路径正常，本次不改。
+- 仅后台反射线程调用（`rpRecordStats` 内），不碰热路径。
+
+### 17.2 记录范围（铁律）
+
+- 每个**有 ≥1 人超过最低档（档1阈值 `rp_t1`）**的红包记一行；**达标 0 人的不记**。
+- **超过 at 上限（如 >10 人）也要完整记录**：at 上限只影响"发不发 @ 条"，**不影响 DB 记录**——`qualified_count` 与 `qualifiers` 都是**全量、不截断**。
+- `key` 去重：用 `INSERT OR REPLACE`（同一红包只占一行，重跑覆盖）。
+
+### 17.3 红包标题 `title`（在 `onHandleMsg` 提取，存进 Job）
+
+- 从红包消息 `wcpayinfo` 取祝福语/标题。候选字段（取首个非空）：`sendertitle` / `receivertitle` / `scenetext` / `des`——通常是"恭喜发财，大吉大利"那类祝福语文本。
+- 提取**只在红包消息上做（低频）**，不影响普通消息热路径。
+- 提取出的 `title` 随 `msgid/sender` 一起存进 **Job（`JOB_TITLE` 第 7 槽位）**，后台写 DB 时取用。**v1.3.0：已恢复 `rpExtractTitle` + `JOB_TITLE` 槽，Job 为 7 元组（两处 Job 构造——首次入队、重试重新入队——都带 title）。**
+- **存疑（已加嗅探日志，待真机确认）**：到底哪个字段是用户可见的祝福语，需真机确认（不同微信版本字段可能不同）；代码按 `sendertitle→receivertitle→scenetext→des` 顺序取首个非空，取不到留空串。`rpExtractTitle` 命中时会 `hbBgLog` 一行 `stats title: usedField=<字段名> len=<长度>`（脱敏，只记字段名 + 长度，不打原文，见 §17.5①），真机发个红包即知标题取自哪个字段、对不对。
+
+### 17.4 写入点（铁律）
+
+- 位置：`hbDetailExtract` 的**后台反射线程**里，在拿到 `receivers` + 算出"超最低档人数"之后；达标 ≥1 才写一行。
+- 该写入**复用 §6 分档已算出的达标信息**（避免重复遍历）：超最低档（`cent > c1`）的人即 §6 三档之和的人；`qualifiers` 序列化为 `昵称|金额元|档次;昵称|金额元|档次;...`（**全部列出，>10 也全列**；档次=1/2/3）。
+- **整段 `try/catch(Throwable)`**：失败只 `hbBgLog` 一行（脱敏，只记计数 + 异常摘要），**绝不抛、绝不卡住关页 / `rpClearInFlight` / 发提醒**。
+- DB 连接懒打开单例，**只后台线程写**。**绝不在 `onHandleMsg` / `rpEnqueue` / `rpWorkerTick` / UI 线程写 DB。**
+- 与 §11 普通红包过滤的关系：普通红包（金额全等）在写 DB 之前已 return，不入 DB（它们也不发提醒，无统计意义）。
+
+### 17.5 嗅探调试日志（v1.3.0，真机一验即探明 3 个未知）
+
+> 全部脱敏（只记字段名 / 长度 / 计数 / 目标尾 4 位，绝不打标题原文 / 明文 wxid / 金额 / 内容）。目的：真机发个红包 + 点一次导出，即可从 `rp.log` 读出三个此前未确认的答案。
+
+- **① 标题字段来源**：`rpExtractTitle` 命中某字段时记 `[RP] stats title: usedField=<sendertitle/receivertitle/scenetext/des> len=<长度>`；全部字段空记 `usedField=none len=0`。`rpRecordStats` 写库时另记 `stats title: writing record, title len=<长度>` 确认该长度带进了本次写库。→ 真机即知标题取自哪个字段、对不对。
+- **② DB 建库**：`rpDb()` 打开/建表成功记 `[RP] stats-db opened (<库文件名>)`；失败记 `[RP] stats-db: open fail (degrade, no record this time): <异常>`。→ 真机即知 GroupAdmin 同级目录建库是否可行。
+- **③ 私聊送达**：`rpExportToday` 后台线程发完后记 `[RP] export: sent <N> msg to target(尾4位=<尾4位>) (rows=<行数>)`。→ 真机即知导出是否真送到该私聊。
+- **④ 群名取到（v1.3.1）**：`rpRecordStats` 取群名后记 `[RP] stats group_name len=<长度>`（只记长度，不打群名原文）。→ 真机即知 `rpGroupName(getGroupList()→getRoomId()→getName())` 是否取到当前群显示名（len>0 即取到）。
+
+## 18. 导出今日红包统计 → 私聊 — ✅ v1.3.0 已实现
+
+> **状态（v1.3.0）：导出按钮与导出逻辑已随统计 DB 一并恢复并生效。** `rp_export_target` 默认 `wxid_REDACTED`（可经命令/Dialog 覆盖）；此为可配置默认值（非密钥），真实采集数据落在本地 DB、不入仓。
+
+- 配置 Dialog（`showConfigDialog`）新增按钮「📤 导出今日红包统计 → 私聊」。
+- 点击（UI 事件回调，**非热路径**）：查 `rp_record` 当天（`date=今天 yyyy-MM-dd`，本地）所有行 → 组装文本，**每个红包一行**：
+  - 格式（v1.3.1 行首带群名）：`[{group_name}] HH:mm 发红包:{sender_name} 标题:{title} 达标{n}人:{qualifiers}`（`HH:mm` 由 `ts` 格式化；`group_name` 取不到则回退群 id 或留空 `[]`）。
+- 私聊发送给目标 wxid `rp_export_target`（默认 `wxid_REDACTED`），用 `sendText(targetWxid, text)`，**放后台线程发**（UI 回调里别阻塞）。
+- **长文本分条**：超过单条上限（约 **1800** 字符，留余量）就分多条发（每条若干完整行，不切断单行），避免超微信单消息上限。
+- 当天无记录 → `toast("今日无红包统计")`，不发送。
+- 全程 `try/catch`，导出是**只读查询 + 发消息**，不影响采集。发完记 §17.5③ 脱敏日志。
+- **公开提示**：`rp_export_target` 默认值 `wxid_REDACTED` 是**可配置默认值（非密钥）**，仅作收件目标；真实采集的昵称/金额/wxid 落在本地 DB（不入仓），导出消息内容不写日志。
+
+## 19. 热路径命令闸门顺序优化（v1.1.3，perf review 建议）
+
+- `onHandleMsg` 排除命令闸门（原"红包排除"判定）：把 `content.indexOf("红包排除") >= 0` 提到 `sender.equals(getLoginWxid())` **之前**判断。
+- 收益：普通消息（绝大多数不含"红包排除"）**不再每条调 `getLoginWxid()`**（短路在更廉价的字符串 `indexOf` 上）。
+- **纯顺序调整、零行为变化**：命中条件仍是"含'红包排除' 且 发送者是 bot 自己 且 atList 非空"，只是 `&&` 子表达式顺序换了一下。
+
+## 20. 每日定时统计 → 私聊（v1.4.0）
+
+每天固定时刻把"过去 24 小时（7 点 - 7 点窗口）各群达标红包"汇总私聊给 `rp_export_target`（默认 `wxid_REDACTED`）。
+
+### 20.1 按群开关 + 迁移默认
+
+- **开关**：`rp_daily_groups`（CSV groupId），独立于红包统计开关 `rp_enabled_groups`。helper：`getDailyGroups` / `isDailyEnabled` / `enableDailyGroup` / `disableDailyGroup`。
+- **迁移默认**：用一次性 flag `rp_daily_migrated`。`onLoad` 调 `rpDailyMigrateOnce()`——若 flag 未置，则把 `rp_daily_groups` 初始化 = 当前 `rp_enabled_groups`（现在开了红包统计的群默认打开定时），随后置 flag=`1`；跑过后用户对 `rp_daily_groups` 的增删不再被覆盖。
+- **联动开启**：`enableGroup`（`开启红包统计`）时也调 `enableDailyGroup`，把该群加进 `rp_daily_groups`（默认开，可单独关）。
+
+### 20.2 开关命令 / Dialog / 状态
+
+- 命令（`onClickSendBtn` 拦截不发群，toast 反馈）：`开启红包定时` / `关闭红包定时`（对当前群）。
+- 设置 Dialog（`showConfigDialog`，groupId 非空时）在"启用开关"下加一个**每日定时开关按钮**，显示/切换本群定时状态。
+- `红包统计状态` 显示本群每日定时开关状态。
+
+### 20.3 触发机制（抗重启，不用精确定时器）
+
+- 在 `rpWorkerTick`（每 `RP_TICK_MS`=3s 跑一次）里调 `rpDailyCheck()`（独立 `try/catch`，异常不影响红包流水线）。
+- `rpDailyCheck`：配 `rp_daily_hour`（默认 7）。若**当前本地小时 ≥ `rp_daily_hour`** 且 `rp_daily_last_sent`（持久化日期串）**≠ 今天日期** → 先把 `rp_daily_last_sent` 置今天（即使发送出错也不重发刷屏）→ 执行每日发送。
+- 效果：**每天只发一次、重启不重发不漏发**（7 点后启动当天补发）。
+
+### 20.4 每日发送内容
+
+- 窗口 = `[今天 rp_daily_hour:00 往前 24 小时（即昨天 hour:00）, 今天 hour:00)`。
+- 查 `rp_record` 中 `ts >= windowStart AND ts < windowEnd AND grp IN (rp_daily_groups)`——**用 `ts` 范围查，别用 `date` 列**（窗口跨两个日历日）。`grp IN (...)` 动态拼占位符。按 `ts` 升序。
+- **每红包一行**，行首带 `[群名]`（`group_name`，取不到回退 `grp`），格式同手动导出：`[群名] HH:mm 发红包:{sender_name} 标题:{title} 达标{n}人:{qualifiers}`。
+- 发给 `rp_export_target`，超长按约 1800 字符分多条（不切断单行）。
+- **Header**：`📊 每日红包统计 (MM-dd HH:mm ~ MM-dd HH:mm)`（手动测试标注 `[手动测试]`）。
+- **无记录也发一条** header + `(过去24h无达标红包)`（作每日心跳）。
+- 整段**后台线程** + `try/catch` 可降级；发完记脱敏日志（条数 + 目标尾 4 位 + 行数）。
+
+### 20.5 手动测试命令
+
+- `红包每日测试`（`onClickSendBtn`，bot 自己）→ 立即按"过去 24 小时（now-24h ~ now）"窗口对 `rp_daily_groups` 跑一次每日发送到 `rp_export_target`。便于不等到 7 点验证。`rpDailyTest()` → `rpDailySend(now-24h, now, manual=true)`。log 一行。
+
+## 21. 轻量 perf 埋点（v1.4.0，为性能分析）
+
+仿 GroupAdmin `perf.log`，用于验证 `onHandleMsg` 没拖慢消息收发。
+
+- **热路径只测不写**：`onHandleMsg` 包装层（`onHandleMsg` 调 `onHandleMsgBody`）入口 `System.nanoTime()`，在 `finally` 里**只做 nanoTime + 顶层整型累加**：`PERF_N`（样本数）、`PERF_SUM_NS`（累计耗时）、`PERF_MAX_NS`（最大耗时）。**不每条写文件**。
+- **聚合落盘**：`perfFlush()` 把聚合行写独立 `perf.log`（插件目录，**与 `rp.log` 分开**），行含 `ts/iso/n/ohm_avg_us/ohm_max_us`；写文件放**后台线程**，先快照清零再写。
+- **落盘触发**：由 `rpWorkerTick` 定时驱动（每 tick 若 `PERF_N >= PERF_FLUSH_EVERY`=200 则 flush）；热路径仅在窗口异常膨胀（`PERF_N >= PERF_FLUSH_EVERY*50`）时兜底 flush 一次（防计数溢出/失真）。
+- 全程 `try/catch`，埋点异常**绝不影响消息**；**绝不把埋点变成热路径负担**（热路径零文件 IO，落盘后台化）。
+- `perf.log` 只写耗时/计数，**绝不写 wxid/群名/群ID/消息内容**。

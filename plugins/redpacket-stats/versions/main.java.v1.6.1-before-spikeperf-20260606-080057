@@ -1,25 +1,4 @@
-// RedPacketStats — v1.6.4 — 在 v1.6.3 之上: enabled 群内存缓存(消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms)。
-//
-// v1.6.4: [性能/C-PERF-01,03] 启用群集合内存缓存 (仿 GroupAdmin v1.16.2)。消除红包消息热路径最后一处 per-红包 FUSE 读:
-//         onHandleMsgBody 的 isGroupEnabled → getEnabledGroups → getString(K_ENABLED) 原每个红包候选读一次 config.prop (~26ms)。
-//         新增顶层 RP_ENABLED_CACHE(HashSet,normGroupId 后)/RP_ENABLED_CACHE_TS/RP_ENABLED_TTL_MS(60s)。rpLoadEnabledCache() 全量 norm 后原子替换。
-//         isGroupEnabled: 缓存 null 或超 TTL → rpLoadEnabledCache(), 然后 contains; 整段 try/catch, 异常回退原"直接 getString 遍历"(宁可慢不可错)。
-//         enableGroup/disableGroup putString 后立即 rpLoadEnabledCache() — 开启/关闭红包统计下一个红包即时生效, 不等 TTL。
-//         归一口径与原 isGroupEnabled 完全一致(normGroupId=trim)。加载失败保留旧缓存只 log。只动 isGroupEnabled 读路径+缓存维护,
-//         不碰检测/入队/worker/分档/发送/统计/定时/导出; spike 归因埋点保留(验证红包热路径耗时进一步降)。
-//         其它只读 getEnabledGroups() 调用(每日迁移/daily groups, 非热路径)保持原 getString(不影响正确性)。
-//
-// v1.6.2: spike 归因埋点 (诊断用, 仿 v1.4.0 PERF_* 风格, 绝不反噬热路径)。
-//         目的: 区分 "每 ~200 条出现 1 次 200-370ms onHandleMsg max spike" 是 (A)真红包那条在热路径做重活,
-//         还是 (B)GC/框架抖动。新增一组顶层 long/int 累加 (只 nanoTime+整型, 无 IO/log/反射):
-//         1. A/B 分类计时: 每条 onHandleMsg 耗时按 红包消息(A, PERF_RP_*)/普通消息(B, PERF_NORM_*) 分别累加 sum/max/count。
-//            A/B 判定: onHandleMsgBody 过完"命中检测(isHb)+本群启用"闸门即置顶层标记 PERF_LAST_RP=true (走 extract+入队"重活"路径);
-//            未命中/未启用快速 return 的为 B。wrapper finally 读标记分类。每条进入前 wrapper 先清标记。
-//         2. spike 标记: 单条耗时 > PERF_SPIKE_NS(50ms) → PERF_SPIKE_N++, 并分 PERF_SPIKE_RP_N(spike且红包)/PERF_SPIKE_NORM_N(spike且普通)。
-//            关键判据: spike 几乎全落普通消息(B) → 大概率 GC/框架抖动(与本插件无关); spike 集中在红包消息(A) → extract/入队在热路径做了重活, 需移后台。
-//         3. perf flush 落盘行追加: rp_msg_n/rp_msg_avg_us/rp_msg_max_us/norm_avg_us/norm_max_us/spike_n/spike_rp/spike_norm + (可选)rp_extract_*。窗口重置时同步清零。
-//         4. (可选细计时) 红包消息内部单量 rpExtractTitle(XML parse) 耗时 → PERF_EXTRACT_* (rp_extract_avg_us/max_us), 帮进一步定位重活点。仅 nanoTime, 无新 IO/反射。
-//         严格不碰任何业务逻辑(检测/extract/入队/队列/分档/发送一行不动), 只插计时与计数; 整段 try/catch, 埋点出错不影响消息。
+// RedPacketStats — v1.6.1 — 在 v1.6.0a 之上: 档位上限 4→10, 修红包文案K 两位数解析 bug, 全量保存错误检测加强。
 //
 // v1.6.1: A. 档位上限 RP_MAX_TIERS 4→10。所有"写死 4"的档位相关命中点改用 RP_MAX_TIERS (getTiers 截断/红包阈值个数上限/
 //            红包增加档满档判定/Dialog 行解析截断/各错误文案 1-4→1-10/K=1/2/3/4→档号 1-10)。与档位无关的 4 (如尾号 substring(-4)、
@@ -192,9 +171,9 @@
 // 群红包领完后, 自动开页读明细 → 按金额阈值分档 → 群内发一条 @ 消息圈出"手气好"的人。
 //
 // 完整链路 (SPEC §4):
-//   onHandleMsg(廉价, v1.6.3): 群聊 + (type==436207665 或含 <nativeurl>) → 本群启用? 否则 return
-//     → 廉价 key=k:talker:sender:msgid + 携原始 content 入队 (attempt=0, 不在热路径 parse nativeurl/exclusive/title)
-//   hbProcess(后台 worker, v1.6.3): 出队后解析原始 content — 专属早退(skip exclusive)/nativeurl/rpExtractTitle(回填 job) → 启动器拉封面页 NewReceiveUI。
+//   onHandleMsg(廉价): 群聊 + (type==436207665 或含 <nativeurl>) → 本群启用? 否则 return
+//     → 提 nativeurl/talker/sender/msgid → 存红包运行态(内存 Map, attempt=0) → delay(rp_first_sec×1000) → hbProcess
+//   hbProcess(nativeurl): 启动器拉封面页 NewReceiveUI。
 //   NewReceiveUI.onResume: delay 后 UI 有界查找 detail 入口("看看大家的手气"/"查看领取详情" 且可点)
 //     ├─ 可点且含"手气"(拼手气领完) → performClick → 微信流转 NewDetailUI
 //     ├─ 可点但不含"手气"="查看领取详情"(普通领完) → 不点击 → finish 封面 → 清状态跳过(不开详情/不发消息)
@@ -305,12 +284,9 @@ java.util.Set OPENED = java.util.Collections.synchronizedSet(new java.util.HashS
 java.util.Map COVER_ACT = java.util.Collections.synchronizedMap(new java.util.HashMap());
 
 // ==================== v1.1.0 §15: 队列 + 单工作者(单飞) ====================
-// Job = Object[]{ key(=廉价去重key k:talker:sender:msgid, String), talker(String), sender(String), msgid(Long), dueAt(Long, ms), attempt(Integer), title(String), content(String 原始消息 XML) }
-// 索引常量 (BeanShell 无 enum, 用 int 常量映射)。v1.3.0: 加 JOB_TITLE 第 7 槽 (供后台写统计 DB 用)。
-// v1.6.3: 去重 key 改用廉价 k:talker:sender:msgid (不再依赖 nativeurl XML parse); 加 JOB_CONTENT 第 8 槽携原始 content,
-//         worker(hbProcess) 出队后才做 nativeurl/exclusive/title 的 XML 解析 (重活移出热路径, C-PERF-03)。
-//         入队时 JOB_TITLE 留空, 由 worker rpExtractTitle 后写回本 job 数组 (CUR_JOB), 供 rpRecordStats 读。
-int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5; int JOB_TITLE = 6; int JOB_CONTENT = 7;
+// Job = Object[]{ nativeurl(=去重key, String), talker(String), sender(String), msgid(Long), dueAt(Long, ms), attempt(Integer) }
+// 索引常量 (BeanShell 无 enum, 用 int 常量映射)。v1.3.0: 加回 JOB_TITLE 第 7 槽 (供后台写统计 DB 用), 恢复 7 元组。
+int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5; int JOB_TITLE = 6;
 // 待处理 Job 队列 (生产者 onHandleMsg 入队; 单工作者出队)。所有读写持 RP_QUEUE 自身锁 (synchronized(RP_QUEUE))。
 java.util.List RP_QUEUE = new java.util.ArrayList();
 int RP_QUEUE_MAX = 50;           // 队列上限: 满则丢最旧一条 + log
@@ -337,32 +313,6 @@ long PERF_N           = 0L;    // 当前窗口样本数 (onHandleMsg 调用数)
 long PERF_SUM_NS      = 0L;    // 窗口 onHandleMsg 累计耗时 (ns)
 long PERF_MAX_NS      = 0L;    // 窗口 onHandleMsg 最大耗时 (ns)
 
-// ==================== v1.6.2: spike 归因埋点 (诊断用, 仿上方 PERF_* 风格) ====================
-// 目的: 区分 "每 ~200 条出现 1 次 200-370ms onHandleMsg max spike" 是 (A)真红包那条在热路径做重活,
-//       还是 (B)GC/框架抖动落在普通消息上。判据: spike 几乎全落普通消息→GC/框架抖动(与本插件无关);
-//       spike 集中在红包消息→extract/入队在热路径做了重活, 需移后台。
-// 实现: 仍只 nanoTime + 顶层整型累加, 绝不在热路径加 IO/log/反射。分类由 onHandleMsgBody 设的 PERF_LAST_RP 标记驱动。
-// 分类: A 红包消息 = 命中检测(isHb)且本群启用, 走 extract title + 入队(或 skip exclusive)那条路径;
-//       B 普通消息 = 未命中或未启用, 快速 return。
-long PERF_RP_SUM_NS   = 0L;    // 窗口内 红包消息 累计 onHandleMsg 耗时 (ns)
-long PERF_RP_MAX_NS   = 0L;    // 窗口内 红包消息 最大单条耗时 (ns)
-long PERF_RP_N        = 0L;    // 窗口内 红包消息 条数
-long PERF_NORM_SUM_NS = 0L;    // 窗口内 普通消息 累计 onHandleMsg 耗时 (ns)
-long PERF_NORM_MAX_NS = 0L;    // 窗口内 普通消息 最大单条耗时 (ns)
-long PERF_NORM_N      = 0L;    // 窗口内 普通消息 条数
-long PERF_SPIKE_NS    = 50000000L; // spike 阈值 = 50ms = 50_000_000ns (>此值算一次 spike)
-long PERF_SPIKE_N     = 0L;    // 窗口内 spike 总数 (>阈值的条数)
-long PERF_SPIKE_RP_N  = 0L;    // 窗口内 spike 且是红包消息 的条数 (关键判据)
-long PERF_SPIKE_NORM_N= 0L;    // 窗口内 spike 且是普通消息 的条数 (关键判据)
-// onHandleMsgBody 把 "本条是否被当红包处理" 写进这个标记, 供 wrapper 在 finally 里按 A/B 分类计时。
-// 默认 false; body 入口处由 wrapper 清, body 内确认红包后置 true。
-boolean PERF_LAST_RP  = false;
-// (可选 §4) rpExtractTitle 耗时单独累加。v1.6.3: extract 已移到后台 worker(hbProcess), 此计时现在 worker 线程累加,
-//   不再计入 onHandleMsg 热路径 — 故热路径 rp_msg 耗时应大幅下降, rp_extract_* 仍可观测提取耗时但不再反噬热路径。
-long PERF_EXTRACT_SUM_NS = 0L; // 窗口内 rpExtractTitle 累计耗时 (ns, v1.6.3 后台 worker 侧)
-long PERF_EXTRACT_MAX_NS = 0L; // 窗口内 rpExtractTitle 最大单次耗时 (ns)
-long PERF_EXTRACT_N      = 0L; // 窗口内 rpExtractTitle 调用次数
-
 // v1.3.0 §17: 统计本地 SQLite (rp_record, 一红包一行)。库与 rp.log 同目录 (GroupAdmin 同级目录建库已验证可行)。
 String RP_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/redpacket_stats.db";
 android.database.sqlite.SQLiteDatabase RP_DB = null;   // 连接单例 (懒打开)
@@ -377,7 +327,7 @@ int HB_MSG_TYPE = 436207665;
 String[] DETAIL_TEXTS = {"看看大家的手气", "查看领取详情"};
 
 void onLoad() {
-    try { log("RedPacketStats v1.6.4 loaded."); } catch (Throwable t) {}
+    try { log("RedPacketStats v1.6.0 loaded."); } catch (Throwable t) {}
     // 旧毫秒键废弃, 清空避免残留混淆 (新键 rp_first_sec/rp_retry1_sec/rp_retry2_sec 为秒)
     try { putString("rp_delay_ms", ""); putString("rp_retry1_ms", ""); putString("rp_retry2_ms", ""); } catch (Throwable t) {}
     if (HOOKED) { try { log("RedPacketStats hook already registered, skip."); } catch (Throwable t) {} return; }
@@ -400,8 +350,8 @@ void onLoad() {
         // v1.4.0 §20: 每日定时迁移 (一次性) — 首次把 rp_daily_groups 初始化 = 当前 rp_enabled_groups。
         try { rpDailyMigrateOnce(); } catch (Throwable t) {}
         try { log("RedPacketStats Activity.onResume hooked + onHandleMsg redpacket-stats enabled."); } catch (Throwable t) {}
-        hbBgLog("[RP] " + hbNow() + " v1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
-            + "[v1.6.3] detect(廉价 type/含<nativeurl>)→enqueue raw content(dedup k:talker:sender:msgid,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB,后台):parse[skip exclusive→nativeurl→extract title 回填 job]→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
+        hbBgLog("[RP] " + hbNow() + " v1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
+            + "detect→[skip exclusive]→extract title→enqueue(dedup,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB)→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
             + "v1.3.0: 在 v1.2.0(队列+两条消息定版)之上加回统计 DB(§17, redpacket_stats.db, rp_record 一红包一行, 仅后台反射线程写, 可降级) + 导出今日红包统计→私聊(§18, Dialog 按钮, sendText 给 rp_export_target) + 标题提取(§17.3) + 嗅探调试日志(title usedField/len, stats-db opened, export sent N). DB 存真实昵称/金额/wxid(本地存储), hbBgLog 仍只记计数(脱敏). 两条消息逻辑一行未动. "
             + "v1.1.4: 发两条修正(§16) — 第一条(引用群规)=固定简洁(cfgRulePrefix+\"过{t}元{动作}\"三档, 无随机无语气); 第二条(@)=随机(pickConnector+pickActionPhrase+[AtWx=]), 隔 rp_two_msg_gap_sec 秒(默认3,可配)延迟发以保序(delay+final捕获,fire-and-forget,不进在飞锁). >at上限只发第一条无第二条无延迟. 只改 hbTierAndSend. "
             + "v1.1.2: 发提醒拆两条 — qualified>=1: rpSendQuote(talker,CUR_JOB.msgid,群规文本)引用原红包(无@,失败回退sendText); qualified 1~at_limit additionally rpSendAt(talker,@文本)真@(sendText). qualified==0不发; >at_limit只发引用群规条. 限频对整次提醒判一次. "
@@ -721,46 +671,10 @@ String joinCsv(List list) {
     return sb.toString();
 }
 String normGroupId(String g) { if (g == null) return ""; return g.trim(); }
-
-// v1.6.4: [性能/C-PERF-01,03] 启用群集合内存缓存 — 消除红包消息热路径最后一处 per-红包 FUSE 读
-//   (isGroupEnabled → getEnabledGroups → getString(K_ENABLED) ~26ms/红包候选)。仿 GroupAdmin v1.16.2 同款。
-//   RP_ENABLED_CACHE 存 normGroupId 后的群 id; TTL 60s 兜底外部 adb 改 config.prop; enable/disable 变更后立即刷新保即时生效。
-//   加载失败保留旧缓存 (降级安全); isGroupEnabled 异常时回退直接读 getString (宁可慢不可错: 这是红包在本群是否处理的总闸门)。
-//   归一口径: 与原 isGroupEnabled 完全一致 = normGroupId(=trim)。
-java.util.HashSet RP_ENABLED_CACHE = null;   // 已启用群 id 集合 (normGroupId 后); null=尚未加载
-long RP_ENABLED_CACHE_TS = 0L;               // 上次加载毫秒
-long RP_ENABLED_TTL_MS   = 60000L;           // 缓存 TTL: 外部改 config.prop 最多此时长后生效
-
-// 从 config.prop 读 K_ENABLED, 全量 norm 后原子替换 RP_ENABLED_CACHE。失败保留旧缓存只 log。
-void rpLoadEnabledCache() {
-    try {
-        List l = parseCsv(getString(K_ENABLED, ""));
-        java.util.HashSet ns = new java.util.HashSet();
-        for (int i = 0; i < l.size(); i++) {
-            String g = normGroupId((String) l.get(i));
-            if (!g.isEmpty()) ns.add(g);
-        }
-        RP_ENABLED_CACHE = ns;            // 原子替换
-        RP_ENABLED_CACHE_TS = System.currentTimeMillis();
-    } catch (Throwable t) {
-        try { log("rpLoadEnabledCache failed (keep old cache): " + t); } catch (Throwable t2) {}
-    }
-}
-
 List getEnabledGroups() { return parseCsv(getString(K_ENABLED, "")); }
 boolean isGroupEnabled(String groupId) {
     String g = normGroupId(groupId);
     if (g.isEmpty()) return false;
-    try {
-        long now = System.currentTimeMillis();
-        if (RP_ENABLED_CACHE == null || (now - RP_ENABLED_CACHE_TS) > RP_ENABLED_TTL_MS) {
-            rpLoadEnabledCache();
-        }
-        if (RP_ENABLED_CACHE != null) return RP_ENABLED_CACHE.contains(g);
-    } catch (Throwable t) {
-        try { log("isGroupEnabled cache error, fallback to direct read: " + t); } catch (Throwable t2) {}
-    }
-    // 回退: 缓存出错时直接读 (保证正确性, 与原逻辑完全一致, 不因缓存错误误判)
     List l = getEnabledGroups();
     for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) return true;
     return false;
@@ -772,7 +686,6 @@ void enableGroup(String groupId) {
     boolean already = false;
     for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) { already = true; break; }
     if (!already) { l.add(g); putString(K_ENABLED, joinCsv(l)); }
-    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 开启后下一个红包立即按新状态判定
     // v1.4.0 §20: 开启红包统计时默认把该群加进每日定时 (可单独关)。
     try { enableDailyGroup(g); } catch (Throwable t) {}
 }
@@ -782,7 +695,6 @@ void disableGroup(String groupId) {
     boolean changed = false;
     for (int i = l.size() - 1; i >= 0; i--) if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
     if (changed) putString(K_ENABLED, joinCsv(l));
-    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 关闭后下一个红包立即不再处理该群
 }
 
 // ==================== 红包提醒排除名单 (按群, v1.0.6 §12) ====================
@@ -924,8 +836,6 @@ boolean rpHandleExcludeCmd(String groupId, String content, java.util.List atList
 void onHandleMsg(Object msg) {
     long _perfStart = 0L;
     boolean _perfOn = false;
-    // v1.6.2: 每条进入前清红包标记; body 内确认本条是红包(命中检测+启用)才置 true。整段 try/catch, 埋点出错不影响消息。
-    try { PERF_LAST_RP = false; } catch (Throwable t) {}
     try { _perfStart = System.nanoTime(); _perfOn = true; } catch (Throwable t) { _perfOn = false; }
     try {
         onHandleMsgBody(msg);
@@ -936,23 +846,6 @@ void onHandleMsg(Object msg) {
                 PERF_N++;
                 PERF_SUM_NS += dur;
                 if (dur > PERF_MAX_NS) PERF_MAX_NS = dur;
-                // v1.6.2: 按 A(红包)/B(普通) 分类累加 sum/max/count, 并标记 spike (>阈值)。
-                boolean wasRp = false;
-                try { wasRp = PERF_LAST_RP; } catch (Throwable t) { wasRp = false; }
-                if (wasRp) {
-                    PERF_RP_N++;
-                    PERF_RP_SUM_NS += dur;
-                    if (dur > PERF_RP_MAX_NS) PERF_RP_MAX_NS = dur;
-                } else {
-                    PERF_NORM_N++;
-                    PERF_NORM_SUM_NS += dur;
-                    if (dur > PERF_NORM_MAX_NS) PERF_NORM_MAX_NS = dur;
-                }
-                if (dur > PERF_SPIKE_NS) {
-                    PERF_SPIKE_N++;
-                    if (wasRp) PERF_SPIKE_RP_N++;
-                    else PERF_SPIKE_NORM_N++;
-                }
                 // 兜底: 窗口异常膨胀 (worker 长时间没跑) 时才在热路径 flush 一次, 防内存计数溢出/数据失真。
                 if (PERF_N >= (long) PERF_FLUSH_EVERY * 50L) perfFlush();
             } catch (Throwable t) { /* 埋点出错绝不影响消息 */ }
@@ -1005,25 +898,36 @@ void onHandleMsgBody(Object msg) {
         // ---- (3) 本群启用闸门: 没启用直接 return (不开页/不排 delay) ----
         if (!isGroupEnabled(groupId)) return;
 
-        // v1.6.2: 至此本条已确认 = 候选红包消息且本群启用, 后续只做"廉价判定+入队"。
-        //         给 wrapper 的 finally 分类用 (A 红包消息)。仅置标记, 不做任何 IO/反射。
-        try { PERF_LAST_RP = true; } catch (Throwable t) {}
+        // ---- (4) 命中才解析 nativeurl (红包频率极低) ----
+        final String nativeurl = hbGetElement(content, "wcpayinfo", "nativeurl");
 
-        // ---- (4) v1.6.3 (C-PERF-03): 热路径只做最廉价的判定 + 入队原始数据。----
-        //   不再在热路径解析 nativeurl / exclusive_recv_username / rpExtractTitle(XML parse)。
-        //   这些重活 (原占 ~267ms 热路径 spike, 其中 extract ~50ms) 全部移到 worker(hbProcess, 已在后台线程)。
-        //   去重 key 改用廉价的 k:talker:sender:msgid (不依赖任何 XML parse, 热路径就拿得到)。
-        //   原始 content 随 Job 携带 (JOB_CONTENT), worker 出队后再 parse nativeurl/exclusive/title。
+        // ---- (4a) 仅处理拼手气红包: 专属红包(指定某人领)检测即跳过, 不开页/不排程 ----
+        // 专属红包 wcpayinfo 里 exclusive_recv_username 非空 = 指定接收人。
+        // v1.0.6 §13.4: 移除 detect-fields 调试解析(原重复 parse 5 字段), 专属判定保留(只解析 exclusive_recv_username 一个)。
+        String exclusiveRecv = null;
+        try { exclusiveRecv = hbGetElement(content, "wcpayinfo", "exclusive_recv_username"); } catch (Throwable t) { exclusiveRecv = null; }
+
+        if (exclusiveRecv != null && !exclusiveRecv.trim().isEmpty()) {
+            hbBgLog("[RP] " + hbNow() + " skip exclusive (exclusive_recv_username present). not scheduling.");
+            return;
+        }
+
+        // ---- (4b) v1.3.0 §17.3: 红包标题/祝福语 (只在红包消息上 parse, 低频; 存进 Job 供后台写 DB)。----
+        // 候选字段取首个非空: sendertitle → receivertitle → scenetext → des (不同微信版本字段可能不同, 见 SPEC 存疑)。
+        // 只在已确认是红包的消息上 parse, 普通消息热路径不调用 (perf: 保持 v1.2.0 热路径不变)。
+        String hbTitle = rpExtractTitle(content);
+        final String fTitle = (hbTitle == null) ? "" : hbTitle;
+
         String sender0 = sender; if (sender0 == null) sender0 = groupId;
         final String fSender = sender0;
         final String fTalker = groupId;
         long msgid0 = 0L;
         try { msgid0 = ((Number) msg.getMsgId()).longValue(); } catch (Throwable t) { msgid0 = 0L; }
         final long fMsgid = msgid0;
-        final String fContent = content;
 
-        // 廉价去重 key (无 XML parse): k:talker:sender:msgid。同一红包 msgid 唯一, 不重复入队。
-        final String fKey = "k:" + fTalker + ":" + fSender + ":" + fMsgid;
+        String dkey = (nativeurl != null && nativeurl.length() > 0)
+            ? nativeurl : ("k:" + fTalker + ":" + fSender + ":" + fMsgid);
+        final String fKey = dkey;
         if (!OPENED.add(fKey)) return;
 
         // v1.1.0 §15.2: 生产者只入队, 不再 per-红包 delay。
@@ -1031,11 +935,11 @@ void onHandleMsgBody(Object msg) {
         // v1.0.6 §13.1: 首次延迟 ±25% 抖动 (base*0.75 ~ base*1.25), 去零方差。long 乘防溢出。
         long delayMs = hbJitter((long) (delaySec * 1000L * 0.75), (long) (delaySec * 1000L * 0.5));
         long dueAt = System.currentTimeMillis() + delayMs;
-        // Job = { key, talker, sender, msgid, dueAt, attempt=0, title(留空, worker填), content(原始) }  (v1.6.3: +JOB_CONTENT 第 8 槽)
-        Object[] job = new Object[]{ fKey, fTalker, fSender, Long.valueOf(fMsgid), Long.valueOf(dueAt), Integer.valueOf(0), "", fContent };
+        // Job = { key, talker, sender, msgid, dueAt, attempt=0, title }  (v1.3.0 §17.3: 加 title 第 7 槽)
+        Object[] job = new Object[]{ fKey, fTalker, fSender, Long.valueOf(fMsgid), Long.valueOf(dueAt), Integer.valueOf(0), fTitle };
         rpEnqueue(job);
-        hbBgLog("[RP] " + hbNow() + " redpacket candidate in enabled group (type=" + type
-            + "). enqueued raw (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ". (extract/exclusive deferred to worker)");
+        hbBgLog("[RP] " + hbNow() + " redpacket detected in enabled group (type=" + type
+            + ", hasNativeurl=" + (nativeurl != null) + "). enqueued (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ".");
     } catch (Throwable t) {
         try { log("RedPacketStats onHandleMsg err: " + t); } catch (Throwable t2) {}
     }
@@ -1355,48 +1259,7 @@ void hbProcess(Object[] job) {
         int attempt = ((Integer) job[JOB_ATTEMPT]).intValue();
         String talker = (String) job[JOB_TALKER];
         String key = (String) job[JOB_KEY];
-        String content = (String) job[JOB_CONTENT];
-        hbBgLog("[RP] " + hbNow() + " hbProcess attempt=" + attempt + " -> (worker-side parse) opening cover " + UI_RECEIVE + ".");
-
-        // ---- v1.6.3 (C-PERF-03): 原热路径"重活"在此后台 worker 线程执行 (逻辑不变, 只换线程/时机)。----
-        //   出队后才解析: 专属判定(early-exit) → nativeurl(开页用) → title(写库用, 回填本 job)。
-        //   只在首跑(attempt==0)解析专属/title (重试时 job 已带回填的 title; 专属在首跑已被早退, 不会有重试)。
-        String nativeurl = null;
-        if (content != null) {
-            // (a) 专属红包早退: wcpayinfo.exclusive_recv_username 非空 = 指定接收人 → 跳过(不开页/不排程), 与改前行为一致。
-            //     只在首跑判 (attempt==0); 专属一旦命中即 return, 不会进入重试路径, 故重试时无需重判。
-            if (attempt == 0) {
-                String exclusiveRecv = null;
-                try { exclusiveRecv = hbGetElement(content, "wcpayinfo", "exclusive_recv_username"); } catch (Throwable t) { exclusiveRecv = null; }
-                if (exclusiveRecv != null && !exclusiveRecv.trim().isEmpty()) {
-                    hbBgLog("[RP] " + hbNow() + " skip exclusive (exclusive_recv_username present, worker-side). not opening. clear in-flight.");
-                    if (key != null) DONE.add(key);   // 专属: 标记完成, 避免再次入队
-                    SEEN.clear();
-                    rpClearInFlight();
-                    return;
-                }
-            }
-            // (b) nativeurl: 开封面页需要 (原热路径解析, 现移此)。
-            try { nativeurl = hbGetElement(content, "wcpayinfo", "nativeurl"); } catch (Throwable t) { nativeurl = null; }
-            if (nativeurl != null && nativeurl.length() == 0) nativeurl = null;
-            // (c) title: rpExtractTitle (原占 ~50ms 热路径 spike, 现在后台)。回填本 job[JOB_TITLE] 供 rpRecordStats 读。
-            //     首跑解析并回填; 重试时 job[JOB_TITLE] 已是首跑回填值, 不重复 parse。
-            if (attempt == 0) {
-                long _exStart = 0L; boolean _exOn = false;
-                try { _exStart = System.nanoTime(); _exOn = true; } catch (Throwable t) { _exOn = false; }
-                String hbTitle = null;
-                try { hbTitle = rpExtractTitle(content); } catch (Throwable t) { hbTitle = null; }
-                if (_exOn) {
-                    try {
-                        long exDur = System.nanoTime() - _exStart;
-                        PERF_EXTRACT_N++;
-                        PERF_EXTRACT_SUM_NS += exDur;
-                        if (exDur > PERF_EXTRACT_MAX_NS) PERF_EXTRACT_MAX_NS = exDur;
-                    } catch (Throwable t) {}
-                }
-                try { job[JOB_TITLE] = (hbTitle == null) ? "" : hbTitle; } catch (Throwable t) {}
-            }
-        }
+        hbBgLog("[RP] " + hbNow() + " hbProcess attempt=" + attempt + " -> opening cover " + UI_RECEIVE + ".");
 
         Object hostCtx = null;
         try { hostCtx = hostContext; } catch (Throwable t) { hostCtx = null; }
@@ -1405,6 +1268,7 @@ void hbProcess(Object[] job) {
         }
         if (hostCtx == null) { hbBgLog("[RP] " + hbNow() + " ABORT: no hostContext. clear in-flight."); rpClearInFlight(); return; }
 
+        String nativeurl = (key != null && key.startsWith("k:")) ? null : key;
         Intent intent = new Intent();
         if (nativeurl != null) intent.putExtra("key_native_url", nativeurl);
         if (talker != null) intent.putExtra("key_username", talker);
@@ -1682,7 +1546,7 @@ void afterCoverNoDetail() {
     long retryMs = hbJitter((long) (retrySec * 1000L * 0.75), (long) (retrySec * 1000L * 0.5));
     long dueAt = System.currentTimeMillis() + retryMs;
     // §15.5: job 重新入队 (新 dueAt + attempt+1); 复用 talker/sender/msgid/title。v1.3.0: 7 元组(含 title)。
-    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt), job[JOB_TITLE], job[JOB_CONTENT] };
+    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt), job[JOB_TITLE] };
     SEEN.clear(); // 清 Activity 去重, 下次重开封面是新实例
     rpClearInFlight();   // 先清在飞, 否则 rpEnqueue 会因"在飞"去重而拒绝重入
     rpEnqueue(reJob);
@@ -3058,25 +2922,8 @@ void perfFlush() {
         final long fN = n;
         final long fSum = PERF_SUM_NS;
         final long fMax = PERF_MAX_NS;
-        // v1.6.2: spike 归因字段快照。
-        final long fRpN = PERF_RP_N;
-        final long fRpSum = PERF_RP_SUM_NS;
-        final long fRpMax = PERF_RP_MAX_NS;
-        final long fNormN = PERF_NORM_N;
-        final long fNormSum = PERF_NORM_SUM_NS;
-        final long fNormMax = PERF_NORM_MAX_NS;
-        final long fSpikeN = PERF_SPIKE_N;
-        final long fSpikeRp = PERF_SPIKE_RP_N;
-        final long fSpikeNorm = PERF_SPIKE_NORM_N;
-        final long fExN = PERF_EXTRACT_N;
-        final long fExSum = PERF_EXTRACT_SUM_NS;
-        final long fExMax = PERF_EXTRACT_MAX_NS;
-        // 清零窗口 (快照后立即清, 新样本进下一窗口)。v1.6.2 新增组同步清零。
+        // 清零窗口 (快照后立即清, 新样本进下一窗口)。
         PERF_N = 0L; PERF_SUM_NS = 0L; PERF_MAX_NS = 0L;
-        PERF_RP_N = 0L; PERF_RP_SUM_NS = 0L; PERF_RP_MAX_NS = 0L;
-        PERF_NORM_N = 0L; PERF_NORM_SUM_NS = 0L; PERF_NORM_MAX_NS = 0L;
-        PERF_SPIKE_N = 0L; PERF_SPIKE_RP_N = 0L; PERF_SPIKE_NORM_N = 0L;
-        PERF_EXTRACT_N = 0L; PERF_EXTRACT_SUM_NS = 0L; PERF_EXTRACT_MAX_NS = 0L;
         new Thread() {
             public void run() {
                 try {
@@ -3084,19 +2931,8 @@ void perfFlush() {
                     long maxUs = fMax / 1000L;
                     long nowMs = System.currentTimeMillis();
                     String iso = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date(nowMs));
-                    // v1.6.2: A/B 分类均值/最大 (各自 n 为 0 时置 0, 防除零)。
-                    long rpAvgUs = (fRpN > 0L) ? ((fRpSum / fRpN) / 1000L) : 0L;
-                    long rpMaxUs = fRpMax / 1000L;
-                    long normAvgUs = (fNormN > 0L) ? ((fNormSum / fNormN) / 1000L) : 0L;
-                    long normMaxUs = fNormMax / 1000L;
-                    long exAvgUs = (fExN > 0L) ? ((fExSum / fExN) / 1000L) : 0L;
-                    long exMaxUs = fExMax / 1000L;
                     String line = "ts=" + nowMs + " iso=" + iso + " n=" + fN
-                        + " ohm_avg_us=" + avgUs + " ohm_max_us=" + maxUs
-                        + " rp_msg_n=" + fRpN + " rp_msg_avg_us=" + rpAvgUs + " rp_msg_max_us=" + rpMaxUs
-                        + " norm_avg_us=" + normAvgUs + " norm_max_us=" + normMaxUs
-                        + " spike_n=" + fSpikeN + " spike_rp=" + fSpikeRp + " spike_norm=" + fSpikeNorm
-                        + " rp_extract_n=" + fExN + " rp_extract_avg_us=" + exAvgUs + " rp_extract_max_us=" + exMaxUs + "\n";
+                        + " ohm_avg_us=" + avgUs + " ohm_max_us=" + maxUs + "\n";
                     java.io.FileWriter fw = new java.io.FileWriter(PERF_LOG, true);  // append
                     try { fw.write(line); } finally { fw.close(); }
                 } catch (Throwable t) {

@@ -1,13 +1,4 @@
-// RedPacketStats — v1.6.4 — 在 v1.6.3 之上: enabled 群内存缓存(消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms)。
-//
-// v1.6.4: [性能/C-PERF-01,03] 启用群集合内存缓存 (仿 GroupAdmin v1.16.2)。消除红包消息热路径最后一处 per-红包 FUSE 读:
-//         onHandleMsgBody 的 isGroupEnabled → getEnabledGroups → getString(K_ENABLED) 原每个红包候选读一次 config.prop (~26ms)。
-//         新增顶层 RP_ENABLED_CACHE(HashSet,normGroupId 后)/RP_ENABLED_CACHE_TS/RP_ENABLED_TTL_MS(60s)。rpLoadEnabledCache() 全量 norm 后原子替换。
-//         isGroupEnabled: 缓存 null 或超 TTL → rpLoadEnabledCache(), 然后 contains; 整段 try/catch, 异常回退原"直接 getString 遍历"(宁可慢不可错)。
-//         enableGroup/disableGroup putString 后立即 rpLoadEnabledCache() — 开启/关闭红包统计下一个红包即时生效, 不等 TTL。
-//         归一口径与原 isGroupEnabled 完全一致(normGroupId=trim)。加载失败保留旧缓存只 log。只动 isGroupEnabled 读路径+缓存维护,
-//         不碰检测/入队/worker/分档/发送/统计/定时/导出; spike 归因埋点保留(验证红包热路径耗时进一步降)。
-//         其它只读 getEnabledGroups() 调用(每日迁移/daily groups, 非热路径)保持原 getString(不影响正确性)。
+// RedPacketStats — v1.6.3 — 在 v1.6.2 之上: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker(消除红包消息~267ms热路径spike)。
 //
 // v1.6.2: spike 归因埋点 (诊断用, 仿 v1.4.0 PERF_* 风格, 绝不反噬热路径)。
 //         目的: 区分 "每 ~200 条出现 1 次 200-370ms onHandleMsg max spike" 是 (A)真红包那条在热路径做重活,
@@ -377,7 +368,7 @@ int HB_MSG_TYPE = 436207665;
 String[] DETAIL_TEXTS = {"看看大家的手气", "查看领取详情"};
 
 void onLoad() {
-    try { log("RedPacketStats v1.6.4 loaded."); } catch (Throwable t) {}
+    try { log("RedPacketStats v1.6.2 loaded."); } catch (Throwable t) {}
     // 旧毫秒键废弃, 清空避免残留混淆 (新键 rp_first_sec/rp_retry1_sec/rp_retry2_sec 为秒)
     try { putString("rp_delay_ms", ""); putString("rp_retry1_ms", ""); putString("rp_retry2_ms", ""); } catch (Throwable t) {}
     if (HOOKED) { try { log("RedPacketStats hook already registered, skip."); } catch (Throwable t) {} return; }
@@ -400,7 +391,7 @@ void onLoad() {
         // v1.4.0 §20: 每日定时迁移 (一次性) — 首次把 rp_daily_groups 初始化 = 当前 rp_enabled_groups。
         try { rpDailyMigrateOnce(); } catch (Throwable t) {}
         try { log("RedPacketStats Activity.onResume hooked + onHandleMsg redpacket-stats enabled."); } catch (Throwable t) {}
-        hbBgLog("[RP] " + hbNow() + " v1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
+        hbBgLog("[RP] " + hbNow() + " v1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
             + "[v1.6.3] detect(廉价 type/含<nativeurl>)→enqueue raw content(dedup k:talker:sender:msgid,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB,后台):parse[skip exclusive→nativeurl→extract title 回填 job]→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
             + "v1.3.0: 在 v1.2.0(队列+两条消息定版)之上加回统计 DB(§17, redpacket_stats.db, rp_record 一红包一行, 仅后台反射线程写, 可降级) + 导出今日红包统计→私聊(§18, Dialog 按钮, sendText 给 rp_export_target) + 标题提取(§17.3) + 嗅探调试日志(title usedField/len, stats-db opened, export sent N). DB 存真实昵称/金额/wxid(本地存储), hbBgLog 仍只记计数(脱敏). 两条消息逻辑一行未动. "
             + "v1.1.4: 发两条修正(§16) — 第一条(引用群规)=固定简洁(cfgRulePrefix+\"过{t}元{动作}\"三档, 无随机无语气); 第二条(@)=随机(pickConnector+pickActionPhrase+[AtWx=]), 隔 rp_two_msg_gap_sec 秒(默认3,可配)延迟发以保序(delay+final捕获,fire-and-forget,不进在飞锁). >at上限只发第一条无第二条无延迟. 只改 hbTierAndSend. "
@@ -721,46 +712,10 @@ String joinCsv(List list) {
     return sb.toString();
 }
 String normGroupId(String g) { if (g == null) return ""; return g.trim(); }
-
-// v1.6.4: [性能/C-PERF-01,03] 启用群集合内存缓存 — 消除红包消息热路径最后一处 per-红包 FUSE 读
-//   (isGroupEnabled → getEnabledGroups → getString(K_ENABLED) ~26ms/红包候选)。仿 GroupAdmin v1.16.2 同款。
-//   RP_ENABLED_CACHE 存 normGroupId 后的群 id; TTL 60s 兜底外部 adb 改 config.prop; enable/disable 变更后立即刷新保即时生效。
-//   加载失败保留旧缓存 (降级安全); isGroupEnabled 异常时回退直接读 getString (宁可慢不可错: 这是红包在本群是否处理的总闸门)。
-//   归一口径: 与原 isGroupEnabled 完全一致 = normGroupId(=trim)。
-java.util.HashSet RP_ENABLED_CACHE = null;   // 已启用群 id 集合 (normGroupId 后); null=尚未加载
-long RP_ENABLED_CACHE_TS = 0L;               // 上次加载毫秒
-long RP_ENABLED_TTL_MS   = 60000L;           // 缓存 TTL: 外部改 config.prop 最多此时长后生效
-
-// 从 config.prop 读 K_ENABLED, 全量 norm 后原子替换 RP_ENABLED_CACHE。失败保留旧缓存只 log。
-void rpLoadEnabledCache() {
-    try {
-        List l = parseCsv(getString(K_ENABLED, ""));
-        java.util.HashSet ns = new java.util.HashSet();
-        for (int i = 0; i < l.size(); i++) {
-            String g = normGroupId((String) l.get(i));
-            if (!g.isEmpty()) ns.add(g);
-        }
-        RP_ENABLED_CACHE = ns;            // 原子替换
-        RP_ENABLED_CACHE_TS = System.currentTimeMillis();
-    } catch (Throwable t) {
-        try { log("rpLoadEnabledCache failed (keep old cache): " + t); } catch (Throwable t2) {}
-    }
-}
-
 List getEnabledGroups() { return parseCsv(getString(K_ENABLED, "")); }
 boolean isGroupEnabled(String groupId) {
     String g = normGroupId(groupId);
     if (g.isEmpty()) return false;
-    try {
-        long now = System.currentTimeMillis();
-        if (RP_ENABLED_CACHE == null || (now - RP_ENABLED_CACHE_TS) > RP_ENABLED_TTL_MS) {
-            rpLoadEnabledCache();
-        }
-        if (RP_ENABLED_CACHE != null) return RP_ENABLED_CACHE.contains(g);
-    } catch (Throwable t) {
-        try { log("isGroupEnabled cache error, fallback to direct read: " + t); } catch (Throwable t2) {}
-    }
-    // 回退: 缓存出错时直接读 (保证正确性, 与原逻辑完全一致, 不因缓存错误误判)
     List l = getEnabledGroups();
     for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) return true;
     return false;
@@ -772,7 +727,6 @@ void enableGroup(String groupId) {
     boolean already = false;
     for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) { already = true; break; }
     if (!already) { l.add(g); putString(K_ENABLED, joinCsv(l)); }
-    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 开启后下一个红包立即按新状态判定
     // v1.4.0 §20: 开启红包统计时默认把该群加进每日定时 (可单独关)。
     try { enableDailyGroup(g); } catch (Throwable t) {}
 }
@@ -782,7 +736,6 @@ void disableGroup(String groupId) {
     boolean changed = false;
     for (int i = l.size() - 1; i >= 0; i--) if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
     if (changed) putString(K_ENABLED, joinCsv(l));
-    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 关闭后下一个红包立即不再处理该群
 }
 
 // ==================== 红包提醒排除名单 (按群, v1.0.6 §12) ====================
