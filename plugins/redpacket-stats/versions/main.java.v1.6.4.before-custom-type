@@ -1,24 +1,4 @@
-// RedPacketStats — v1.7.2 — 在 v1.7.1 之上: 定制包第二条 @消息【查包】前缀加「定制包」→【查包】定制包 (SPEC §22.6)。
-// RedPacketStats — v1.7.1 — 在 v1.7.0 之上: 定制包判定包含匹配修正 + 定制包第一条群规文本 (SPEC §22.2/§22.6)。
-//
-// v1.7.1: [修复/SPEC §22.2,§22.6] 两处 (其余 v1.7.0 逻辑一行未动: 限频/排除/分档/两条消息骨架/抖动/ANR/onHandleMsg 热路径)。
-//         1. 定制判定 前缀→包含 (§22.2): rpIsCustom 把 title.trim().startsWith(kw) 改为 title.contains(kw) (kw 先 trim, 空串仍按未启用→false→普通)。
-//            真实定制包祝福语形如「【定制】…」, 关键字「定制」被【】包裹不在串首, 前缀匹配漏判 → 包含匹配命中。整段 try/catch 不变, 异常回退 false。
-//            worker pkg-type: 诊断日志保留(脱敏 kwLen/titleLen, 不打原文)。
-//         2. 定制包第一条群规文本 (§22.6): 新增 per-group 键 rp_custom_rule_prefix_<gid>(默认「定制包请按要求执行」)+helper cfgCustomRulePrefix(groupId)。
-//            hbTierAndSend 第一条群规前缀 = isCustom ? cfgCustomRulePrefix(talker) : cfgRulePrefix(); 各档仍「，过{阈值}元{动作}」(档表已是 getTiersByType 定制档)。
-//            第二条(@条/【查包】/逐档@)机制一行不动, 仅档表/文案来自定制档表。
-//            录入: 命令 定制群规前缀 <文字>(当前群, 仿 红包群规前缀) + Dialog 定制区块「定制群规前缀」EditText + 红包统计状态增显。
-//
-// v1.7.0: [功能/SPEC §22] 给红包加「包类型」维度 — 普通包(默认) / 定制包(祝福语命中定制关键字, v1.7.1 改包含匹配)。默认全关 → 没开定制的群与今天逐字节一致。
-//         · 配置(per-group): rp_custom_on_<gid>(开关,仅 Dialog 可改)/rp_custom_kw_<gid>(关键字,前缀匹配)/rp_tiers_custom_<gid>(定制档表,格式同 rp_tiers_)。
-//         · 类型判定: 全在后台 worker(hbProcess, title 本就在此提取) — rpIsCustom(talker,title): custom_on 关→普通; 否则 kw 非空且 title 包含 kw(v1.7.1 由前缀改包含)→定制; 否则普通。
-//           判定结果回填 Job 第 9 槽 JOB_ISCUSTOM, hbDetailExtract 取出透传给 hbTierAndSend。【onHandleMsg/onHandleMsgBody 热路径一行不加 — 只在入队 Job 塞常量 Boolean.FALSE(C-PERF-01/03, VH-01 教训)】。
-//         · 选档: hbTierAndSend 加 isCustom 参, getTiers(talker)→getTiersByType(talker,isCustom)(定制读 rp_tiers_custom, 未配回退普通)。限频/排除/分档/两条消息(引用群规+@)/ANR/抖动 一行不动, 仅档表来源切换。
-//         · 命令(onClickSendBtn, 当前群, 复用普通解析器 isCustom=true): 定制阈值/定制文案K/定制增加档/定制减少档(操作 rp_tiers_custom) + 定制关键字 <kw>(写 rp_custom_kw)。错误/格式文案仿普通。
-//         · Dialog(红包统计设置): 加「定制」区块 — ☑是否开启定制(仅此处改 rp_custom_on)+定制关键字 EditText+定制档表多行 EditText(复用 rpParseTierBox 逐行校验, 全无效不保存)。
-//         · 状态(红包统计状态): 增显 定制开关/定制关键字/定制档表(rpTiersSummary)。
-//         · 兼容: 默认全关→完全向后兼容; 改动落在 worker+发送+命令+Dialog, 全程 try/catch; 旧档表 helper 抽 parseTiersFromKey/setTiersToKey 共用普通/定制, 普通 call site 行为不变。
+// RedPacketStats — v1.6.4 — 在 v1.6.3 之上: enabled 群内存缓存(消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms)。
 //
 // v1.6.4: [性能/C-PERF-01,03] 启用群集合内存缓存 (仿 GroupAdmin v1.16.2)。消除红包消息热路径最后一处 per-红包 FUSE 读:
 //         onHandleMsgBody 的 isGroupEnabled → getEnabledGroups → getString(K_ENABLED) 原每个红包候选读一次 config.prop (~26ms)。
@@ -250,13 +230,6 @@ String K_TXT1 = "rp_txt1"; String K_TXT2 = "rp_txt2"; String K_TXT3 = "rp_txt3";
 //         未配置该键的群回退全局 cfgT1/2/3 + cfgTxt1/2/3 (三档), 保证旧行为不变。
 String K_TIERS_PREFIX = "rp_tiers_";
 int RP_MAX_TIERS = 10;
-// v1.7.0 §22: 包类型 普通包/定制包。per-group 三个键 (默认全关 → 与今天逐字节一致)。
-//   rp_custom_on_<gid>   定制开关 (bool, 仅 Dialog 可改); 关 → 所有红包按普通包。
-//   rp_custom_kw_<gid>   定制关键字 (String, 包含匹配 title, v1.7.1); 空串视为未启用 → 回退普通。
-//   rp_tiers_custom_<gid> 定制档表 (格式同 rp_tiers_<gid>); 未配置 → 回退普通档表 getTiers。
-String K_CUSTOM_ON_PREFIX = "rp_custom_on_";
-String K_CUSTOM_KW_PREFIX = "rp_custom_kw_";
-String K_TIERS_CUSTOM_PREFIX = "rp_tiers_custom_";
 String K_DELAY = "rp_first_sec"; String K_RETRY1 = "rp_retry1_sec"; String K_RETRY2 = "rp_retry2_sec";
 String K_AT_LIMIT = "rp_at_limit";
 String K_MSG_GAP = "rp_msg_min_gap_sec";          // 同群两条红包提醒最小间隔(秒, v1.0.6 §13.3)
@@ -280,9 +253,6 @@ String DEF_TXT3 = "发视频";
 // 通用群规消息前缀(>at上限时发, 无@), 单值原样使用。
 String K_RULE_PREFIX = "rp_rule_prefix";
 String DEF_RULE_PREFIX = "领红包请遵守群规执行";
-// v1.7.1 §22.6: 定制包第一条群规文本前缀 (per-group, rp_custom_rule_prefix_<gid>)。可经命令/Dialog 改, 空回退默认。
-String K_CUSTOM_RULE_PREFIX_PREFIX = "rp_custom_rule_prefix_";
-String DEF_CUSTOM_RULE_PREFIX = "定制包请按要求执行";
 // v1.0.7 §14: 只在"金额连接词"和"动作语气包裹"上随机, 去机器指纹。动作核心词/前缀/档位均不动(用户原样录入)。
 // 内置默认连接词变体 (带 {X} 占位, X=该档阈值)。
 String[] DEF_CONNECTORS = new String[] { "超过{X}元，", "过{X}元，", "过{X}，", "{X}元以上，", "领超{X}元，" };
@@ -340,9 +310,7 @@ java.util.Map COVER_ACT = java.util.Collections.synchronizedMap(new java.util.Ha
 // v1.6.3: 去重 key 改用廉价 k:talker:sender:msgid (不再依赖 nativeurl XML parse); 加 JOB_CONTENT 第 8 槽携原始 content,
 //         worker(hbProcess) 出队后才做 nativeurl/exclusive/title 的 XML 解析 (重活移出热路径, C-PERF-03)。
 //         入队时 JOB_TITLE 留空, 由 worker rpExtractTitle 后写回本 job 数组 (CUR_JOB), 供 rpRecordStats 读。
-// v1.7.0 §22: 加 JOB_ISCUSTOM 第 9 槽 (Boolean), worker(hbProcess) 判定包类型后回填本 job, hbDetailExtract 取用透传给 hbTierAndSend。
-//   入队时留 Boolean.FALSE; worker 拿到 title 后 rpIsCustom 算出真值并回填。绝不在热路径算 (C-PERF-01/03)。
-int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5; int JOB_TITLE = 6; int JOB_CONTENT = 7; int JOB_ISCUSTOM = 8;
+int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5; int JOB_TITLE = 6; int JOB_CONTENT = 7;
 // 待处理 Job 队列 (生产者 onHandleMsg 入队; 单工作者出队)。所有读写持 RP_QUEUE 自身锁 (synchronized(RP_QUEUE))。
 java.util.List RP_QUEUE = new java.util.ArrayList();
 int RP_QUEUE_MAX = 50;           // 队列上限: 满则丢最旧一条 + log
@@ -409,7 +377,7 @@ int HB_MSG_TYPE = 436207665;
 String[] DETAIL_TEXTS = {"看看大家的手气", "查看领取详情"};
 
 void onLoad() {
-    try { log("RedPacketStats v1.7.2 loaded."); } catch (Throwable t) {}
+    try { log("RedPacketStats v1.6.4 loaded."); } catch (Throwable t) {}
     // 旧毫秒键废弃, 清空避免残留混淆 (新键 rp_first_sec/rp_retry1_sec/rp_retry2_sec 为秒)
     try { putString("rp_delay_ms", ""); putString("rp_retry1_ms", ""); putString("rp_retry2_ms", ""); } catch (Throwable t) {}
     if (HOOKED) { try { log("RedPacketStats hook already registered, skip."); } catch (Throwable t) {} return; }
@@ -432,7 +400,7 @@ void onLoad() {
         // v1.4.0 §20: 每日定时迁移 (一次性) — 首次把 rp_daily_groups 初始化 = 当前 rp_enabled_groups。
         try { rpDailyMigrateOnce(); } catch (Throwable t) {}
         try { log("RedPacketStats Activity.onResume hooked + onHandleMsg redpacket-stats enabled."); } catch (Throwable t) {}
-        hbBgLog("[RP] " + hbNow() + " v1.7.2 loaded (定制包第二条@消息【查包】前缀加「定制包」→【查包】定制包, §22.6, isCustom?checkPrefix; 其余不动).\nv1.7.1 loaded (定制判定 前缀→包含 §22.2: rpIsCustom title.contains(kw)(原 startsWith), 修「【定制】…」被【】包裹漏判; 定制包第一条群规文本 §22.6: rp_custom_rule_prefix_<gid>(默认「定制包请按要求执行」)+cfgCustomRulePrefix, hbTierAndSend 第一条前缀 isCustom?定制:普通, 各档仍「，过{阈值}元{动作}」(定制档表); 第二条@/【查包】机制一行不动; 命令 定制群规前缀 <文字>+Dialog 定制区块「定制群规前缀」+状态增显; 限频/排除/分档/两条消息骨架/抖动/ANR/onHandleMsg 热路径全不动).\nv1.7.0 loaded (包类型 普通/定制 SPEC §22: rp_custom_on/kw/tiers_custom per-group, 默认全关=逐字节兼容; 类型判定全在 worker(hbProcess)rpIsCustom(title包含kw), 回填 Job 第9槽 JOB_ISCUSTOM→hbDetailExtract→hbTierAndSend; onHandleMsg 热路径零改动(只塞常量 Boolean.FALSE); 选档 getTiersByType(定制读 rp_tiers_custom 未配回退普通), 限频/排除/分档/两条消息/ANR 全不动; 命令 定制阈值/定制文案K/定制增加档/定制减少档/定制关键字; Dialog 定制区块(开关仅此处改)+状态增显).\nv1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
+        hbBgLog("[RP] " + hbNow() + " v1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
             + "[v1.6.3] detect(廉价 type/含<nativeurl>)→enqueue raw content(dedup k:talker:sender:msgid,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB,后台):parse[skip exclusive→nativeurl→extract title 回填 job]→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
             + "v1.3.0: 在 v1.2.0(队列+两条消息定版)之上加回统计 DB(§17, redpacket_stats.db, rp_record 一红包一行, 仅后台反射线程写, 可降级) + 导出今日红包统计→私聊(§18, Dialog 按钮, sendText 给 rp_export_target) + 标题提取(§17.3) + 嗅探调试日志(title usedField/len, stats-db opened, export sent N). DB 存真实昵称/金额/wxid(本地存储), hbBgLog 仍只记计数(脱敏). 两条消息逻辑一行未动. "
             + "v1.1.4: 发两条修正(§16) — 第一条(引用群规)=固定简洁(cfgRulePrefix+\"过{t}元{动作}\"三档, 无随机无语气); 第二条(@)=随机(pickConnector+pickActionPhrase+[AtWx=]), 隔 rp_two_msg_gap_sec 秒(默认3,可配)延迟发以保序(delay+final捕获,fire-and-forget,不进在飞锁). >at上限只发第一条无第二条无延迟. 只改 hbTierAndSend. "
@@ -462,8 +430,6 @@ String cfgTxt3() { return cfgStr(K_TXT3, DEF_TXT3); }
 // 元素类型 Object[]{Integer 阈值(元), String 动作}。BeanShell 无泛型, 用 ArrayList + 强转。
 // 整段 try/catch 可降级: 解析失败/键不存在 → 回退全局三档 (cfgT1/2/3 + cfgTxt1/2/3)。
 String tiersKey(String groupId) { return K_TIERS_PREFIX + normGroupId(groupId); }
-// v1.7.0 §22: 定制档表键 rp_tiers_custom_<gid>。
-String tiersCustomKey(String groupId) { return K_TIERS_CUSTOM_PREFIX + normGroupId(groupId); }
 
 // 动作里的 | ; 会污染序列化分隔符 → 与 qualifiers 同款替换 (| → /, ; → ,)。
 String sanitizeTierAction(String a) {
@@ -474,24 +440,9 @@ String sanitizeTierAction(String a) {
 // 取某群档表 (升序, 长度 1-4)。键存在且解析出 >=1 档 → 用它; 否则回退全局三档。
 // 返回 List<Object[]{Integer,String}>。绝不返回空/null (兜底全局三档)。
 List getTiers(String groupId) {
-    List out = parseTiersFromKey(tiersKey(groupId));
-    if (out != null && out.size() >= 1) { sortTiers(out); return out; }
-    // 回退: 全局三档 (旧行为)。
-    out = new java.util.ArrayList();
-    out.add(new Object[]{ Integer.valueOf(cfgT1()), cfgTxt1() });
-    out.add(new Object[]{ Integer.valueOf(cfgT2()), cfgTxt2() });
-    out.add(new Object[]{ Integer.valueOf(cfgT3()), cfgTxt3() });
-    sortTiers(out);
-    return out;
-}
-
-// v1.7.0 §22: 解析某存储键的档表 (升序去重, 长度 1-RP_MAX_TIERS)。
-//   键不存在/为空/全无效 → 返回空 List (由调用方决定回退源: 普通回退全局三档, 定制回退普通档表)。
-//   解析逻辑与 v1.6.0 原 getTiers 内联段完全一致, 仅抽成 helper 供普通/定制共用。整段 try/catch 可降级。
-List parseTiersFromKey(String key) {
     List out = new java.util.ArrayList();
     try {
-        String raw = getString(key, "");
+        String raw = getString(tiersKey(groupId), "");
         if (raw != null && !raw.trim().isEmpty()) {
             String[] segs = raw.split(";");
             for (int i = 0; i < segs.length; i++) {
@@ -515,72 +466,14 @@ List parseTiersFromKey(String key) {
             }
         }
     } catch (Throwable t) { out = new java.util.ArrayList(); }
+    if (out.size() >= 1) { sortTiers(out); return out; }
+    // 回退: 全局三档 (旧行为)。
+    out = new java.util.ArrayList();
+    out.add(new Object[]{ Integer.valueOf(cfgT1()), cfgTxt1() });
+    out.add(new Object[]{ Integer.valueOf(cfgT2()), cfgTxt2() });
+    out.add(new Object[]{ Integer.valueOf(cfgT3()), cfgTxt3() });
+    sortTiers(out);
     return out;
-}
-
-// v1.7.0 §22.3: 按包类型取档表。isCustom=true → 读 rp_tiers_custom_<gid> (未配/全无效 → 回退普通档表 getTiers);
-//   isCustom=false → getTiers(普通, 未配回退全局三档)。绝不返回空/null。仅 worker/统计/UI 线程调, 不碰热路径。
-List getTiersByType(String groupId, boolean isCustom) {
-    try {
-        if (isCustom) {
-            List out = parseTiersFromKey(tiersCustomKey(groupId));
-            if (out != null && out.size() >= 1) { sortTiers(out); return out; }
-        }
-    } catch (Throwable t) {}
-    return getTiers(groupId);   // 普通 / 定制未配 → 回退普通档表
-}
-
-// v1.7.0 §22.1: 定制开关读写 (per-group, 仅 Dialog 改)。
-String customOnKey(String groupId) { return K_CUSTOM_ON_PREFIX + normGroupId(groupId); }
-boolean isCustomOn(String groupId) {
-    try {
-        String g = normGroupId(groupId);
-        if (g.isEmpty()) return false;
-        String s = getString(customOnKey(g), "");
-        return s != null && s.trim().equals("1");
-    } catch (Throwable t) { return false; }
-}
-void setCustomOn(String groupId, boolean on) {
-    try {
-        String g = normGroupId(groupId);
-        if (g.isEmpty()) return;
-        putString(customOnKey(g), on ? "1" : "");
-    } catch (Throwable t) {}
-}
-
-// v1.7.0 §22.1: 定制关键字读写 (per-group; 包含匹配 title 用, v1.7.1; 空串=未启用)。
-String customKwKey(String groupId) { return K_CUSTOM_KW_PREFIX + normGroupId(groupId); }
-String getCustomKw(String groupId) {
-    try {
-        String g = normGroupId(groupId);
-        if (g.isEmpty()) return "";
-        String s = getString(customKwKey(g), "");
-        return (s == null) ? "" : s;
-    } catch (Throwable t) { return ""; }
-}
-void setCustomKw(String groupId, String kw) {
-    try {
-        String g = normGroupId(groupId);
-        if (g.isEmpty()) return;
-        putString(customKwKey(g), (kw == null) ? "" : kw.trim());
-    } catch (Throwable t) {}
-}
-
-// v1.7.0 §22.2 (v1.7.1 修正): 包类型判定 (worker 内, 零热路径)。
-//   该群定制开关关 → 普通(false); 否则取 kw, kw 非空且 title 包含 kw → 定制(true); 否则普通(false)。
-//   v1.7.1: 由前缀匹配(title.startsWith)改为包含匹配(title.contains) — 真实定制包祝福语形如「【定制】…」,
-//           关键字「定制」被【】包裹不在串首, 前缀匹配会漏判, 用包含匹配命中 (SPEC §22.2)。
-//   整段 try/catch, 任何异常退回普通(false), 与定制全关行为一致 (安全降级)。
-boolean rpIsCustom(String groupId, String title) {
-    try {
-        if (!isCustomOn(groupId)) return false;
-        String kw = getCustomKw(groupId);
-        if (kw == null) return false;
-        kw = kw.trim();
-        if (kw.isEmpty()) return false;
-        String t = (title == null) ? "" : title;
-        return t.contains(kw);
-    } catch (Throwable t) { return false; }
 }
 
 // 按阈值升序排序 (简单插入排序; 最多 RP_MAX_TIERS 元素)。
@@ -600,12 +493,9 @@ void sortTiers(List tiers) {
 }
 
 // 落盘某群档表 (升序去重序列化)。空列表 → 删键 (回退全局)。
-void setTiers(String groupId, List tiers) { setTiersToKey(tiersKey(groupId), tiers); }
-
-// v1.7.0 §22: 落盘到指定键 (普通 rp_tiers_<gid> / 定制 rp_tiers_custom_<gid> 共用)。逻辑同 v1.6.0 原 setTiers。
-void setTiersToKey(String key, List tiers) {
+void setTiers(String groupId, List tiers) {
     try {
-        if (tiers == null || tiers.isEmpty()) { putString(key, ""); return; }
+        if (tiers == null || tiers.isEmpty()) { putString(tiersKey(groupId), ""); return; }
         sortTiers(tiers);
         StringBuilder sb = new StringBuilder();
         int n = 0;
@@ -619,7 +509,7 @@ void setTiersToKey(String key, List tiers) {
             n++;
             if (n >= RP_MAX_TIERS) break;
         }
-        putString(key, sb.toString());
+        putString(tiersKey(groupId), sb.toString());
     } catch (Throwable t) {}
 }
 
@@ -647,25 +537,21 @@ String rpTiersSummary(List tiers) {
 }
 
 // 红包阈值 a [b ...]: 设当前群 1-RP_MAX_TIERS 个递增阈值。保留原各档动作 (按档次对位), 新增档动作留空提示。
-String rpSetThresholdsCmd(String groupId, String rest) { return rpSetThresholdsCmd(groupId, rest, false); }
-// v1.7.0 §22.4: isCustom=true → 操作 rp_tiers_custom_<gid> (读回退普通档表, 写定制键); 文案前缀按类型切换。逻辑与普通逐行一致。
-String rpSetThresholdsCmd(String groupId, String rest, boolean isCustom) {
-    String cmdName = isCustom ? "定制阈值" : "红包阈值";
-    String actCmd = isCustom ? "定制文案" : "红包文案";
+String rpSetThresholdsCmd(String groupId, String rest) {
     if (rest == null) rest = "";
     String trimmed = rest.trim();
-    if (trimmed.isEmpty()) return "❌ 格式: " + cmdName + " 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
+    if (trimmed.isEmpty()) return "❌ 格式: 红包阈值 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
     String[] parts = trimmed.split("\\s+");
     List nums = new java.util.ArrayList();
     for (int i = 0; i < parts.length; i++) {
         String p = parts[i].trim();
         if (p.isEmpty()) continue;
         int v;
-        try { v = Integer.parseInt(p); } catch (Throwable t) { return "❌ 阈值需整数: " + cmdName + " 5 10 20"; }
+        try { v = Integer.parseInt(p); } catch (Throwable t) { return "❌ 阈值需整数: 红包阈值 5 10 20"; }
         if (v <= 0) return "❌ 阈值需正整数";
         nums.add(Integer.valueOf(v));
     }
-    if (nums.isEmpty()) return "❌ 格式: " + cmdName + " 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
+    if (nums.isEmpty()) return "❌ 格式: 红包阈值 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
     if (nums.size() > RP_MAX_TIERS) return "❌ 最多 " + RP_MAX_TIERS + " 档";
     // 升序排序 + 拒绝重复/相等
     for (int i = 0; i < nums.size(); i++) {
@@ -679,8 +565,8 @@ String rpSetThresholdsCmd(String groupId, String rest, boolean isCustom) {
         while (k >= 0 && ((Integer) nums.get(k)).intValue() > cv) { nums.set(k + 1, nums.get(k)); k--; }
         nums.set(k + 1, cur);
     }
-    // 旧档表 (按档次对位保留动作)。定制: 读 getTiersByType(true) (未配回退普通档表), 写定制键。
-    List old = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    // 旧档表 (按档次对位保留动作)
+    List old = getTiers(groupId);
     List out = new java.util.ArrayList();
     int missingFrom = -1;
     for (int i = 0; i < nums.size(); i++) {
@@ -692,87 +578,48 @@ String rpSetThresholdsCmd(String groupId, String rest, boolean isCustom) {
         if (act.isEmpty() && missingFrom < 0) missingFrom = i + 1;   // 1-based
         out.add(new Object[]{ Integer.valueOf(thr), act.isEmpty() ? "未设" : act });
     }
-    if (isCustom) setTiersToKey(tiersCustomKey(groupId), out); else setTiers(groupId, out);
-    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
-    String msg = "✅ 本群" + (isCustom ? "定制" : "") + "已设 " + saved.size() + " 档: " + rpTiersSummary(saved);
-    if (missingFrom > 0) msg += "\n⚠️ 档" + missingFrom + "起动作未设, 请发 " + actCmd + missingFrom + " <动作> 设置";
+    setTiers(groupId, out);
+    List saved = getTiers(groupId);
+    String msg = "✅ 本群已设 " + saved.size() + " 档: " + rpTiersSummary(saved);
+    if (missingFrom > 0) msg += "\n⚠️ 档" + missingFrom + "起动作未设, 请发 红包文案" + missingFrom + " <动作> 设置";
     return msg;
 }
 
 // 红包文案K 文字: 设当前群第 K 档动作。
-String rpSetTierActionCmd(String groupId, int k, String v) { return rpSetTierActionCmd(groupId, k, v, false); }
-// v1.7.0 §22.4: isCustom=true → 操作定制档表 (读 getTiersByType(true), 写定制键)。
-String rpSetTierActionCmd(String groupId, int k, String v, boolean isCustom) {
-    String txtCmd = isCustom ? "定制文案" : "红包文案";
-    String addCmd = isCustom ? "定制增加档" : "红包增加档";
-    if (v == null || v.trim().isEmpty()) return "❌ 格式: " + txtCmd + k + " 爆照";
-    List tiers = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
-    if (k < 1 || k > tiers.size()) return "❌ 当前仅 " + tiers.size() + " 档, 请先发 " + addCmd + " <阈值> <动作> 增加档";
+String rpSetTierActionCmd(String groupId, int k, String v) {
+    if (v == null || v.trim().isEmpty()) return "❌ 格式: 红包文案" + k + " 爆照";
+    List tiers = getTiers(groupId);
+    if (k < 1 || k > tiers.size()) return "❌ 当前仅 " + tiers.size() + " 档, 请先发 红包增加档 <阈值> <动作> 增加档";
     String act = sanitizeTierAction(v);
     if (act.isEmpty()) return "❌ 动作不能为空";
     Object[] e = (Object[]) tiers.get(k - 1);
     e[1] = act;
-    if (isCustom) setTiersToKey(tiersCustomKey(groupId), tiers); else setTiers(groupId, tiers);
-    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
-    return "✅ " + (isCustom ? "定制" : "") + "档" + k + "动作(原样,措辞随机): " + act + "\n当前: " + rpTiersSummary(saved);
+    setTiers(groupId, tiers);
+    List saved = getTiers(groupId);
+    return "✅ 档" + k + "动作(原样,措辞随机): " + act + "\n当前: " + rpTiersSummary(saved);
 }
 
 // 红包增加档 <阈值> <动作>: 当前群追加一档。
-String rpAddTierCmd(String groupId, String rest) { return rpAddTierCmd(groupId, rest, false); }
-// v1.7.0 §22.4: isCustom=true → 追加到定制档表 (读 getTiersByType(true), 写定制键)。
-String rpAddTierCmd(String groupId, String rest, boolean isCustom) {
-    String addCmd = isCustom ? "定制增加档" : "红包增加档";
+String rpAddTierCmd(String groupId, String rest) {
     if (rest == null) rest = "";
     rest = rest.trim();
     int sp = rest.indexOf(' ');
-    if (sp < 0) return "❌ 格式: " + addCmd + " 30 发红包";
+    if (sp < 0) return "❌ 格式: 红包增加档 30 发红包";
     String tStr = rest.substring(0, sp).trim();
     String act = sanitizeTierAction(rest.substring(sp + 1));
     int thr;
-    try { thr = Integer.parseInt(tStr); } catch (Throwable t) { return "❌ 阈值需整数: " + addCmd + " 30 发红包"; }
+    try { thr = Integer.parseInt(tStr); } catch (Throwable t) { return "❌ 阈值需整数: 红包增加档 30 发红包"; }
     if (thr <= 0) return "❌ 阈值需正整数";
-    if (act.isEmpty()) return "❌ 格式: " + addCmd + " 30 发红包";
-    List tiers = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    if (act.isEmpty()) return "❌ 格式: 红包增加档 30 发红包";
+    List tiers = getTiers(groupId);
     if (tiers.size() >= RP_MAX_TIERS) return "❌ 最多 " + RP_MAX_TIERS + " 档";
     for (int i = 0; i < tiers.size(); i++) {
         if (((Integer) ((Object[]) tiers.get(i))[0]).intValue() == thr) return "❌ 该阈值已存在";
     }
     tiers.add(new Object[]{ Integer.valueOf(thr), act });
-    if (isCustom) setTiersToKey(tiersCustomKey(groupId), tiers); else setTiers(groupId, tiers);
-    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
-    return "✅ 已增加" + (isCustom ? "定制" : "") + "档 (>" + thr + "元 " + act + "), 当前 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
-}
-
-// v1.7.0 §22.4: Dialog 多行档表解析 helper (普通/定制档表编辑器共用; 逐行校验 + 行号错误 + 满档截断)。
-//   返回 Object[]{ List parsed, StringBuilder errs, Integer errCount, Boolean overflow }。逻辑与 v1.6.1 内联段逐字一致。
-Object[] rpParseTierBox(String raw) {
-    List parsed = new java.util.ArrayList();
-    StringBuilder errs = new StringBuilder();
-    int errCount = 0;
-    int nonEmptyLineNo = 0;
-    boolean overflow = false;
-    if (raw == null) raw = "";
-    String[] lines = raw.split("\n");
-    for (int i = 0; i < lines.length; i++) {
-        String ln = lines[i].trim();
-        if (ln.isEmpty()) continue;
-        nonEmptyLineNo++;
-        if (parsed.size() >= RP_MAX_TIERS) { overflow = true; continue; }
-        int sp = ln.indexOf(' ');
-        if (sp < 0) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行格式错(缺动作)"); errCount++; continue; }
-        String ts = ln.substring(0, sp).trim();
-        String act = sanitizeTierAction(ln.substring(sp + 1));
-        int thr;
-        try { thr = Integer.parseInt(ts); } catch (Throwable t) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值非整数"); errCount++; continue; }
-        if (thr <= 0) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值需正整数"); errCount++; continue; }
-        if (act.isEmpty()) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行缺动作"); errCount++; continue; }
-        boolean dup = false;
-        for (int j = 0; j < parsed.size(); j++) { if (((Integer) ((Object[]) parsed.get(j))[0]).intValue() == thr) { dup = true; break; } }
-        if (dup) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值重复"); errCount++; continue; }
-        parsed.add(new Object[]{ Integer.valueOf(thr), act });
-    }
-    if (overflow) rpAppendErr(errs, errCount, "最多 " + RP_MAX_TIERS + " 档, 超出已截断");
-    return new Object[]{ parsed, errs, Integer.valueOf(errCount), Boolean.valueOf(overflow) };
+    setTiers(groupId, tiers);
+    List saved = getTiers(groupId);
+    return "✅ 已增加档 (>" + thr + "元 " + act + "), 当前 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
 }
 
 // v1.6.1: Dialog 行解析错误收集 helper (前 5 条带分隔符追加, 简化调用点避免 BeanShell 深嵌套解析问题)。
@@ -785,15 +632,13 @@ void rpAppendErr(StringBuilder errs, int curCount, String msg) {
 }
 
 // 红包减少档: 删当前群最高档 (档数需 >1)。
-String rpDelTopTierCmd(String groupId) { return rpDelTopTierCmd(groupId, false); }
-// v1.7.0 §22.4: isCustom=true → 删定制档表最高档 (读 getTiersByType(true), 写定制键)。
-String rpDelTopTierCmd(String groupId, boolean isCustom) {
-    List tiers = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+String rpDelTopTierCmd(String groupId) {
+    List tiers = getTiers(groupId);
     if (tiers.size() <= 1) return "❌ 至少保留 1 档, 无法再减少";
     Object[] removed = (Object[]) tiers.remove(tiers.size() - 1);
-    if (isCustom) setTiersToKey(tiersCustomKey(groupId), tiers); else setTiers(groupId, tiers);
-    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
-    return "✅ 已删除" + (isCustom ? "定制" : "") + "最高档 (>" + ((Integer) removed[0]).intValue() + "元 " + (String) removed[1] + "), 剩 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
+    setTiers(groupId, tiers);
+    List saved = getTiers(groupId);
+    return "✅ 已删除最高档 (>" + ((Integer) removed[0]).intValue() + "元 " + (String) removed[1] + "), 剩 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
 }
 
 long cfgDelay() { return cfgLong(K_DELAY, DEF_DELAY); }
@@ -816,15 +661,6 @@ String cfgStr(String key, String def) {
     catch (Throwable t) { return def; }
 }
 String cfgRulePrefix() { return cfgStr(K_RULE_PREFIX, DEF_RULE_PREFIX); }
-// v1.7.1 §22.6: 定制包第一条群规前缀 (per-group, 空回退默认「定制包请按要求执行」)。
-String customRulePrefixKey(String groupId) { return K_CUSTOM_RULE_PREFIX_PREFIX + normGroupId(groupId); }
-String cfgCustomRulePrefix(String groupId) {
-    try {
-        String s = getString(customRulePrefixKey(groupId), "");
-        if (s == null || s.trim().isEmpty()) return DEF_CUSTOM_RULE_PREFIX;
-        return s;
-    } catch (Throwable t) { return DEF_CUSTOM_RULE_PREFIX; }
-}
 String cfgExportTarget() { return cfgStr(K_EXPORT_TARGET, DEF_EXPORT_TARGET); }   // v1.3.0 §18
 int cfgDailyHour() { int h = cfgInt(K_DAILY_HOUR, DEF_DAILY_HOUR); if (h < 0 || h > 23) h = DEF_DAILY_HOUR; return h; }   // v1.4.0 §20
 
@@ -1195,9 +1031,8 @@ void onHandleMsgBody(Object msg) {
         // v1.0.6 §13.1: 首次延迟 ±25% 抖动 (base*0.75 ~ base*1.25), 去零方差。long 乘防溢出。
         long delayMs = hbJitter((long) (delaySec * 1000L * 0.75), (long) (delaySec * 1000L * 0.5));
         long dueAt = System.currentTimeMillis() + delayMs;
-        // Job = { key, talker, sender, msgid, dueAt, attempt=0, title(留空, worker填), content(原始), isCustom(留 FALSE, worker填) }
-        //   v1.6.3: +JOB_CONTENT 第 8 槽; v1.7.0 §22: +JOB_ISCUSTOM 第 9 槽 (热路径只塞常量 Boolean.FALSE, 不算类型 — 类型判定全在 worker)。
-        Object[] job = new Object[]{ fKey, fTalker, fSender, Long.valueOf(fMsgid), Long.valueOf(dueAt), Integer.valueOf(0), "", fContent, Boolean.FALSE };
+        // Job = { key, talker, sender, msgid, dueAt, attempt=0, title(留空, worker填), content(原始) }  (v1.6.3: +JOB_CONTENT 第 8 槽)
+        Object[] job = new Object[]{ fKey, fTalker, fSender, Long.valueOf(fMsgid), Long.valueOf(dueAt), Integer.valueOf(0), "", fContent };
         rpEnqueue(job);
         hbBgLog("[RP] " + hbNow() + " redpacket candidate in enabled group (type=" + type
             + "). enqueued raw (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ". (extract/exclusive deferred to worker)");
@@ -1262,64 +1097,6 @@ boolean onClickSendBtn(String text) {
         // v1.4.0 §20: 手动测试每日发送 (bot 自己; 立即按过去24h对 daily_groups 跑一次 → 私聊 ACCT_REDACTED)。
         if (content.equals("红包每日测试")) {
             try { rpDailyTest(); toast("📤 已触发每日测试 (过去24h → 私聊, 看 rp.log)"); } catch (Throwable t) { try { toast("❌ 测试失败: " + t); } catch (Throwable t2) {} }
-            return true;
-        }
-        // ========== v1.7.0 §22.4: 定制包档表命令 (作用当前群, 复用普通解析器 isCustom=true) ==========
-        // 顺序: 定制* 必须在 红包* 之前不必, 因前缀不同; 但 定制关键字 要先于 定制(若有其它). 这里各自独立 startsWith/equals。
-        if (content.startsWith("定制关键字")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            String kw = content.substring("定制关键字".length()).trim();
-            try {
-                setCustomKw(groupId, kw);
-                if (kw.isEmpty()) toast("✅ 已清空本群定制关键字 (定制将回退普通包)");
-                else toast("✅ 本群定制关键字(包含匹配祝福语): " + kw + (isCustomOn(groupId) ? "" : "\n⚠️ 定制开关未开, 请在『红包统计设置』Dialog 开启"));
-            } catch (Throwable t) { try { toast("❌ 格式: 定制关键字 恭喜发财"); } catch (Throwable t2) {} }
-            return true;
-        }
-        // v1.7.1 §22.6: 定制包第一条群规前缀 (当前群, 单值原样存储/发送), 仿 红包群规前缀。
-        if (content.startsWith("定制群规前缀")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            String v = content.substring("定制群规前缀".length()).trim();
-            try { if (!v.isEmpty()) { putString(customRulePrefixKey(groupId), v); toast("✅ 本群定制群规前缀(原样发送): " + v); } else toast("❌ 格式: 定制群规前缀 定制包请按要求执行"); } catch (Throwable t) {}
-            return true;
-        }
-        if (content.startsWith("定制增加档")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            String rest = content.substring("定制增加档".length()).trim();
-            try { toast(rpAddTierCmd(groupId, rest, true)); } catch (Throwable t) { try { toast("❌ 格式: 定制增加档 20 发视频"); } catch (Throwable t2) {} }
-            return true;
-        }
-        if (content.equals("定制减少档")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            try { toast(rpDelTopTierCmd(groupId, true)); } catch (Throwable t) { try { toast("❌ 操作失败"); } catch (Throwable t2) {} }
-            return true;
-        }
-        if (content.startsWith("定制阈值")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            String rest = content.substring("定制阈值".length()).trim();
-            try { toast(rpSetThresholdsCmd(groupId, rest, true)); } catch (Throwable t) { try { toast("❌ 格式: 定制阈值 5 10 (1-" + RP_MAX_TIERS + "个递增正整数)"); } catch (Throwable t2) {} }
-            return true;
-        }
-        if (content.startsWith("定制文案")) {
-            String groupId = rpCurrentGroupOrToast();
-            if (groupId == null) return true;
-            try {
-                String afterPrefix = content.substring("定制文案".length());
-                int di = 0;
-                while (di < afterPrefix.length() && di < 2 && afterPrefix.charAt(di) >= '0' && afterPrefix.charAt(di) <= '9') di++;
-                if (di == 0) { try { toast("❌ 格式: 定制文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} return true; }
-                String kStr = afterPrefix.substring(0, di);
-                int k = Integer.parseInt(kStr);
-                if (k < 1 || k > RP_MAX_TIERS) { try { toast("❌ 档号需 1-" + RP_MAX_TIERS); } catch (Throwable t2) {} return true; }
-                String v = afterPrefix.substring(di).trim();
-                if (v.isEmpty()) { try { toast("❌ 格式: 定制文案" + k + " 爆照 (动作不能为空)"); } catch (Throwable t2) {} return true; }
-                try { toast(rpSetTierActionCmd(groupId, k, v, true)); } catch (Throwable t) { try { toast("❌ 格式: 定制文案" + k + " 爆照"); } catch (Throwable t2) {} }
-            } catch (Throwable t) { try { toast("❌ 格式: 定制文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} }
             return true;
         }
         // v1.6.0: 红包增加档 <阈值> <动作> — 当前群追加一档 (需档数 <4)。
@@ -1428,7 +1205,7 @@ String rpCurrentGroupOrToast() {
 
 String rpStatusText(String groupId) {
     StringBuilder sb = new StringBuilder();
-    sb.append("📊 红包统计 v1.7.1\n");
+    sb.append("📊 红包统计 v1.6.0\n");
     sb.append("本群: ").append(isGroupEnabled(groupId) ? "✅ 已启用" : "🔴 未启用").append("\n");
     sb.append("本群每日定时: ").append(isDailyEnabled(groupId) ? ("✅ 开 (每天" + cfgDailyHour() + "点)") : "🔴 关").append("\n");
     // v1.6.0: 每群独立 1-4 档 (未配置则回退全局默认三档)。
@@ -1436,18 +1213,7 @@ String rpStatusText(String groupId) {
     boolean _custom = false;
     try { String _raw = getString(tiersKey(groupId), ""); _custom = (_raw != null && !_raw.trim().isEmpty()); } catch (Throwable t) {}
     sb.append("本群档位 (").append(_tiers.size()).append("档").append(_custom ? "" : ",全局默认").append("): ").append(rpTiersSummary(_tiers)).append("\n");
-    // v1.7.0 §22.4: 定制包维度状态。
-    boolean _customOn = isCustomOn(groupId);
-    sb.append("定制开关: ").append(_customOn ? "✅ 开" : "🔴 关 (仅 Dialog 可改)").append("\n");
-    String _kw = getCustomKw(groupId);
-    sb.append("定制关键字: ").append((_kw == null || _kw.isEmpty()) ? "(未设)" : _kw).append("\n");
-    boolean _customTiersSet = false;
-    try { String _rawc = getString(tiersCustomKey(groupId), ""); _customTiersSet = (_rawc != null && !_rawc.trim().isEmpty()); } catch (Throwable t) {}
-    List _ct = getTiersByType(groupId, true);
-    sb.append("定制档位 (").append(_ct.size()).append("档").append(_customTiersSet ? "" : ",回退普通").append("): ").append(rpTiersSummary(_ct)).append("\n");
-    // v1.7.1 §22.6: 定制包第一条群规前缀。
-    sb.append("定制群规前缀: ").append(cfgCustomRulePrefix(groupId)).append("\n");
-    sb.append("命令: 红包阈值 a b.. / 红包文案K 文字 / 红包增加档 阈值 动作 / 红包减少档 / 定制阈值.. / 定制文案K.. / 定制增加档.. / 定制减少档 / 定制关键字 <kw> / 定制群规前缀 <文字>\n");
+    sb.append("命令: 红包阈值 a b.. / 红包文案K 文字 / 红包增加档 阈值 动作 / 红包减少档\n");
     sb.append("延迟: 首次:").append(cfgDelay()).append("秒 重试1:").append(cfgRetry1()).append("秒 重试2:").append(cfgRetry2()).append("秒 (±抖动)\n");
     sb.append("at上限: ").append(cfgAtLimit()).append(" (超过则发无@群规消息)\n");
     sb.append("同群限频: ").append(cfgMsgGap()).append("秒\n");
@@ -1629,13 +1395,6 @@ void hbProcess(Object[] job) {
                     } catch (Throwable t) {}
                 }
                 try { job[JOB_TITLE] = (hbTitle == null) ? "" : hbTitle; } catch (Throwable t) {}
-                // v1.7.0 §22.2 (v1.7.1): 包类型判定 (worker 内, 零热路径)。该群定制关 → 普通; 否则 title 包含 kw → 定制。
-                //   回填本 job[JOB_ISCUSTOM] 供 hbDetailExtract 透传给 hbTierAndSend。整段 try/catch, 异常退回普通(FALSE)。
-                try {
-                    boolean isCustom = rpIsCustom(talker, (String) job[JOB_TITLE]);
-                    job[JOB_ISCUSTOM] = isCustom ? Boolean.TRUE : Boolean.FALSE;
-                    hbBgLog("[RP] " + hbNow() + " pkg-type: " + (isCustom ? "custom" : "normal") + " (custom_on=" + isCustomOn(talker) + ", kwLen=" + getCustomKw(talker).length() + ", titleLen=" + ((String) job[JOB_TITLE]).length() + ").");
-                } catch (Throwable t) { try { job[JOB_ISCUSTOM] = Boolean.FALSE; } catch (Throwable t2) {} }
             }
         }
 
@@ -1923,7 +1682,7 @@ void afterCoverNoDetail() {
     long retryMs = hbJitter((long) (retrySec * 1000L * 0.75), (long) (retrySec * 1000L * 0.5));
     long dueAt = System.currentTimeMillis() + retryMs;
     // §15.5: job 重新入队 (新 dueAt + attempt+1); 复用 talker/sender/msgid/title。v1.3.0: 7 元组(含 title)。
-    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt), job[JOB_TITLE], job[JOB_CONTENT], job[JOB_ISCUSTOM] };
+    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt), job[JOB_TITLE], job[JOB_CONTENT] };
     SEEN.clear(); // 清 Activity 去重, 下次重开封面是新实例
     rpClearInFlight();   // 先清在飞, 否则 rpEnqueue 会因"在飞"去重而拒绝重入
     rpEnqueue(reJob);
@@ -2445,10 +2204,6 @@ void hbDetailExtract(Object root, String key) {
         String jobSender = null, jobTitle = null;
         try { if (job != null) jobSender = (String) job[JOB_SENDER]; } catch (Throwable t) { jobSender = null; }
         try { if (job != null) jobTitle = (String) job[JOB_TITLE]; } catch (Throwable t) { jobTitle = null; }
-        // v1.7.0 §22: 包类型 (worker 已判定并回填 job[JOB_ISCUSTOM])。仅用于选档, 透传给 hbTierAndSend。
-        boolean jobIsCustom = false;
-        try { if (job != null && job[JOB_ISCUSTOM] != null) jobIsCustom = ((Boolean) job[JOB_ISCUSTOM]).booleanValue(); } catch (Throwable t) { jobIsCustom = false; }
-        final boolean fIsCustom = jobIsCustom;
 
         // BFS 找领取者 List
         Object listObj = hbFindReceiverList(root);
@@ -2520,8 +2275,8 @@ void hbDetailExtract(Object root, String key) {
         // 关页 (详情 + 封面)
         finishDetailAndCover(key);
 
-        // 分档 + 发一条提醒 (v1.1.0 §16: 传 msgid 用于引用原红包; v1.7.0 §22: 传 isCustom 选档)
-        if (talker != null) hbTierAndSend(talker, fMsgid, receivers, fIsCustom);
+        // 分档 + 发一条提醒 (v1.1.0 §16: 传 msgid 用于引用原红包)
+        if (talker != null) hbTierAndSend(talker, fMsgid, receivers);
         else hbBgLog("[RP] " + hbNow() + " detail: talker null, cannot send.");
 
         // 标记完成 + 清状态 (§15.5 退出点 → 清在飞)
@@ -2676,9 +2431,7 @@ boolean hbLooksNick(String s) {
 
 // ============ 分档 + 发一条提醒 (SPEC §6; v1.1.0 §16: 引用原红包) ============
 // msgid = 原红包消息的本地 msgId (来自 CUR_JOB), 用于引用条 rpSendQuote 引用原红包。v1.1.2: 引用群规条(无@) + @条(sendText 真@), 详见函数内。
-void hbTierAndSend(String talker, long msgid, List receivers) { hbTierAndSend(talker, msgid, receivers, false); }
-// v1.7.0 §22.3: 加 isCustom 参数 — 仅选档来源按类型切换 (getTiersByType), 其余(限频/排除/分档/两条消息)一行不动。
-void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) {
+void hbTierAndSend(String talker, long msgid, List receivers) {
     try {
         // ---- v1.0.6 §13.3: 同群 @ 限频。两条红包提醒间隔 < rp_msg_min_gap_sec 则跳过本次。----
         // 在分档/构造前就判, 避免无谓计算; talker = 群 id。
@@ -2697,9 +2450,8 @@ void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) 
         }
 
         // v1.6.0: 每群独立 1-4 档 (未配置该群则 getTiers 回退全局三档, 旧行为不变)。
-        //         此处在后台 worker 线程 (hbTierAndSend), 非 onHandleMsg 热路径, 满足约束。
-        // v1.7.0 §22.3: 档表来源按包类型切换 — 定制读 rp_tiers_custom_<gid>(未配回退普通), 普通读 getTiers。其余逻辑全不变。
-        List tiers = getTiersByType(talker, isCustom);
+        //         getTiers 读 store, 但此处在后台 worker 线程 (hbTierAndSend), 非 onHandleMsg 热路径, 满足约束。
+        List tiers = getTiers(talker);
         int nTier = tiers.size();
         int lowThr = ((Integer) ((Object[]) tiers.get(0))[0]).intValue();   // 最低档阈值(元)
         long lowCent = (long) lowThr * 100L;
@@ -2740,10 +2492,8 @@ void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) 
 
         // v1.1.4 §16: 发提醒拆两条 (达标≥1 才发), 严格顺序: 先第一条(引用群规) → 隔 rp_two_msg_gap_sec 秒 → 第二条(@)。
         //   v1.6.0: 第一条群规改为 N 档循环 (列全档, 无随机无语气), 连接词固定"过X元", 动作用各档原样。
-        //   v1.7.1 §22.6: 定制包第一条改用定制前缀 cfgCustomRulePrefix(talker)(默认「定制包请按要求执行」), 普通包仍用 cfgRulePrefix();
-        //     档表已是 getTiersByType(talker,isCustom) 选出的那套(定制档动作), 各档仍「，过{阈值}元{动作}」, 仅前缀按类型切换。
         StringBuilder ruleSb = new StringBuilder();
-        ruleSb.append(isCustom ? cfgCustomRulePrefix(talker) : cfgRulePrefix());
+        ruleSb.append(cfgRulePrefix());
         for (int gi = 0; gi < nTier; gi++) {
             Object[] te = (Object[]) tiers.get(gi);
             ruleSb.append("，过").append(((Integer) te[0]).intValue()).append("元");
@@ -2759,12 +2509,10 @@ void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) 
         // v1.3.1 §16: 第二条文本 (msg2)。两种情况都带 【查包】 前缀、都隔 gap 秒延迟发 (同一机制)。
         //   ≤ at上限 → 第二条 = 【查包】 + 逐档随机@文本 (真@到人, 仅非空档)。
         //   > at上限 → 第二条 = 【查包】本次过{最低档阈值}元共{Y}人... (纯文字, 无@)。
-        // v1.7.2 §22.6: 第二条(@条/notice)【查包】前缀, 定制包加「定制包」三字 → 【查包】定制包。
-        String checkPrefix = isCustom ? "【查包】定制包" : "【查包】";
         String msg2 = null;
         if (totalQualified > atLimit) {
             // > at上限: 第二条为汇总 notice (无@, 纯文字)。{最低档阈值}(元), {Y}=达标总人数(已剔除排除名单)。
-            msg2 = checkPrefix + "本次过" + lowThr + "元共" + totalQualified + "人，人数较多不逐一提醒，请大家自觉。";
+            msg2 = "【查包】本次过" + lowThr + "元共" + totalQualified + "人，人数较多不逐一提醒，请大家自觉。";
             hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " > at_limit=" + atLimit
                 + " (excluded=" + excludedHit + ") -> 1.N-tier quoted group-rule (sent now), 2.【查包】summary notice (NO @, delayed " + cfgTwoMsgGap() + "s). tiers=" + nTier + ".");
         } else {
@@ -2780,7 +2528,7 @@ void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) 
                 first = false;
             }
             String atText = sb.toString();
-            if (atText.length() > 0) msg2 = checkPrefix + atText;   // v1.3.1: 整体开头加 【查包】(v1.7.2: 定制包 →【查包】定制包), 在所有 [AtWx=]/逐档文本之前
+            if (atText.length() > 0) msg2 = "【查包】" + atText;   // v1.3.1: 整体开头加 【查包】 (在所有 [AtWx=]/逐档文本之前)
             hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " <= at_limit=" + atLimit
                 + " (excluded=" + excludedHit + ") -> 1.N-tier quoted group-rule (sent now), 2.【查包】+@msg via sendText (delayed " + cfgTwoMsgGap() + "s for ordering). tiers=" + nTier + ".");
         }
@@ -2999,7 +2747,7 @@ void showConfigDialog(final String groupId) {
     root.setBackground(_rpRound("#0F1115", 0));
 
     android.widget.TextView title = new android.widget.TextView(ctx);
-    title.setText("🧧 红包统计 v1.7.0 配置");
+    title.setText("🧧 红包统计 v1.6.0 配置");
     title.setTextColor(_rpC("#E8E9EC"));
     title.setTextSize(18);
     title.setPadding(0, 0, 0, 8 * dp);
@@ -3046,11 +2794,6 @@ void showConfigDialog(final String groupId) {
     final android.widget.EditText tierBox;
     final android.widget.EditText e1; final android.widget.EditText e2; final android.widget.EditText e3;
     final android.widget.EditText t1; final android.widget.EditText t2; final android.widget.EditText t3;
-    // v1.7.0 §22.4: 定制区块控件 (仅 groupId 非空时构建; 否则全 null, 保存时跳过)。
-    final boolean[] customOnHolder = new boolean[]{ groupId != null && isCustomOn(groupId) };
-    final android.widget.EditText customKwBox;
-    final android.widget.EditText customTierBox;
-    final android.widget.EditText customRulePrefixBox;   // v1.7.1 §22.6
     if (groupId != null) {
         _rpLabel(root, ctx, "本群档位 (1-10 行, 每行: 阈值 动作; 阈值正整数递增)");
         StringBuilder pre = new StringBuilder();
@@ -3066,47 +2809,8 @@ void showConfigDialog(final String groupId) {
         root.addView(tb);
         tierBox = tb;
         e1 = null; e2 = null; e3 = null; t1 = null; t2 = null; t3 = null;
-
-        // ===== v1.7.0 §22.4: 定制包区块 (与普通档表区块同构) =====
-        _rpSpacer(root, ctx, 8 * dp);
-        _rpLabel(root, ctx, "—— 定制包 (祝福语包含关键字时改用定制档表) ——");
-        // ☑ 是否开启定制 (仅此处可改 rp_custom_on)。
-        final android.widget.Button customToggle = _rpBtn(ctx, customOnHolder[0] ? "✅ 已开启定制 (点击关闭)" : "🔴 未开启定制 (点击开启)", customOnHolder[0] ? "#FF6B6B" : "#5CB6FF");
-        customToggle.setOnClickListener(new android.view.View.OnClickListener() {
-            public void onClick(android.view.View v) {
-                if (customOnHolder[0]) { customOnHolder[0] = false; customToggle.setText("🔴 未开启定制 (点击开启)"); customToggle.setBackground(_rpRound("#5CB6FF", 24)); }
-                else { customOnHolder[0] = true; customToggle.setText("✅ 已开启定制 (点击关闭)"); customToggle.setBackground(_rpRound("#FF6B6B", 24)); }
-            }
-        });
-        root.addView(customToggle);
-        // 📝 定制关键字 (rp_custom_kw)。
-        _rpLabel(root, ctx, "定制关键字 (包含匹配祝福语; 空=不启用)");
-        android.widget.EditText ckb = _rpEdit(ctx, getCustomKw(groupId), false); root.addView(ckb);
-        customKwBox = ckb;
-        // 📋 定制档表 (rp_tiers_custom; 每行 阈值 动作; 复用普通档表逐行解析)。
-        _rpLabel(root, ctx, "定制档位 (1-10 行, 每行: 阈值 动作; 未配置则回退普通档)");
-        StringBuilder cpre = new StringBuilder();
-        List _ctt = getTiersByType(groupId, true);
-        for (int i = 0; i < _ctt.size(); i++) {
-            Object[] cte = (Object[]) _ctt.get(i);
-            if (i > 0) cpre.append("\n");
-            cpre.append(((Integer) cte[0]).intValue()).append(" ").append((String) cte[1]);
-        }
-        android.widget.EditText ctb = _rpEdit(ctx, cpre.toString(), false);
-        ctb.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        ctb.setMinLines(2); ctb.setMaxLines(11); ctb.setSingleLine(false);
-        root.addView(ctb);
-        customTierBox = ctb;
-        // v1.7.1 §22.6: 定制群规前缀 (rp_custom_rule_prefix_<gid>; 定制包第一条群规文本前缀)。
-        _rpLabel(root, ctx, "定制群规前缀 (定制包第一条群规文本; 空=默认「" + DEF_CUSTOM_RULE_PREFIX + "」)");
-        android.widget.EditText crp = _rpEdit(ctx, cfgCustomRulePrefix(groupId), false); root.addView(crp);
-        customRulePrefixBox = crp;
-        _rpSpacer(root, ctx, 8 * dp);
     } else {
         tierBox = null;
-        customKwBox = null;
-        customTierBox = null;
-        customRulePrefixBox = null;
         // 阈值 (全局默认源)
         _rpLabel(root, ctx, "全局默认三档阈值 (元, 严格大于; 仅作未配置群的回退)");
         e1 = _rpEdit(ctx, String.valueOf(cfgT1()), true); root.addView(e1);
@@ -3233,29 +2937,6 @@ void showConfigDialog(final String groupId) {
                         setTiers(groupId, parsed);
                         if (errCount > 0 || overflow) { toast("⚠️ 部分档位行有误已忽略 (" + errs.toString() + "), 已存 " + parsed.size() + " 档"); }
                     }
-                    // ===== v1.7.0 §22.4: 定制区块保存 (仅 groupId 上下文; 与普通档表同款逐行解析) =====
-                    try {
-                        // 定制开关 (仅 Dialog 可改)。
-                        setCustomOn(groupId, customOnHolder[0]);
-                        // 定制关键字。
-                        if (customKwBox != null) setCustomKw(groupId, customKwBox.getText().toString());
-                        // v1.7.1 §22.6: 定制群规前缀 (空 → 清键, 读时回退默认)。
-                        if (customRulePrefixBox != null) putString(customRulePrefixKey(groupId), customRulePrefixBox.getText().toString().trim());
-                        // 定制档表: 复用 rpParseTierBox; 全无效不保存(不破坏原表), 部分有效存有效行。
-                        if (customTierBox != null) {
-                            Object[] cres = rpParseTierBox(customTierBox.getText().toString());
-                            List cparsed = (List) cres[0];
-                            StringBuilder cerrs = (StringBuilder) cres[1];
-                            int cerrCount = ((Integer) cres[2]).intValue();
-                            boolean coverflow = ((Boolean) cres[3]).booleanValue();
-                            if (cparsed.isEmpty()) {
-                                toast("⚠️ 定制档位为空或全部无效, 未保存定制档位 (其他已存)" + (cerrs.length() > 0 ? ": " + cerrs.toString() : ""));
-                            } else {
-                                setTiersToKey(tiersCustomKey(groupId), cparsed);
-                                if (cerrCount > 0 || coverflow) { toast("⚠️ 部分定制档位行有误已忽略 (" + cerrs.toString() + "), 已存 " + cparsed.size() + " 定制档"); }
-                            }
-                        }
-                    } catch (Throwable t) { try { toast("定制保存失败: " + t); } catch (Throwable t2) {} }
                 } else {
                     saveIntField(K_T1, e1); saveIntField(K_T2, e2); saveIntField(K_T3, e3);
                     saveStrField(K_TXT1, t1); saveStrField(K_TXT2, t2); saveStrField(K_TXT3, t3);
