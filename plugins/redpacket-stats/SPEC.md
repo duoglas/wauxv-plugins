@@ -55,6 +55,8 @@
 
 ### 配置入口
 
+> **v1.8.0 设置页拆分（§23）**：原单一长 ScrollView Dialog 拆为「主菜单 + 二级子页」，详见 §23。下述基础机制（getTopActivity/AlertDialog/onClickSendBtn 拦截/UI 线程上下文）不变。
+
 - **图形 Dialog（主通道）**：`openSettings()` = WAuxiliary 主面板点插件"设置"弹出。展示当前配置 + 可编辑（三档阈值 EditText 数字 / 三档文案 EditText / 三个延迟 EditText / 保存按钮）。参考 GroupAdmin 的 `openSettings` + `showGroupConfigDialog`（`getTopActivity()`、AlertDialog、LinearLayout、EditText、`_rpBtn`/`_rpC`/`_rpRound`）。
 - **群内 Dialog**：`红包统计设置`（在群输入框打 → 点发送，经 `onClickSendBtn` 拦截，**消息不发到群**）→ 弹本群配置 Dialog（含本群启用开关）。因运行在 UI 线程上下文，`getTopActivity()` 拿得到前台 Activity，Dialog 能正常弹出（v1.0.2 修复在消息线程弹失败）。
 - **文字命令**（v1.0.2 起全部经 `onClickSendBtn` 拦截，**命中即 `return true` 不发群** + toast 反馈；非配置命令 `return false` 正常发送）：
@@ -463,3 +465,25 @@ NewDetailUI.onResume (类名过滤 + 去重):
 - **第二条（@ 条）前缀（v1.7.2）**：普通包仍 `【查包】`；**定制包 → `【查包】定制包`**（`checkPrefix = isCustom ? "【查包】定制包" : "【查包】"`，≤上限的逐档@条与 >上限的汇总 notice 两种都用此前缀）。逐档 @ 达标者、档表/文案来自定制档表，其余机制不变（§6.1）。
 - 选用哪条前缀**仅取决于 `isCustom`**（已在 worker 判定并随 Job 透传），与普通包共用同一发送骨架（限频/排除/两条消息/ANR 一行不动）。
 - 配置：命令 `定制群规前缀 <文字>`（作用当前群，仿 `rp_rule_prefix` 的设定方式）+ `红包统计设置` Dialog 定制区块加一项「定制群规前缀」EditText；`红包统计状态` 增显。
+
+## 23. 设置页拆分：主菜单 + 二级子页（v1.8.0）
+
+原 `showConfigDialog` 把所有配置堆在单一 ScrollView 内，过长难用。改为**主菜单 Dialog + 按需弹出的二级子页 Dialog**（均 AlertDialog，不引入 ViewPager/Fragment，遵守 §7 ANR：只构建 Dialog、无 UI 遍历）。
+
+### 23.1 主菜单 Dialog
+
+- `红包统计设置`（群内）/ `openSettings`（全局）弹出主菜单：顶部**本群状态摘要**（启用 / 定制开关+关键字 / 每日定时）+ 一列入口按钮，点按钮弹对应子页。
+- 入口（群上下文）：`📌 基础开关` · `🧧 普通档表` · `🎯 定制包` · `⏱️ 延迟 & @上限` · `🚫 排除名单` · `📤 导出今日→私聊`（直接动作）· `关闭`。
+- 全局上下文（groupId==null）：隐藏「本群开关/每日定时/排除名单」等群专属项，仅留全局可配项。
+
+### 23.2 二级子页
+
+- 每个子页独立 AlertDialog：聚焦该类配置 + `💾 保存`（**只写本页 key**）+ `← 返回`（保存/返回后回到主菜单）。
+- 子页与原字段一一对应（值的读取/校验/写入键全沿用既有 helper，逻辑不变）：
+  - **基础开关**：本群启用、每日定时（toggle 即时生效，沿用现逻辑）。
+  - **普通档表**：多行 EditText（每行「阈值 动作」，复用 `rpParseTierBox` 逐行校验/全无效不保存）。
+  - **定制包**：定制开关（仅此处可改）、定制关键字、定制档表（多行）、定制群规前缀。
+  - **延迟 & @上限**：首次/重试1/重试2（秒）、`rp_at_limit`。
+  - **排除名单**：成员列表 + 移除（沿用现 exclBox 逻辑）。
+- **只重构 Dialog 展示层**：worker / onHandleMsg 热路径 / 文字命令 / 存储键 全不动；命令入口仍作 Dialog 之外的兜底。
+- 健壮：每个子页构建/保存整段 try/catch，异常 toast 不崩 Dialog。

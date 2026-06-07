@@ -14,7 +14,10 @@ metadata:
 
 ## 当前部署版本（真机已上）
 - **GroupAdmin v1.16.3**：在 v1.16.2(黑名单安全化 + recordSpeak SQLite[VH-01 消除] + enabled 群内存缓存 onHandleMsg ~30ms→~12ms)之上,**onLoad 冷启动健壮化**——getLoginWxid 安全取值 + 关键初始化分段 try/catch,修 VH-02(冷重启时 getLoginWxid 抛 NoResetUinStack 连坐整段 onLoad、flush 循环没启动)。真机重载验过 onLoad 干净跑完。见 C-PLUGIN-05/VH-02。GroupAdmin 重启即加载。
-- **RedPacketStats v1.7.2**：在 v1.6.4(红包圈人全链路 + 每群 1-10 档 + 分组导出/每日私聊 + 检测移后台 worker + enabled 缓存)之上,新增**包类型 普通/定制**(SPEC §22):per-group 定制开关(仅 Dialog)+定制关键字(**包含匹配** title)+定制档表 rp_tiers_custom_;判定全在 worker 零热路径;定制包第一条群规用定制前缀(默认「定制包请按要求执行」)、第二条 @ 前缀「【查包】定制包」。真机发定制包验收通过。**懒加载;曾因解析失败被自动停用,注意确认开关 ON**。
+- **RedPacketStats v1.8.1**：在 v1.6.4 基础上加**包类型 普通/定制**(SPEC §22)+ **设置页拆分**(SPEC §23)。
+  - 包类型(v1.7.x,真机验收过):per-group 定制开关(仅 Dialog)+定制关键字(**包含匹配** title)+定制档表 rp_tiers_custom_;判定全在 worker 零热路径;定制包第一条群规用定制前缀(默认「定制包请按要求执行」)、第二条 @ 前缀「【查包】定制包」。
+  - 设置页(v1.8.x):原单一长 Dialog 拆为「主菜单 showConfigDialog + 二级子页 showPageBasic/NormalTiers/Custom/Delay/Exclude」,每页只写本页 key。v1.8.1 修「关闭」失效(对话框堆叠→menuHolder 捕获+入口按钮开子页前 dismiss)+排除名单显示名字(rpSenderName 群名片/昵称,「昵称（…尾4）」)。只动 Dialog 层。
+  - **懒加载;曾因解析失败被自动停用,注意确认开关 ON**。
 
 ## 挂起的真机收尾项（adb 输不了中文/红包，需人工在微信里做）
 1. RedPacketStats v1.6.4：发个拼手气红包 → 拉 perf.log 确认红包消息热路径从 ~130ms 降到几 ms（这次优化的最终数字还没坐实）。
