@@ -3,8 +3,10 @@
 # 用法: bash scripts/build-akita-app.sh [输出目录]   (默认 ~/Desktop)
 # 行为: 双击 app → 自动起 adb / 等设备授权 / scrcpy 息屏镜像(手机黑屏, 电脑窗口控制)。
 #       出错(没装 adb/scrcpy、没连设备)弹 macOS 原生对话框提示, 不需要终端。
+# 图标: 若同目录有 akita-app-icon.icns 则套用(不依赖 PIL)。
 
 set -e
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 OUT_DIR="${1:-$HOME/Desktop}"
 APP="$OUT_DIR/akita 连接.app"
 MACOS="$APP/Contents/MacOS"
@@ -13,7 +15,14 @@ RES="$APP/Contents/Resources"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# ---- 图标(可选) ----
+ICON_LINE=""
+if [ -f "$SCRIPT_DIR/akita-app-icon.icns" ]; then
+  cp "$SCRIPT_DIR/akita-app-icon.icns" "$RES/AppIcon.icns"
+  ICON_LINE="  <key>CFBundleIconFile</key>        <string>AppIcon</string>"
+fi
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -25,6 +34,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>
   <key>CFBundleExecutable</key>      <string>akita-connect</string>
+$ICON_LINE
   <key>LSMinimumSystemVersion</key>  <string>10.13</string>
   <key>NSHighResolutionCapable</key> <true/>
 </dict>
@@ -69,5 +79,6 @@ RUN
 chmod +x "$MACOS/akita-connect"
 
 /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+/usr/bin/touch "$APP" 2>/dev/null || true
 
 echo "OK 已生成: $APP"
