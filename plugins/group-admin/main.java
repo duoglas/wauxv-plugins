@@ -1,4 +1,5 @@
-// GroupAdmin v1.17.2 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.18.0 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+//   - v1.18.0: 活动判定=任意消息类型 — 非文本消息(图片/表情/语音/红包/文件等)也计入发言活动, 修复只发非文本消息者被 #潜水 误判潜水 (SPEC §3/§6.10 活动采集前置)
 //   - v1.17.2: 踢人安全 — @所有人(notify@all)不能踢 (@路径踢/请动作前置守卫 _isAtAll)
 //   - v1.17.1: 管理员时效标签文案 "失效 X" → "有效期至 X"(列表/群消息同源 adminExpiryLabel)
 // 完整命令清单见 README.md 或 WAuxiliary 主面板插件列表 → 设置 (openSettings)
@@ -1933,7 +1934,7 @@ void onLoad() {
         String _owner;
         try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
         if (_owner == null) _owner = "(login pending)";
-        log("GroupAdmin v1.17.2 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
+        log("GroupAdmin v1.18.0 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
     } catch (Throwable t) {
         try { log("GroupAdmin v1.17.0 onLoad log block err: " + t); } catch (Throwable t2) {}
     }
@@ -1955,7 +1956,7 @@ void onLoad() {
                     int added = initFirstSeenBaseline(g);
                     if (added > 0) { touched++; totalAdded += added; }
                 }
-                log("GroupAdmin v1.17.2 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+                log("GroupAdmin v1.18.0 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
                 // _probeGroupInfoAPI();
             }
         });
@@ -2110,7 +2111,22 @@ void onHandleMsgBody(Object msg) {
         content = msg.getContent();
     } else {
         content = msg.getContent();
-        if (content == null || content.trim().isEmpty()) return;   // 非文本且无可读文本 → 不处理
+        if (content == null || content.trim().isEmpty()) {
+            // v1.18.0 活动采集前置 (SPEC §6.10): 非文本且无可读文本 (图片/表情/语音/红包/文件等)
+            // 在此早退点之前先把这条消息记为一次发言活动, 否则只发非文本消息的人 last_speak 永远为空,
+            // 被 #潜水 N 误判潜水。热路径红线 (C-PERF-01): 只调 getTalker/getSendTalker/isGroupEnabled(缓存)/
+            // recordSpeak(O(1) 内存写), 绝不调 getQuoteMsg/解析 XML; 整段 try/catch(Throwable) 包裹,
+            // 异常只跳过采集、绝不抛入消息处理。L3_DEGRADED 期间 recordSpeak 自身照旧丢弃 (§7)。
+            // 与下方 ~2188 行那次 recordSpeak 互斥: 空内容非文本在此早退, 文本/有内容 appmsg 走主路径, 不重复记。
+            try {
+                String _aGid = msg.getTalker();
+                String _aSnd = msg.getSendTalker();
+                if (_aSnd != null && !_aSnd.isEmpty() && isGroupEnabled(_aGid)) {
+                    recordSpeak(_aGid, _aSnd);
+                }
+            } catch (Throwable _aErr) {}
+            return;   // 非文本且无可读文本 → 采集后不再处理
+        }
     }
     if (content == null) return;
     content = content.trim();

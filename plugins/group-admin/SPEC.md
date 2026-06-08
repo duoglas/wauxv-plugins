@@ -6,7 +6,7 @@
 ## 1. 概述
 
 - 名称：GroupAdmin（群管理）
-- 当前版本：v1.16.0（`main.java`，BeanShell；T1 埋点 + T2 内存缓冲 + T2′ SQLite 落盘）
+- 当前版本：v1.18.0（`main.java`，BeanShell；T1 埋点 + T2 内存缓冲 + T2′ SQLite 落盘；v1.18.0 非文本消息也计入发言活动）
 - 宿主：WAuxiliary（`me.hd.wauxv`），通过 `onHandleMsg` 等回调 hook 微信 `com.tencent.mm`
 - 职责：群消息驱动的群管理——踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局名单 / 三层权限
 - 部署目标：真机 `…/WAuxiliary/Plugin/GroupAdmin/main.java`
@@ -27,6 +27,8 @@
 | **L1 管理动作** | 破坏性 / 需即时可靠生效 | 踢人（`#踢潜水`/`踢潜水`）、警告、加黑名单（`添加黑名单 @xx`/`addgb`）、严格模式、开启/关闭群管、保护名单写入 | 必须可靠执行；失败要有反馈（如无 bot 权限提示）；优先级最高 |
 | **L2 用户交互** | 查询 / 响应，需要及时但无破坏性 | 各查询（黑名单/白名单/管理员/警告名单/保护名单/潜水名单/群管状态/群管群列表）、帮助、`群管设置`/`#群管设置` Dialog、`#群权限自检` | 及时响应；可同步但要轻；重计算（如 native cursor 扫群成员）仅在该命令触发时执行，不进普通消息路径 |
 | **L3 统计/被动追踪** | 及时性低、可降级 | `recordSpeak`（潜水发言时间 `lsg_`）、first_seen（`fsg_`）维护 | **必须异步化 + 可降级**（C-ARCH-02）；绝不在消息线程同步做全量持久化；热路径压力大/出错时可丢弃当前批次 |
+
+> **活动判定 = 任何消息类型（v1.18.0 修复）**：「冒泡 / 不潜水」的判据是**在群里发过任意消息**——文本、引用回复、**图片、表情、语音、视频、红包、文件、位置**等一律算活跃。`recordSpeak` 必须覆盖所有非空 sender 的群消息，**不能只记带可读文本的消息**。v1.17.2 及以前的 bug：非文本且 `getContent()` 为空的消息（图片/表情/语音/红包）在入口 isText 闸门处被早退（见 §6.10），走不到 `recordSpeak` → 只发非文本的人 `last_speak` 永远为空 → 被 `#潜水 N` 误判为「从未发言」列入潜水名单。
 
 > 关键认知：潜水**清理**（踢潜水）是 L1，但潜水**数据采集**（recordSpeak）是 L3。VH-01 的错误正是把 L3 采集同步压在了热路径上。
 
@@ -107,6 +109,7 @@
    - `isText()=true`（普通文本，占绝大多数）：维持原样——`content.split` 取 lastTok → `isActionTok(lastTok)` 纯字符串判定 → 末尾非动作词即 return（recordSpeak 内存入队已在更早完成）。**绝不调用 `getQuoteMsg()`、绝不解析 XML title**，热路径成本与改造前一致。
    - `!isText()`（appmsg，频率远小于普通聊天）：`q = msg.getQuoteMsg()`（**仅在此一次调用**）；`q==null` → return；否则正则提取 `<title>` → 取末尾 token 作 `actionTok` → `isActionTok` 判定。`getQuoteMsg()` + XML 正则只发生在非文本消息上，不影响 `rs_avg_us`/`ohm_avg_us`（真机 perf.log 验证）。
 10. **isText 闸门（W2，WRISK-1）**：`onHandleMsgBody` 入口对非文本消息**零额外成本放行**——`isText()` 通过照常继续（普通文本路径不变、不调 getQuoteMsg）；`isText()` 不通过时再看 `getContent()` 是否非空（引用回复 appmsg 带 XML 文本），非空才继续走后续判定（引用路径在无 @ 分支的 `!isText` 子分支里调 `getQuoteMsg()` 取 title）。普通文本消息在第一个分支即通过，**永不为非文本消息额外调用 getQuoteMsg()**。（W2 修复后已移除临时探针 `[QDIAG]`/`[QUOTE-PROBE]`。）
+    - **活动采集前置（v1.18.0 修复）**：在「`!isText()` 且 `getContent()` 空 → return」这个早退点**之前**，必须先把这条消息记为一次发言活动——取 `groupId=getTalker()` / `sender=getSendTalker()`，`sender` 非空且 `isGroupEnabled(groupId)` 时调一次 `recordSpeak(groupId, sender)`，再 `return`。这样图片/表情/语音/红包等无文本消息也计入 `last_speak`，不再被误判潜水。**热路径红线不变（C-PERF-01）**：只调 `getTalker/getSendTalker/isGroupEnabled`(缓存)`/recordSpeak`(O(1) 内存写)，**绝不调 `getQuoteMsg()`、绝不解析 XML**；整段 try/catch 包裹，异常只跳过采集、绝不抛入消息处理；`L3_DEGRADED` 期间 `recordSpeak` 自身照旧丢弃（§7）。文本/appmsg-有内容 的消息仍走原 ~2188 行那次 `recordSpeak`，**不重复记**（两条路径互斥：空内容非文本在此早退，其余走主路径）。
 5. `[现状]`（T1 落地，C-PERF-04）：onHandleMsg 入口埋点已实现。热路径只做 `nanoTime` 取值 + 顶层内存计数器累加（样本数、onHandleMsg 累计/最大耗时、recordSpeak 累计/最大耗时、命令分支/普通分支计数），不每条消息写文件或 plugin.log（避免埋点自身变成热路径开销，RISK-5）。每累计 `PERF_FLUSH_EVERY`（默认 200）条消息聚合落盘一行到独立 `perf.log`（与 plugin.log 分离），落盘后清零窗口计数进入下一窗口。所有埋点逻辑被 try/catch 包裹，任何异常只跳过埋点、绝不抛入消息处理。
    - `perf.log` 路径：插件目录 `…/WAuxiliary/Plugin/GroupAdmin/perf.log`。
    - 行格式（空格分隔，可 grep/awk 聚合）：`ts=<epochMs> iso=<yyyy-MM-dd HH:mm:ss> n=<样本数> ohm_avg_us=<onHandleMsg平均微秒> ohm_max_us=<最大> rs_n=<recordSpeak调用数> rs_avg_us=<recordSpeak平均> rs_max_us=<最大> cmd=<命令分支数> normal=<普通消息分支数>`。
