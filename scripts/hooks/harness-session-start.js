@@ -27,6 +27,8 @@ const ROOT = findRoot();
 const HARNESS_DIR = path.join(ROOT, '.harness');
 const STAGE_FILE = path.join(HARNESS_DIR, 'current-stage.json');
 const TOOL_COUNT_FILE = path.join(HARNESS_DIR, 'tool-count.json');
+// C-CTX-01: 新 session 清掉 directive 注入状态，确保新 session 第一次调用重新注入一次整段 directive
+const DIRECTIVE_STATE_FILE = path.join(HARNESS_DIR, 'directive-state.json');
 
 // VH-18 F3: 只在合法 Harness 项目根（worktree 或已存 .harness/）才
 // mkdir 自举。fallback-cwd（用户随便 cd 进的空目录）直接退出，不创建
@@ -64,6 +66,8 @@ if (shouldReset) {
     fs.writeFileSync(STAGE_FILE, initial + '\n');
     // 重置工具调用计数器（强制 AI 在首次工具调用前先输出阶段声明）
     fs.writeFileSync(TOOL_COUNT_FILE, JSON.stringify({ count: 0 }) + '\n');
+    // C-CTX-01: 清掉 directive 注入状态，让新 session 第一次调用重新注入整段 directive
+    try { fs.rmSync(DIRECTIVE_STATE_FILE, { force: true }); } catch {}
   } catch (e) {
     process.stderr.write(`[Harness Session Start] 初始化失败: ${e.message}\n`);
   }

@@ -69,6 +69,36 @@ PLAN → SETUP → EXECUTE → VERIFY → REVIEW → FEEDBACK
 - `/harness-off` — 临时关闭 Harness 模式
 - `/harness-on` — 重新启用
 
+## 工具调用稳定性（避免格式出错中断）
+
+### 头号根因：超长 session 上下文退化 → tool-call 信封格式崩坏（2026-06-08 排查）
+
+实测教训：在**一个跨多天、从不清空的长 session** 里，模型会越来越频繁地把工具调用的标记（`<invoke …>`）当成**纯文本**吐出来，而不是真正的结构化调用 → 工具不执行、回合空转 end_turn 结束 → 看起来「做一会就停下来 / 卡住」，被迫一遍遍打「继续」。模型自述症状是「老在开标签上漏字」。
+
+证据：单 session（claude-opus-4-8）死回合数随长度暴增 **06-06=1 → 06-07=10 → 06-08=28**，且聚集在上下文最深处（后 25% 占一多半）。峰值上下文 ~570K tokens。
+
+关键认知：**「等它自动 compact」救不了**——auto-compact 只在逼近 1M 窗口（~80%+）才触发，~570K 远没到阈值，于是卡在「已退化、却没触发安全网」的中间地带。
+
+应对（按优先级）：
+
+- **主动 compact / 开新 session，别等自动**：到 ~400K tokens（或察觉开始出现空转回合）就 `/compact` 或开新 session 继续。
+- **单 session 不要跨多天**：长跑的运维/守护任务（watchdog、连续观察）用后台脚本 + 日志承载，不要靠让一个对话 session 一直开着。
+- **降低每次工具调用的上下文灬注**：harness `harness-stage-guard.js` 已改为整段阶段 directive + LOG_REMINDER 每 (session, stage) 只注入一次（C-CTX-01），后续同阶段调用只留一行 `[Harness ON] 当前阶段` 简提醒（每次注入 ~1262B→124B）。
+- 一旦看到模型回复里出现裸 `<invoke>`/`<parameter>` 文本而工具没执行，立即 `/compact` 或重开，而不是反复「继续」。
+
+### 次要：`AskUserQuestion` payload 折叠
+
+实测教训（2026-06-06 session 复盘）：**`AskUserQuestion` 是反复出格式错的工具**，报错 `questions type is expected as array but provided as string`——模型把整个 `questions` 数组折叠成了一个（且往往已损坏的）JSON 字符串。触发条件高度一致：**payload 过大、过深嵌套**（长段中文 option 描述 + `preview` 里塞带换行和转义引号的多行命令）。
+
+避免方式：
+
+- `questions` / `options` 必须是真数组，**绝不整体序列化成字符串**
+- option 的 `description` 写短（一句话），**不要在 `preview` 里塞带转义引号的多行 shell/git 命令**——那串转义最容易让 JSON 写崩
+- 一个超大问题拆成多个小问题，单次 payload 越小越不会折叠
+- 真要展示多行命令，放进正文文本里问，别塞进 `preview` 字段
+
+> 注：这类错误模型会在 ~8s 后自动重试成功，不是硬中断，但浪费一轮、看着像卡住。缩小输入是最有效的规避。
+
 ## Harness 规则（自动加载，`.claude/rules/`）
 
 - `harness-entry.md` — 新 session banner + 入口

@@ -102,6 +102,8 @@ const TOOL_COUNT_FILE = path.join(ROOT, '.harness/tool-count.json');
 const STAGE_HISTORY_FILE = path.join(ROOT, '.harness/stage-history.jsonl');
 const PRETOOL_OBS_FILE = path.join(ROOT, '.harness/pretool-observations.jsonl');
 const INFRA_TIER_FILE = path.join(ROOT, '.harness/infra-tier.json');
+// C-CTX-01: 整段阶段 directive 只在每个 (session, stage) 注入一次的状态记录
+const DIRECTIVE_STATE_FILE = path.join(ROOT, '.harness/directive-state.json');
 
 // 验证证据文件——至少一个存在才算 VERIFY 做过
 const VERIFY_EVIDENCE = [
@@ -759,6 +761,24 @@ function recordStageHistory(stage) {
 }
 
 
+// C-CTX-01: 长 session 上下文退化会让模型把 tool-call 信封（<invoke> 标记）
+// 当成纯文本吐出，工具不执行、回合空转结束，看起来像"不断停下来"。根因日志见
+// 2026-06-08 排查（死回合数随 session 变长 1→10→28，聚集在上下文最深处）。
+// 缓解措施之一：把整段 STAGE_DIRECTIVES + LOG_REMINDER 从"每次工具调用注入"
+// 降为"每个 (session, stage) 只注入一次"。同 session 同阶段后续调用只留一行简提醒，
+// 避免 500+ 次重复灬注（~353-580 字符/次）撑大上下文、加速格式退化。
+// 每次工具调用仍有极简的 `[Harness ON] 当前阶段: X` 一行作为常驻提醒。
+function shouldInjectFullDirective(input, stage) {
+  const key = `${(input && input.session_id) || 'nosession'}:${stage}`;
+  let last = null;
+  try { last = JSON.parse(safeReadFileSync(DIRECTIVE_STATE_FILE) || 'null'); } catch {}
+  if (last && last.key === key) return false;
+  try {
+    fs.writeFileSync(DIRECTIVE_STATE_FILE, JSON.stringify({ key, t: new Date().toISOString() }) + '\n');
+  } catch {}
+  return true;
+}
+
 function readStructuredVerifyEvidence() {
   const jsonPath = path.join(ROOT, '.harness/verify-evidence.json');
   try {
@@ -960,9 +980,15 @@ process.stdin.on('end', () => {
         }
 
         // 首次工具调用检查：强制 AI 先输出阶段声明
+        // 只读工具（Read/Grep/Glob/WebFetch/WebSearch + 只读 Bash）豁免——纯探索无副作用，
+        // 不应在每个新 session 开头被拦一次（用户反馈：只读探索被首次拦截最像误报中断）。
+        // 不豁免也不递增计数器：让 block 留到第一个写/执行类工具（Edit/Write/Agent/写 Bash），
+        // 强制声明纪律保留在真正动手那一步。TASK_TOOLS 沿用原有豁免。
         let toolCount = { count: 999 }; // 默认跳过（文件不存在时不阻止）
         try { toolCount = JSON.parse(fs.readFileSync(TOOL_COUNT_FILE, 'utf8')); } catch {}
-        if (toolCount.count === 0 && !TASK_TOOLS.includes(toolName)) {
+        const isReadOnlyForFirstCall = READ_TOOLS.includes(toolName) ||
+          (toolName === 'Bash' && isPlanReadOnlyBash(input.tool_input?.command));
+        if (toolCount.count === 0 && !TASK_TOOLS.includes(toolName) && !isReadOnlyForFirstCall) {
           // 递增计数器，下次不再阻止
           try { fs.writeFileSync(TOOL_COUNT_FILE, JSON.stringify({ count: 1 }) + '\n'); } catch {}
           return denyPreToolUse(input, FIRST_CALL_BLOCK);
@@ -978,9 +1004,13 @@ process.stdin.on('end', () => {
             (isPatchTool(toolName) && (patchTouchesOnlyHarnessPlan(input) || patchTouchesOnlyIterationSpec(input) || patchTouchesOnlyHarnessStage(input)));
 
           if (isReadTool || isReadOnlyBash) {
-            // 读操作 / 只读 Bash 放行，注入 directive
-            process.stderr.write(STAGE_DIRECTIVES.PLAN);
-            process.stderr.write(LOG_REMINDER);
+            // 读操作 / 只读 Bash 放行。整段 PLAN directive 每 (session,stage) 只注入一次（C-CTX-01）
+            if (shouldInjectFullDirective(input, 'PLAN')) {
+              process.stderr.write(STAGE_DIRECTIVES.PLAN);
+              process.stderr.write(LOG_REMINDER);
+            } else {
+              process.stderr.write('[PLAN] 只读探索放行（PLAN 阶段；完整要求见本阶段首次提示）。用户确认计划前不要改代码。\n');
+            }
           } else if (isTaskTool) {
             // 任务管理工具放行，不打扰（流程管理操作）
           } else if (isAllowedWrite) {
@@ -1002,7 +1032,9 @@ process.stdin.on('end', () => {
           // 这里保留 TaskUpdate 作为 TASK_TOOLS 成员（放行流程 + 跳过 first-call guard），
           // 但不再在 PreToolUse:TaskUpdate 分支做 completed 检测，避免和 TaskCompleted 重复提醒。
 
-          if (STAGE_DIRECTIVES[data.stage]) {
+          // 整段阶段 directive + LOG_REMINDER 每 (session,stage) 只注入一次（C-CTX-01）。
+          // 上方 `[Harness ON] 当前阶段: X` 一行作为每次调用的常驻提醒。
+          if (STAGE_DIRECTIVES[data.stage] && shouldInjectFullDirective(input, data.stage)) {
             process.stderr.write(STAGE_DIRECTIVES[data.stage]);
             process.stderr.write(LOG_REMINDER);
           }
