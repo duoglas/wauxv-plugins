@@ -1,1 +1,1 @@
-{"stage":"OFF","since":"2026-06-06T01:42:00.000Z","reason":"用户执行 /harness-off"}
+{"stage":"EXECUTE","since":"2026-06-08T08:43:10.000Z","task":"取证: 潜水统计今天两群把发言者误判潜水的根因(只读DB/perf.log)"}
