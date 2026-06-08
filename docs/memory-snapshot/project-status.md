@@ -13,10 +13,12 @@ metadata:
 工作目录 = `~/Dropbox/ops-work/android-ops`（多 Mac 经 Dropbox 同步）。新 session 先 `bash scripts/bootstrap.sh`（自识别机器/adb/scrcpy/手机/root/版本 + 本机记忆为空时从 `docs/memory-snapshot/` 自动 seed）。详见 `docs/ONBOARDING.md`。**写了新记忆后要 `cp ~/.claude/.../memory/*.md docs/memory-snapshot/` 同步回快照**，否则别的机器接不到。
 
 ## 当前部署版本（真机已上）
-- **GroupAdmin v1.17.2**：在 v1.16.3(onLoad 冷启动健壮化 C-PLUGIN-05/VH-02)之上:
+- **GroupAdmin v1.18.0**：在 v1.16.3(onLoad 冷启动健壮化 C-PLUGIN-05/VH-02)之上:
   - v1.17.0 **管理员时效**:加管理可选永久/N天,并行键 `admin_exp_<gid>`(未设=永久,向后兼容);到期惰性清除 `purgeExpiredAdmins`(管理函数入口,不进热路径);@命令 `@TA 管理员 [N]` + Dialog 天数双入口;Dialog 加删静默、群@命令保留群消息。
   - v1.17.1 列表/群消息文案「**有效期至** yyyy-MM-dd」(adminExpiryLabel 同源)。
   - v1.17.2 **@所有人(notify@all)不能踢** — @路径踢/请前置守卫 `_isAtAll`(标记真机待最终确认)。
+  - **v1.18.0 潜水误判修复(2026-06-08)**:非文本消息(图片/表情/语音/红包/文件)`getContent()` 空, 原在 onHandleMsgBody 入口 isText 闸门早退、走不到 ~2188 行 recordSpeak → 只发非文本的人 last_speak 永空被 `#潜水` 误判潜水。修复=早退点前先记一次发言活动(只调 talker/sendTalker/isGroupEnabled缓存/recordSpeak O(1), 不调 getQuoteMsg, try/catch, 与主路径互斥)。真机实测纯图片使 owner last_speak 推进。**冒泡=任意消息类型**。详见 SPEC §3/§6.10。
+  - **全群基线重置(2026-06-08 17:19)**:应用户要求"从今天起算", 停微信→`UPDATE speak SET first_seen=now`(全 8 群所有行, **last_speak 保留**)→推回→重启验证。真机留底 `groupadmin.db.before-baseline-reset-20260608`。**预期**:之后 N 天 `#潜水 N` 基本空(全员新成员豁免期), N 天后从今天起没冒泡的人才上榜。
   - GroupAdmin 重启即加载。
 - **RedPacketStats v1.9.2**：v1.6.4 基础上累积 包类型(§22)/设置页拆分(§23)/转发对象按群(§24)。
   - 包类型 普通/定制(v1.7.x):定制开关(仅 Dialog)+关键字(**包含匹配**)+定制档表;worker 判定零热路径;定制第一条用定制前缀、第二条「【查包】定制包」。
