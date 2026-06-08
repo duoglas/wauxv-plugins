@@ -1,4 +1,6 @@
-// GroupAdmin v1.16.3 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.17.2 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+//   - v1.17.2: 踢人安全 — @所有人(notify@all)不能踢 (@路径踢/请动作前置守卫 _isAtAll)
+//   - v1.17.1: 管理员时效标签文案 "失效 X" → "有效期至 X"(列表/群消息同源 adminExpiryLabel)
 // 完整命令清单见 README.md 或 WAuxiliary 主面板插件列表 → 设置 (openSettings)
 // 重要变化历程:
 //   - v1.7: 潜水成员清理 (#潜水 N / #踢潜水) + bot 群管权限自检 (#群权限自检)
@@ -29,6 +31,12 @@
 //   - v1.16.3: [健壮性/C-PLUGIN-05] onLoad 防御登录态未就绪——getLoginWxid 安全取值 (取不到用占位串, 日志永不抛) +
 //              关键初始化分段 try/catch (日志块/延迟基线调度块/flush 循环启动块互不连坐); 修 VH-02 冷启动
 //              getLoginWxid 抛 NoResetUinStack 导致 onLoad 第一行中断、flush 循环不启动而丢脏增量。仅动 onLoad, 不碰热路径。
+//   - v1.17.0: [管理员时效] 加管理员可选 永久 / N 天到期: 新增 per-group 键 admin_exp_<gid> (CSV wxid:到期毫秒;...,
+//              只存有时效者, 不在其中=永久 → admins_<gid> 格式不动, 老数据全是永久, 完全向后兼容);
+//              管理员列表 (群命令 showAdmins + Dialog _adminRow) 显示 "永久"/"失效 yyyy-MM-dd";
+//              到期惰性清除 purgeExpiredAdmins (仅在 isAuthorized/showAdmins/showAdminListDialog 等管理函数入口跑, 绝不进每条消息热路径);
+//              @命令尾随天数: `@TA 管理员 7` = 7天 (仅"管理员"动作识别尾随整数, 其它动作不变); 引用回复路径同样支持;
+//              Dialog 加天数 EditText (空=永久)。Dialog 路径保持静默(只 toast); 群 @命令路径保留群消息(含时长/失效日期)。
 // 不再过滤 isSend() — 机器人账号自己发命令也响应
 
 import java.util.*;
@@ -1721,8 +1729,104 @@ boolean isAdminInGroup(String groupId, String wxid) {
     return getAdmins(groupId).contains(wxid);
 }
 
+// ===== v1.17.0 管理员时效 (admin_exp_<gid>) =====
+// 存储: CSV "wxid:到期毫秒;wxid:到期毫秒"。只存有时效的; 不在表里的管理员 = 永久。
+// admins_<gid> 格式完全不动 → 老数据无 exp 记录 = 永久, 向后兼容。
+// 全部 helper try/catch(Throwable), 异常退化为 0(永久), 绝不抛回微信。
+java.util.Map _parseAdminExp(String groupId) {
+    java.util.HashMap m = new java.util.HashMap();
+    try {
+        String raw = getString("admin_exp_" + normGroupId(groupId), "");
+        if (raw == null || raw.isEmpty()) return m;
+        String[] parts = raw.split(";");
+        for (int i = 0; i < parts.length; i++) {
+            String p = parts[i].trim();
+            if (p.isEmpty()) continue;
+            int idx = p.lastIndexOf(":");
+            if (idx <= 0 || idx >= p.length() - 1) continue;
+            String w = p.substring(0, idx).trim();
+            String ms = p.substring(idx + 1).trim();
+            if (w.isEmpty()) continue;
+            try { m.put(w, new Long(Long.parseLong(ms))); } catch (Throwable t) {}
+        }
+    } catch (Throwable t) {}
+    return m;
+}
+void _saveAdminExp(String groupId, java.util.Map m) {
+    try {
+        StringBuilder sb = new StringBuilder();
+        java.util.Iterator it = m.keySet().iterator();
+        boolean first = true;
+        while (it.hasNext()) {
+            String w = (String) it.next();
+            Long v = (Long) m.get(w);
+            if (w == null || w.isEmpty() || v == null) continue;
+            if (!first) sb.append(";");
+            sb.append(w).append(":").append(v.longValue());
+            first = false;
+        }
+        putString("admin_exp_" + normGroupId(groupId), sb.toString());
+    } catch (Throwable t) {}
+}
+// 返回到期毫秒; 0 = 永久/无记录。
+long getAdminExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return 0L;
+        Long v = (Long) _parseAdminExp(groupId).get(wxid);
+        return v == null ? 0L : v.longValue();
+    } catch (Throwable t) { return 0L; }
+}
+void setAdminExpiry(String groupId, String wxid, long millis) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseAdminExp(groupId);
+        m.put(wxid, new Long(millis));
+        _saveAdminExp(groupId, m);
+    } catch (Throwable t) {}
+}
+void clearAdminExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseAdminExp(groupId);
+        if (m.remove(wxid) != null) _saveAdminExp(groupId, m);
+    } catch (Throwable t) {}
+}
+// 显示标签: "永久" 或 "有效期至 yyyy-MM-dd"。
+String adminExpiryLabel(String groupId, String wxid) {
+    try {
+        long exp = getAdminExpiry(groupId, wxid);
+        if (exp <= 0L) return "永久";
+        String d = new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp));
+        return "有效期至 " + d;
+    } catch (Throwable t) { return "永久"; }
+}
+// 惰性到期清除: 遍历 getAdmins, 对有 exp 且已过期者 → 从 admins 移除 + clearAdminExpiry, 变更则落盘。
+// 静默 (不发群消息)。★ 只在管理相关函数 (isAuthorized/showAdmins/showAdminListDialog) 入口调用, 绝不进每条消息热路径 (C-PERF-01)。
+void purgeExpiredAdmins(String groupId) {
+    try {
+        java.util.Map m = _parseAdminExp(groupId);
+        if (m.isEmpty()) return;   // 无任何时效记录 → 无可清除 (老数据/纯永久群直接返回, 零开销)
+        long now = System.currentTimeMillis();
+        List admins = getAdmins(groupId);
+        boolean changed = false;
+        for (int i = admins.size() - 1; i >= 0; i--) {
+            String w = (String) admins.get(i);
+            Long v = (Long) m.get(w);
+            if (v != null && now >= v.longValue()) {
+                admins.remove(i);
+                clearAdminExpiry(groupId, w);
+                changed = true;
+            }
+        }
+        if (changed) setAdmins(groupId, admins);
+    } catch (Throwable t) {}
+}
+
 // v1.12: 严格模式收紧到仅群主, 否则等价本群管理员
 boolean isAuthorized(String groupId, String wxid) {
+    // v1.17.0 惰性到期清除: 此函数仅在命令/@动作/引用动作路径被调 (非每条普通消息),
+    // 且 purgeExpiredAdmins 对无时效记录的群直接 return (零开销), 不违反 C-PERF-01。
+    try { purgeExpiredAdmins(groupId); } catch (Throwable t) {}
     if (isStrictMode()) return isOwner(wxid);
     return isAdminInGroup(groupId, wxid);
 }
@@ -1829,9 +1933,9 @@ void onLoad() {
         String _owner;
         try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
         if (_owner == null) _owner = "(login pending)";
-        log("GroupAdmin v1.16.3 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
+        log("GroupAdmin v1.17.2 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
     } catch (Throwable t) {
-        try { log("GroupAdmin v1.16.3 onLoad log block err: " + t); } catch (Throwable t2) {}
+        try { log("GroupAdmin v1.17.0 onLoad log block err: " + t); } catch (Throwable t2) {}
     }
 
     // [C-PLUGIN-05] 延迟基线调度块: 本身不依赖 getLoginWxid; 单独 try/catch 互不连坐。
@@ -1851,7 +1955,7 @@ void onLoad() {
                     int added = initFirstSeenBaseline(g);
                     if (added > 0) { touched++; totalAdded += added; }
                 }
-                log("GroupAdmin v1.16.3 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+                log("GroupAdmin v1.17.2 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
                 // _probeGroupInfoAPI();
             }
         });
@@ -2217,17 +2321,35 @@ void onHandleMsgBody(Object msg) {
     // 注意: 普通文本聊天的 split + isActionTok 都是纯内存/字符串判定 (无 IO/getQuoteMsg), 末尾非动作词立即 return (C-PERF-01)。
     String[] tokens = content.split("[\\s\\u2005\\u00A0]+");
     String lastTok = tokens.length > 0 ? tokens[tokens.length - 1].trim() : "";
+
+    // v1.17.0: 仅对"管理员"动作识别尾随天数 (`@TA 管理员 7` → 动作="管理员" days=7)。
+    // 纯字符串/内存判定, 仅在末尾命中"管理员"时才解析整数; 其它动作完全不变 (C-PERF-01: 不进普通消息热路径)。
+    int actDays = 0;
+    if (!isActionTok(lastTok) && tokens.length >= 2) {
+        String prev = tokens[tokens.length - 2].trim();
+        if (prev.equals("管理员") && _isPosIntTok(lastTok)) {
+            try { actDays = Integer.parseInt(lastTok); } catch (Throwable t) { actDays = 0; }
+            if (actDays > 0) lastTok = "管理员";   // 改写动作词为"管理员", 带 days
+        }
+    }
     boolean isAction = isActionTok(lastTok);
 
     boolean hasAt = atList != null && atList.size() > 0;
 
     if (hasAt) {
-        // ===== @ 路径 (原行为完全不变) =====
+        // ===== @ 路径 (原行为完全不变, 仅"管理员"动作多透传 days) =====
         if (!isAction) return;
         // T1 埋点: @ 动作是命令, 之前误记为 normal, 回拨到 cmd (二者互斥)。
         if (!_perfCmd) { try { PERF_NORMAL_N--; PERF_CMD_N++; _perfCmd = true; } catch (Throwable t) {} }
 
         if (!isAuthorized(groupId, sender)) return;       // 非管理员/群主静默 (严格模式仅群主)
+
+        // v1.17.2: 踢人若 @所有人 则拒绝 (防误踢/无意义目标)。
+        if (lastTok.equals("踢") || lastTok.equals("请")) {
+            boolean atAll = false;
+            for (int i = 0; i < atList.size(); i++) { if (_isAtAll((String) atList.get(i))) { atAll = true; break; } }
+            if (atAll) { sendText(groupId, "❌ 不能对 @所有人 执行踢人"); return; }
+        }
 
         // 取第一个非自己的 @ 作为 target
         String me = getLoginWxid();
@@ -2240,7 +2362,7 @@ void onHandleMsgBody(Object msg) {
             sendText(groupId, "❌ 请 @ 你要操作的对象");
             return;
         }
-        dispatchAction(groupId, sender, target, lastTok);
+        dispatchAction(groupId, sender, target, lastTok, actDays);
         return;
     }
 
@@ -2276,6 +2398,7 @@ void onHandleMsgBody(Object msg) {
 
     // 从 <title> 提取回复文本 → 取末尾 token 作动作词 (与 @ 路径同一套 split: 空白 / U+2005 / U+00A0)。
     String actionTok = "";
+    int qDays = 0;   // v1.17.0: 引用路径"管理员"动作尾随天数
     try {
         java.util.regex.Matcher m = java.util.regex.Pattern
             .compile("<title>(.*?)</title>", java.util.regex.Pattern.DOTALL)
@@ -2285,6 +2408,14 @@ void onHandleMsgBody(Object msg) {
             if (title != null) {
                 String[] tt = title.trim().split("[\\s\\u2005\\u00A0]+");
                 if (tt.length > 0) actionTok = tt[tt.length - 1].trim();
+                // 仅"管理员"动作识别尾随天数 (`引用 管理员 7`); 其它动作不变。
+                if (!isActionTok(actionTok) && tt.length >= 2) {
+                    String prev = tt[tt.length - 2].trim();
+                    if (prev.equals("管理员") && _isPosIntTok(actionTok)) {
+                        try { qDays = Integer.parseInt(actionTok); } catch (Throwable t2) { qDays = 0; }
+                        if (qDays > 0) actionTok = "管理员";
+                    }
+                }
             }
         }
     } catch (Throwable t) { actionTok = ""; }
@@ -2299,7 +2430,25 @@ void onHandleMsgBody(Object msg) {
 
     // ★ 权限/保护与 @ 路径完全相同: 先 isAuthorized 静默闸门, 再走 dispatchAction (内含 ownerOnly + canActOn)。
     if (!isAuthorized(groupId, sender)) return;       // 非授权者引用发动作 → 静默拒绝 (防探测)
-    dispatchAction(groupId, sender, qTarget, actionTok);
+    dispatchAction(groupId, sender, qTarget, actionTok, qDays);
+}
+
+// v1.17.0: 判断 token 是否为纯正整数 (用于"管理员"尾随天数解析)。纯字符串判定, 无 IO。
+boolean _isPosIntTok(String s) {
+    if (s == null || s.isEmpty()) return false;
+    for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+// v1.17.2: 判断 @列表项是否为 @所有人 (WeChat 系统标记 notify@all, 含 @all; 兼容字面"所有人")。纯字符串判定。
+boolean _isAtAll(String w) {
+    if (w == null) return false;
+    String s = w.trim();
+    if (s.isEmpty()) return false;
+    return s.equals("notify@all") || s.indexOf("@all") >= 0 || s.indexOf("所有人") >= 0;
 }
 
 // 动作关键词集 (与 @ / 引用路径共用)。
@@ -2327,6 +2476,10 @@ boolean isOwnerOnlyTok(String lastTok) {
 // 调用前提: caller 已通过 isAuthorized(groupId,sender) 闸门。
 // 各 do* 内部仍各自做 canActOn(保护名单/原生群主/层级)校验 → 破坏性动作权限不被任何入口绕过。
 void dispatchAction(String groupId, String sender, String target, String lastTok) {
+    dispatchAction(groupId, sender, target, lastTok, 0);
+}
+// v1.17.0: days 仅对"管理员"动作有意义 (永久=0 / N天), 其它动作忽略。
+void dispatchAction(String groupId, String sender, String target, String lastTok, int days) {
     // 群主专属命令: 与 @ 路径一致的 ownerOnly 校验。
     if (isOwnerOnlyTok(lastTok) && !isOwner(sender)) {
         sendText(groupId, "❌ 此命令仅群主可用");
@@ -2341,7 +2494,7 @@ void dispatchAction(String groupId, String sender, String target, String lastTok
     else if (lastTok.equals("清零"))                            { doWarnClear(groupId, sender, target); }
     else if (lastTok.equals("警告-1") || lastTok.equals("警告减1")) { doWarnDec(groupId, sender, target); }
     else if (lastTok.equals("警告详情"))                        { doWarnDetail(groupId, target); }
-    else if (lastTok.equals("管理员"))                          { doAddAdmin(groupId, target); }
+    else if (lastTok.equals("管理员"))                          { doAddAdmin(groupId, target, days); }
     else if (lastTok.equals("移除管理"))                        { doDelAdmin(groupId, target); }
     else if (lastTok.equals("保护"))                            { doProtect(groupId, sender, target); }
     else if (lastTok.equals("取消保护"))                        { doUnprotect(groupId, sender, target); }
@@ -2599,7 +2752,9 @@ void doSetWarnKick(String groupId, String content) {
     else sendText(groupId, "✅ 本群警告上限已设为 " + actual + " 次自动踢");
 }
 
-void doAddAdmin(String groupId, String target) {
+// 群命令路径: 保留群消息 (含时长信息)。无参/days<=0 = 永久 (向后兼容原行为)。
+void doAddAdmin(String groupId, String target) { doAddAdmin(groupId, target, 0); }
+void doAddAdmin(String groupId, String target, int days) {
     if (target.equals(getLoginWxid())) { sendText(groupId, "❌ 机器人账号已是群主, 不需要再加管理"); return; }
     if (isOwner(target))  { sendText(groupId, "❌ 该用户已是群主"); return; }
     List admins = getAdmins(groupId);
@@ -2607,13 +2762,20 @@ void doAddAdmin(String groupId, String target) {
         admins.add(target);
         setAdmins(groupId, admins);
     }
-    sendText(groupId, "🛡 已加为管理员: " + lookupName(target, groupId));
+    // v1.17.0: days>0 → 设到期; days<=0 → 永久 (清除可能残留的旧时效)
+    if (days > 0) setAdminExpiry(groupId, target, System.currentTimeMillis() + (long) days * 86400000L);
+    else clearAdminExpiry(groupId, target);
+    String suffix;
+    if (days > 0) suffix = " (" + days + "天, " + adminExpiryLabel(groupId, target) + ")";
+    else suffix = " (永久)";
+    sendText(groupId, "🛡 已加为管理员: " + lookupName(target, groupId) + suffix);
 }
 
 void doDelAdmin(String groupId, String target) {
     List admins = getAdmins(groupId);
     if (admins.remove(target)) {
         setAdmins(groupId, admins);
+        clearAdminExpiry(groupId, target);   // v1.17.0: 清理残留时效
         sendText(groupId, "✅ 已移除管理: " + lookupName(target, groupId));
     } else {
         sendText(groupId, "❌ 该用户不是管理员");
@@ -2684,6 +2846,7 @@ void showBlacklist(String groupId) {
 }
 
 void showAdmins(String groupId) {
+    try { purgeExpiredAdmins(groupId); } catch (Throwable t) {}   // v1.17.0 惰性到期清除 (命令路径, 低频)
     StringBuilder sb = new StringBuilder();
     // 群主段
     sb.append("👑 群主:\n");
@@ -2702,7 +2865,9 @@ void showAdmins(String groupId) {
     if (!admins.isEmpty()) {
         sb.append("\n🛡 管理员:\n");
         for (int i = 0; i < admins.size(); i++) {
-            sb.append("· ").append(lookupName((String) admins.get(i), groupId)).append("\n");
+            String aw = (String) admins.get(i);
+            sb.append("· ").append(lookupName(aw, groupId))
+              .append(" (").append(adminExpiryLabel(groupId, aw)).append(")\n");
         }
     }
     sendText(groupId, sb.toString());
@@ -3038,13 +3203,16 @@ android.widget.LinearLayout _adminRow(Activity ctx, String groupId, String wxid,
     final String fGroupId = groupId;
     final String fWxid = wxid;
     final AlertDialog[] fDh = dh;
-    android.widget.LinearLayout row = _gaRow(ctx, lookupName(fWxid, fGroupId), fWxid, "移除", "#FF6B6B");
+    // v1.17.0: 副标题显示 失效日期/永久 (替代原来只显示 wxid; wxid 仍拼在前)
+    String sub = fWxid + " · " + adminExpiryLabel(fGroupId, fWxid);
+    android.widget.LinearLayout row = _gaRow(ctx, lookupName(fWxid, fGroupId), sub, "移除", "#FF6B6B");
     android.view.View act = row.getChildAt(1);
     act.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
             List l = getAdmins(fGroupId);
             l.remove(fWxid);
             setAdmins(fGroupId, l);
+            clearAdminExpiry(fGroupId, fWxid);   // v1.17.0: 清理残留时效
             toast("已移除本群管理员");
             if (fDh[0] != null) fDh[0].dismiss();
             showAdminListDialog(fGroupId);
@@ -3076,6 +3244,7 @@ android.widget.LinearLayout _ownerRow(Activity ctx, String returnGroupId, String
 void showAdminListDialog(String groupId) {
     Activity ctx = getTopActivity();
     if (ctx == null) return;
+    try { purgeExpiredAdmins(groupId); } catch (Throwable t) {}   // v1.17.0 惰性到期清除 (Dialog 路径, 低频)
     final String fGroupId = groupId;
     final AlertDialog[] dh = new AlertDialog[1];
 
@@ -3111,14 +3280,34 @@ void showAdminListDialog(String groupId) {
     root.addView(inp);
     _gaSpacer(root, ctx, 6 * dp);
 
+    // v1.17.0: 天数输入 (空=永久)
+    final android.widget.EditText dayInp = new android.widget.EditText(ctx);
+    dayInp.setHint("天数(空=永久)");
+    dayInp.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+    dayInp.setTextColor(_gaC("#E8E9EC"));
+    dayInp.setHintTextColor(_gaC("#7C828E"));
+    dayInp.setBackground(_gaRound("#252934", 12));
+    dayInp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    dayInp.setTextSize(14);
+    root.addView(dayInp);
+    _gaSpacer(root, ctx, 6 * dp);
+
     android.widget.Button addBtn = _gaBtn(ctx, "➕ 添加本群管理员", "#5CB6FF");
     addBtn.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
             String w = inp.getText().toString().trim();
             if (w.isEmpty()) { toast("请输入 wxid"); return; }
+            // v1.17.0: 解析天数 (空/非正整数 = 永久), Dialog 路径保持静默 (只 toast, 不发群)
+            int days = 0;
+            try {
+                String ds = dayInp.getText().toString().trim();
+                if (!ds.isEmpty() && _isPosIntTok(ds)) { int n = Integer.parseInt(ds); if (n > 0) days = n; }
+            } catch (Throwable t) { days = 0; }
             List l = getAdmins(fGroupId);
             if (!l.contains(w)) { l.add(w); setAdmins(fGroupId, l); }
-            toast("已添加本群管理员");
+            if (days > 0) setAdminExpiry(fGroupId, w, System.currentTimeMillis() + (long) days * 86400000L);
+            else clearAdminExpiry(fGroupId, w);
+            toast(days > 0 ? ("已添加本群管理员 (" + days + "天)") : "已添加本群管理员 (永久)");
             if (dh[0] != null) dh[0].dismiss();
             showAdminListDialog(fGroupId);
         }
