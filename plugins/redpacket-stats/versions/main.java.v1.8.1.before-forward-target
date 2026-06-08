@@ -1,6 +1,3 @@
-// RedPacketStats — v1.9.1 — 转发对象 全局→按群 §24: rp_export_target_<gid>/name + cfgExportTargetFor 回退全局默认 + rpBuildGroupedMsgs 带 grp、发送按群路由到各自目标 + 通知只讲当前群。
-// RedPacketStats — v1.9.2 — 在 v1.9.1 之上: 每日定时开关 + 推送时间(全局)迁入「📮 转发对象」子页 (SPEC §24/§20) — 转发对象页加「📅 本群每日定时」开关(即时生效 enable/disableDailyGroup) + 「⏰ 每日推送时间」EditText(子页💾保存校验 0-23 写 K_DAILY_HOUR); 基础开关页(showPageBasic)移走每日定时 toggle, 只留「本群启用」。定时开关函数/cfgDailyHour 夹取/存储键 不动, 只动 Dialog 展示层, worker/onHandleMsg 热路径零改。
-// RedPacketStats — v1.9.0 — 在 v1.8.1 之上: 转发对象可选好友/群 (SPEC §24) — getFriendList/getGroupList 选择器 + rp_export_target_name(显示名) + 设置后通知(sendForwardNotice)。后台线程加载 list, Handler 回主线程弹单选 AlertDialog 防 ANR。只动 Dialog(showPageForward 入口)+发送层; 每日定时/手动导出沿用 cfgExportTarget() 逻辑不动, onHandleMsg 热路径零改。
 // RedPacketStats — v1.8.1 — 在 v1.8.0 之上: 修主菜单「关闭」失效(对话框堆叠—入口按钮开子页前先 dismiss 主菜单, menuHolder 捕获) + 排除名单显示名字(rpSenderName 群名片/昵称, 「昵称（…尾4）」)。
 // RedPacketStats — v1.8.0 — 在 v1.7.2 之上: 设置页拆分 (SPEC §23) — 原单一长 ScrollView 配置 Dialog 拆为「主菜单 + 二级子页」。只动 Dialog 展示层 (worker/onHandleMsg 热路径/文字命令/存储键 全不动)。
 //                            主菜单(showConfigDialog): 状态摘要 + 入口按钮; 子页 showPageBasic/showPageNormalTiers/showPageCustom/showPageDelay/showPageExclude, 各页只写本页 key, 保存/返回回主菜单。导出为主菜单直接动作(不进子页)。每页/骨架整段 try/catch, 只构建 Dialog 无 UI 遍历(§7)。
@@ -268,8 +265,7 @@ String K_AT_LIMIT = "rp_at_limit";
 String K_MSG_GAP = "rp_msg_min_gap_sec";          // 同群两条红包提醒最小间隔(秒, v1.0.6 §13.3)
 String K_TWO_MSG_GAP = "rp_two_msg_gap_sec";      // v1.1.4 §16: 同一次提醒内第一条(引用群规)与第二条(@)之间的延迟(秒)
 String K_EXCLUDE_PREFIX = "rp_exclude_";          // 按群排除名单前缀: rp_exclude_<groupId> (CSV wxid, v1.0.6 §12)
-String K_EXPORT_TARGET = "rp_export_target";      // v1.3.0 §18: 导出今日红包统计私聊目标 wxid (好友 wxid 或群 xxx@chatroom, v1.9.0 §24)
-String K_EXPORT_TARGET_NAME = "rp_export_target_name";  // v1.9.0 §24.1: 转发目标显示名 (供 Dialog/状态展示; 类型由 id 是否含 @chatroom 区分, 不另存)
+String K_EXPORT_TARGET = "rp_export_target";      // v1.3.0 §18: 导出今日红包统计私聊目标 wxid
 // v1.4.0 §20: 每日定时统计 (7点-7点窗口, worker-tick 触发, 私聊导出目标)。
 String K_DAILY_GROUPS = "rp_daily_groups";        // 开了每日定时的群 (CSV groupId), 与红包统计开关独立
 String K_DAILY_MIGRATED = "rp_daily_migrated";    // 一次性迁移 flag: 首次加载把 daily_groups 初始化=当前 enabled_groups
@@ -364,11 +360,6 @@ long inflightStartMs = 0L;
 // 同群红包提醒上次发送时间 (groupId -> lastSentMs), 用于 @ 限频 (v1.0.6 §13.3, 内存, 不落盘)
 java.util.Map RP_LAST_MSG = java.util.Collections.synchronizedMap(new java.util.HashMap());
 
-// v1.9.0 §24.2: 好友/群 list 缓存 (getFriendList()/getGroupList() 可能慢; 首次用时后台线程加载, 简单不主动失效)。
-// 只在「转发对象」子页后台线程读写, 不碰热路径 (C-PERF-01/03)。null = 尚未加载。
-java.util.List sCachedFriendList = null;
-java.util.List sCachedGroupList = null;
-
 String HB_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/rp.log";
 
 // ==================== v1.4.0: 轻量 perf 埋点 (仿 GroupAdmin; 为明早性能分析) ====================
@@ -421,7 +412,7 @@ int HB_MSG_TYPE = 436207665;
 String[] DETAIL_TEXTS = {"看看大家的手气", "查看领取详情"};
 
 void onLoad() {
-    try { log("RedPacketStats v1.9.2 loaded."); } catch (Throwable t) {}
+    try { log("RedPacketStats v1.8.1 loaded."); } catch (Throwable t) {}
     // 旧毫秒键废弃, 清空避免残留混淆 (新键 rp_first_sec/rp_retry1_sec/rp_retry2_sec 为秒)
     try { putString("rp_delay_ms", ""); putString("rp_retry1_ms", ""); putString("rp_retry2_ms", ""); } catch (Throwable t) {}
     if (HOOKED) { try { log("RedPacketStats hook already registered, skip."); } catch (Throwable t) {} return; }
@@ -444,7 +435,7 @@ void onLoad() {
         // v1.4.0 §20: 每日定时迁移 (一次性) — 首次把 rp_daily_groups 初始化 = 当前 rp_enabled_groups。
         try { rpDailyMigrateOnce(); } catch (Throwable t) {}
         try { log("RedPacketStats Activity.onResume hooked + onHandleMsg redpacket-stats enabled."); } catch (Throwable t) {}
-        hbBgLog("[RP] " + hbNow() + " v1.9.2 loaded (每日定时开关+推送时间(全局)迁入「📮 转发对象」子页 §24/§20: showPageForward 加 📅本群每日定时开关(即时 enable/disableDailyGroup→刷新本页)+⏰每日推送时间 EditText(子页💾保存校验 0-23 写 K_DAILY_HOUR 全局); showPageBasic 移走每日定时 toggle 只留本群启用; 定时开关函数/cfgDailyHour 夹取/存储键不动, 只动 Dialog 展示层, worker/onHandleMsg 热路径零改).\nv1.9.1 loaded (转发对象 全局→按群 §24: rp_export_target_<gid>/name_<gid> + cfgExportTargetFor/NameFor 回退全局默认(向后兼容: 未设群=旧行为); rpApplyForwardTarget(groupId,...) 写按群键 + rpPickTarget/showPageForward 作用当前群; rpBuildGroupedMsgs 返回 List<Object[]{grp,msg}>, rpExportToday/rpDailySend 发送循环按 cfgExportTargetFor(grp) 路由到各自目标, 无达标心跳仍发全局默认; sendForwardNotice(groupId,target) 通知只讲当前群; 状态/子页按群显示; worker/检测/写库/onHandleMsg 热路径零改).\nv1.9.0 loaded (转发对象可选好友/群 §24: getFriendList/getGroupList 选择器 + rp_export_target_name + 设置后通知 sendForwardNotice; 后台线程加载 list+Handler 回主线程弹单选 AlertDialog 防 ANR(§7), sCachedFriendList/sCachedGroupList 缓存; 只动 Dialog(showPageForward 入口)+发送层, 每日定时/手动导出仍用 cfgExportTarget() 逻辑不动, onHandleMsg 热路径零改).\nv1.8.1 loaded (修主菜单关闭失效=对话框堆叠(menuHolder 捕获, 入口按钮开子页前 dismiss 主菜单)+排除名单显示名字(rpSenderName, 昵称（…尾4）); 仍只动 Dialog 层).\nv1.8.0 loaded (设置页拆分 §23: 主菜单 showConfigDialog(状态摘要+入口按钮) + 二级子页 showPageBasic/NormalTiers/Custom/Delay/Exclude, 每子页只写本页 key, 保存/返回回主菜单, 导出为主菜单直接动作; 只动 Dialog 展示层, worker/onHandleMsg 热路径/文字命令/存储键/校验/即时生效逻辑全不动, 只构建 Dialog 无 UI 遍历 §7, 每页整段 try/catch).\nv1.7.2 loaded (定制包第二条@消息【查包】前缀加「定制包」→【查包】定制包, §22.6, isCustom?checkPrefix; 其余不动).\nv1.7.1 loaded (定制判定 前缀→包含 §22.2: rpIsCustom title.contains(kw)(原 startsWith), 修「【定制】…」被【】包裹漏判; 定制包第一条群规文本 §22.6: rp_custom_rule_prefix_<gid>(默认「定制包请按要求执行」)+cfgCustomRulePrefix, hbTierAndSend 第一条前缀 isCustom?定制:普通, 各档仍「，过{阈值}元{动作}」(定制档表); 第二条@/【查包】机制一行不动; 命令 定制群规前缀 <文字>+Dialog 定制区块「定制群规前缀」+状态增显; 限频/排除/分档/两条消息骨架/抖动/ANR/onHandleMsg 热路径全不动).\nv1.7.0 loaded (包类型 普通/定制 SPEC §22: rp_custom_on/kw/tiers_custom per-group, 默认全关=逐字节兼容; 类型判定全在 worker(hbProcess)rpIsCustom(title包含kw), 回填 Job 第9槽 JOB_ISCUSTOM→hbDetailExtract→hbTierAndSend; onHandleMsg 热路径零改动(只塞常量 Boolean.FALSE); 选档 getTiersByType(定制读 rp_tiers_custom 未配回退普通), 限频/排除/分档/两条消息/ANR 全不动; 命令 定制阈值/定制文案K/定制增加档/定制减少档/定制关键字; Dialog 定制区块(开关仅此处改)+状态增显).\nv1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
+        hbBgLog("[RP] " + hbNow() + " v1.8.1 loaded (修主菜单关闭失效=对话框堆叠(menuHolder 捕获, 入口按钮开子页前 dismiss 主菜单)+排除名单显示名字(rpSenderName, 昵称（…尾4）); 仍只动 Dialog 层).\nv1.8.0 loaded (设置页拆分 §23: 主菜单 showConfigDialog(状态摘要+入口按钮) + 二级子页 showPageBasic/NormalTiers/Custom/Delay/Exclude, 每子页只写本页 key, 保存/返回回主菜单, 导出为主菜单直接动作; 只动 Dialog 展示层, worker/onHandleMsg 热路径/文字命令/存储键/校验/即时生效逻辑全不动, 只构建 Dialog 无 UI 遍历 §7, 每页整段 try/catch).\nv1.7.2 loaded (定制包第二条@消息【查包】前缀加「定制包」→【查包】定制包, §22.6, isCustom?checkPrefix; 其余不动).\nv1.7.1 loaded (定制判定 前缀→包含 §22.2: rpIsCustom title.contains(kw)(原 startsWith), 修「【定制】…」被【】包裹漏判; 定制包第一条群规文本 §22.6: rp_custom_rule_prefix_<gid>(默认「定制包请按要求执行」)+cfgCustomRulePrefix, hbTierAndSend 第一条前缀 isCustom?定制:普通, 各档仍「，过{阈值}元{动作}」(定制档表); 第二条@/【查包】机制一行不动; 命令 定制群规前缀 <文字>+Dialog 定制区块「定制群规前缀」+状态增显; 限频/排除/分档/两条消息骨架/抖动/ANR/onHandleMsg 热路径全不动).\nv1.7.0 loaded (包类型 普通/定制 SPEC §22: rp_custom_on/kw/tiers_custom per-group, 默认全关=逐字节兼容; 类型判定全在 worker(hbProcess)rpIsCustom(title包含kw), 回填 Job 第9槽 JOB_ISCUSTOM→hbDetailExtract→hbTierAndSend; onHandleMsg 热路径零改动(只塞常量 Boolean.FALSE); 选档 getTiersByType(定制读 rp_tiers_custom 未配回退普通), 限频/排除/分档/两条消息/ANR 全不动; 命令 定制阈值/定制文案K/定制增加档/定制减少档/定制关键字; Dialog 定制区块(开关仅此处改)+状态增显).\nv1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
             + "[v1.6.3] detect(廉价 type/含<nativeurl>)→enqueue raw content(dedup k:talker:sender:msgid,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB,后台):parse[skip exclusive→nativeurl→extract title 回填 job]→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
             + "v1.3.0: 在 v1.2.0(队列+两条消息定版)之上加回统计 DB(§17, redpacket_stats.db, rp_record 一红包一行, 仅后台反射线程写, 可降级) + 导出今日红包统计→私聊(§18, Dialog 按钮, sendText 给 rp_export_target) + 标题提取(§17.3) + 嗅探调试日志(title usedField/len, stats-db opened, export sent N). DB 存真实昵称/金额/wxid(本地存储), hbBgLog 仍只记计数(脱敏). 两条消息逻辑一行未动. "
             + "v1.1.4: 发两条修正(§16) — 第一条(引用群规)=固定简洁(cfgRulePrefix+\"过{t}元{动作}\"三档, 无随机无语气); 第二条(@)=随机(pickConnector+pickActionPhrase+[AtWx=]), 隔 rp_two_msg_gap_sec 秒(默认3,可配)延迟发以保序(delay+final捕获,fire-and-forget,不进在飞锁). >at上限只发第一条无第二条无延迟. 只改 hbTierAndSend. "
@@ -837,37 +828,7 @@ String cfgCustomRulePrefix(String groupId) {
         return s;
     } catch (Throwable t) { return DEF_CUSTOM_RULE_PREFIX; }
 }
-String cfgExportTarget() { return cfgStr(K_EXPORT_TARGET, DEF_EXPORT_TARGET); }   // v1.3.0 §18 (每日定时/手动导出沿用, v1.9.0 不变)
-// v1.9.0 §24.1: 转发目标显示名 (空回退空串)。
-String cfgExportTargetName() { try { String s = getString(K_EXPORT_TARGET_NAME, ""); return (s == null) ? "" : s; } catch (Throwable t) { return ""; } }
-// v1.9.1 §24.1: 按群转发目标。rp_export_target_<gid> 非空则用, 否则回退全局默认 cfgExportTarget()。
-String cfgExportTargetFor(String gid) {
-    try {
-        String g = normGroupId(gid);
-        if (!g.isEmpty()) {
-            String s = getString(K_EXPORT_TARGET + "_" + g, "");
-            if (s != null && !s.trim().isEmpty()) return s.trim();
-        }
-    } catch (Throwable t) {}
-    return cfgExportTarget();
-}
-// v1.9.1 §24.1: 按群转发目标显示名, 同理回退全局 cfgExportTargetName()。
-String cfgExportTargetNameFor(String gid) {
-    try {
-        String g = normGroupId(gid);
-        if (!g.isEmpty()) {
-            // 仅当该群设过按群目标时才用按群显示名 (避免目标空但名残留)。
-            String tgt = getString(K_EXPORT_TARGET + "_" + g, "");
-            if (tgt != null && !tgt.trim().isEmpty()) {
-                String s = getString(K_EXPORT_TARGET_NAME + "_" + g, "");
-                return (s == null) ? "" : s;
-            }
-        }
-    } catch (Throwable t) {}
-    return cfgExportTargetName();
-}
-// v1.9.0 §24: 目标是否为群 (id 含 @chatroom)。
-boolean rpTargetIsGroup(String target) { try { return target != null && target.indexOf("@chatroom") >= 0; } catch (Throwable t) { return false; } }
+String cfgExportTarget() { return cfgStr(K_EXPORT_TARGET, DEF_EXPORT_TARGET); }   // v1.3.0 §18
 int cfgDailyHour() { int h = cfgInt(K_DAILY_HOUR, DEF_DAILY_HOUR); if (h < 0 || h > 23) h = DEF_DAILY_HOUR; return h; }   // v1.4.0 §20
 
 // 统计 "A|B|C" 里的非空变体数 (toast 提示用)。
@@ -1470,7 +1431,7 @@ String rpCurrentGroupOrToast() {
 
 String rpStatusText(String groupId) {
     StringBuilder sb = new StringBuilder();
-    sb.append("📊 红包统计 v1.9.1\n");
+    sb.append("📊 红包统计 v1.7.1\n");
     sb.append("本群: ").append(isGroupEnabled(groupId) ? "✅ 已启用" : "🔴 未启用").append("\n");
     sb.append("本群每日定时: ").append(isDailyEnabled(groupId) ? ("✅ 开 (每天" + cfgDailyHour() + "点)") : "🔴 关").append("\n");
     // v1.6.0: 每群独立 1-4 档 (未配置则回退全局默认三档)。
@@ -1494,16 +1455,9 @@ String rpStatusText(String groupId) {
     sb.append("at上限: ").append(cfgAtLimit()).append(" (超过则发无@群规消息)\n");
     sb.append("同群限频: ").append(cfgMsgGap()).append("秒\n");
     sb.append("本群排除名单: ").append(getExcludeList(groupId).size()).append(" 人\n");
-    // v1.9.1 §24.5: 转发对象 (按群): 有群上下文显示该群目标 (未设回退全局默认), 无群上下文显示全局默认。
-    sb.append("转发对象: ");
-    boolean _hasGrp = (normGroupId(groupId).length() > 0);
-    String et = _hasGrp ? cfgExportTargetFor(groupId) : cfgExportTarget();
-    String etn = _hasGrp ? cfgExportTargetNameFor(groupId) : cfgExportTargetName();
-    sb.append((etn != null && !etn.isEmpty()) ? etn : "(未命名)");
-    sb.append(rpTargetIsGroup(et) ? "（群）" : "（好友）");
-    sb.append("尾4: ");
+    sb.append("导出目标(尾4位): ");
+    String et = cfgExportTarget();
     sb.append((et != null && et.length() >= 4) ? et.substring(et.length() - 4) : et);
-    if (!_hasGrp) sb.append(" (全局默认)");
     return sb.toString();
 }
 
@@ -2235,9 +2189,7 @@ List rpParseQualifiers(String qf) {
     return out;
 }
 
-// v1.5.0: 把窗口内 rows (List<Object[]>) 按群 (grp) 分组 → 每群拼一条多行文本 → 单群超长按行兜底分条。
-// v1.9.1 §24.4: 返回带 grp 的分组消息 List<Object[]{String grp, String msg}> (每元素 = {该群 grp, 一条待发消息})。
-//   发送循环据此把每条发到该群自己的目标 cfgExportTargetFor(grp) (未设回退全局默认 → 旧行为不变)。
+// v1.5.0: 把窗口内 rows (List<Object[]>) 按群 (grp) 分组 → 每群拼一条多行文本 → 单群超长按行兜底分条 → 返回 List<String> (每元素 = 一条待发消息)。
 // headerPrefix: rpExportToday 传当天 "📊 红包统计 MM-dd"; rpDailySend 传 "📊 每日红包统计[...] (winStr)"。
 // 每条消息头行 = headerPrefix + "  【群名】"。群名取该群首条记录的 group_name, 空回退 grp, 都空则 【】。
 // 红包行: "HH:mm 发包人「标题」 达标N人" (标题空则省「」); 人行: 全角空格缩进 "　昵称 金额元"。红包之间空一行, 群内最后一个不留空行。
@@ -2264,7 +2216,6 @@ List rpBuildGroupedMsgs(List rows, String headerPrefix) {
             Object[] first = (Object[]) bucket.get(0);
             String fgn = (String) first[5];
             String fgid = (String) first[6];
-            final String grpKey = (fgid != null) ? fgid : "";   // v1.9.1: 该群 grp, 随每条消息返回供按群路由
             String groupName = (fgn != null && !fgn.isEmpty()) ? fgn : fgid;
             if (groupName == null) groupName = "";
             String header = headerPrefix + "  【" + groupName + "】";
@@ -2299,13 +2250,13 @@ List rpBuildGroupedMsgs(List rows, String headerPrefix) {
             for (int li = 0; li < blockLines.size(); li++) {
                 String ln = (String) blockLines.get(li);
                 if (cur.length() + 1 + ln.length() > MAX_CHARS && cur.length() > 0) {
-                    msgs.add(new Object[]{ grpKey, cur.toString() });   // v1.9.1: 带 grp
+                    msgs.add(cur.toString());
                     cur = new StringBuilder();
                     cur.append(header);   // 续条重复 header 保持每条可读
                 }
                 cur.append("\n").append(ln);
             }
-            if (cur.length() > 0) msgs.add(new Object[]{ grpKey, cur.toString() });   // v1.9.1: 带 grp
+            if (cur.length() > 0) msgs.add(cur.toString());
         }
     } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " build-grouped err: " + t); }
     return msgs;
@@ -2316,6 +2267,9 @@ List rpBuildGroupedMsgs(List rows, String headerPrefix) {
 void rpExportToday() {
     try {
         String date = rpToday();
+        String target = cfgExportTarget();
+        if (target == null || target.trim().isEmpty()) { try { toast("❌ 未配置导出目标 wxid"); } catch (Throwable t) {} return; }
+        target = target.trim();
 
         android.database.sqlite.SQLiteDatabase db = rpDb();
         if (db == null) { try { toast("❌ 统计库打不开"); } catch (Throwable t) {} return; }
@@ -2334,25 +2288,21 @@ void rpExportToday() {
         String mmdd = date;
         try { mmdd = new java.text.SimpleDateFormat("MM-dd").format(new java.util.Date()); } catch (Throwable t) {}
         String headerPrefix = "📊 红包统计 " + mmdd;
-        List msgs = rpBuildGroupedMsgs(rows, headerPrefix);   // v1.9.1: List<Object[]{grp, msg}>
+        List msgs = rpBuildGroupedMsgs(rows, headerPrefix);
 
+        final String fTarget = target;
         final List fMsgs = msgs;
         final int fRows = rows.size();
-        // 发消息放后台线程 (sendText 可能涉及 IO; UI 回调里别阻塞)。
-        // v1.9.1 §24.4: 每条按 cfgExportTargetFor(该群 grp) 发到该群自己的目标 (未设回退全局默认 → 旧行为不变)。
+        // 发消息放后台线程 (sendText 可能涉及 IO; UI 回调里别阻塞)。每群一条 (超长则该群再分条)。
         new Thread() {
             public void run() {
                 try {
                     for (int i = 0; i < fMsgs.size(); i++) {
-                        try {
-                            Object[] gm = (Object[]) fMsgs.get(i);
-                            String grp = (String) gm[0];
-                            String msg = (String) gm[1];
-                            sendText(cfgExportTargetFor(grp), msg);
-                        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " export sendText err: " + t); }
+                        try { sendText(fTarget, (String) fMsgs.get(i)); } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " export sendText err: " + t); }
                     }
-                    // 嗅探日志 (脱敏): 只记实际发送条数 + 行数, 绝不打群名/昵称/内容/目标。
-                    hbBgLog("[RP] " + hbNow() + " export: sent " + fMsgs.size() + " msg (per-group routed) (rows=" + fRows + "). content NOT logged.");
+                    // 嗅探日志 (脱敏): 只记实际发送条数 + 行数 + 目标尾4位, 绝不打群名/昵称/内容。
+                    String tail = (fTarget.length() >= 4) ? fTarget.substring(fTarget.length() - 4) : fTarget;
+                    hbBgLog("[RP] " + hbNow() + " export: sent " + fMsgs.size() + " msg to target(尾4位=" + tail + ") (rows=" + fRows + "). content NOT logged.");
                 } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " export thread err: " + t); }
             }
         }.start();
@@ -2409,6 +2359,10 @@ void rpDailySend(final long windowStart, final long windowEnd, final boolean man
     new Thread() {
         public void run() {
             try {
+                String target = cfgExportTarget();
+                if (target == null || target.trim().isEmpty()) { hbBgLog("[RP] " + hbNow() + " daily-send: no export target, skip."); return; }
+                target = target.trim();
+
                 List dailyGroups = getDailyGroups();
                 // 窗口头尾的 MM-dd HH:mm 用于 header。
                 java.text.SimpleDateFormat mdhm = new java.text.SimpleDateFormat("MM-dd HH:mm");
@@ -2442,28 +2396,20 @@ void rpDailySend(final long windowStart, final long windowEnd, final boolean man
                     } finally { if (c != null) try { c.close(); } catch (Throwable t) {} }
                 }
 
-                // 组装 + 发送 (v1.9.1 §24.4)。
-                //  - 有记录 → rpBuildGroupedMsgs 返回 List<Object[]{grp, msg}>, 每条按 cfgExportTargetFor(grp) 发到该群自己的目标 (未设回退全局默认 = 旧行为)。
-                //  - 全窗口无记录 → 仍发一条总心跳, 发到全局默认 cfgExportTarget() (边缘场景, 不按群散发, 避免噪音)。
-                int sent = 0;
+                // 组装 + 发送。有记录 → 按群分组每群一条; 全窗口无记录 → 仍发一条总心跳 (header + 无记录提示)。
+                List msgs;
                 if (rows.isEmpty()) {
-                    String def = cfgExportTarget();
-                    if (def != null && !def.trim().isEmpty()) {
-                        try { sendText(def.trim(), headerPrefix + "\n(过去24h无达标红包)"); sent = 1; } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send heartbeat sendText err: " + t); }
-                    } else { hbBgLog("[RP] " + hbNow() + " daily-send: no global target for heartbeat, skip."); }
+                    msgs = new java.util.ArrayList();
+                    msgs.add(headerPrefix + "\n(过去24h无达标红包)");
                 } else {
-                    List msgs = rpBuildGroupedMsgs(rows, headerPrefix);   // List<Object[]{grp, msg}>
-                    for (int i = 0; i < msgs.size(); i++) {
-                        try {
-                            Object[] gm = (Object[]) msgs.get(i);
-                            String grp = (String) gm[0];
-                            String msg = (String) gm[1];
-                            sendText(cfgExportTargetFor(grp), msg);
-                            sent++;
-                        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send sendText err: " + t); }
-                    }
+                    msgs = rpBuildGroupedMsgs(rows, headerPrefix);
                 }
-                hbBgLog("[RP] " + hbNow() + " daily-send: sent " + sent + " msg (per-group routed), rows=" + rows.size()
+
+                for (int i = 0; i < msgs.size(); i++) {
+                    try { sendText(target, (String) msgs.get(i)); } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send sendText err: " + t); }
+                }
+                String tail = (target.length() >= 4) ? target.substring(target.length() - 4) : target;
+                hbBgLog("[RP] " + hbNow() + " daily-send: sent " + msgs.size() + " msg to target(尾4位=" + tail + "), rows=" + rows.size()
                     + ", groups=" + dailyGroups.size() + ", manual=" + manual + ". content NOT logged.");
             } catch (Throwable t) {
                 hbBgLog("[RP] " + hbNow() + " daily-send thread err: " + t);
@@ -3099,7 +3045,7 @@ void showConfigDialog(final String groupId) {
         android.widget.LinearLayout root = _rpPageRoot(ctx);
 
         android.widget.TextView title = new android.widget.TextView(ctx);
-        title.setText("🧧 红包统计 v1.9.0 设置");
+        title.setText("🧧 红包统计 v1.8.1 设置");
         title.setTextColor(_rpC("#E8E9EC"));
         title.setTextSize(18);
         title.setPadding(0, 0, 0, 8 * dp);
@@ -3166,14 +3112,6 @@ void showConfigDialog(final String groupId) {
             _rpSpacer(root, ctx, 6 * dp);
         }
 
-        // v1.9.0 §24: 转发对象子页 (选好友/群 + 设置后通知)。导出/每日定时均沿用 cfgExportTarget(), 此处可改目标。
-        android.widget.Button bForward = _rpBtn(ctx, "📮 转发对象", "#5CB6FF");
-        bForward.setOnClickListener(new android.view.View.OnClickListener() {
-            public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageForward(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
-        });
-        root.addView(bForward);
-        _rpSpacer(root, ctx, 6 * dp);
-
         // 导出: 直接动作 (不进子页, §23.1)。
         android.widget.Button bExport = _rpBtn(ctx, "📤 导出今日 → 私聊", "#3FB27F");
         bExport.setOnClickListener(new android.view.View.OnClickListener() {
@@ -3220,10 +3158,20 @@ void showPageBasic(final String groupId) {
         root.addView(toggleBtn);
         _rpSpacer(root, ctx, 6 * dp);
 
-        // v1.9.2 §24: 每日定时开关 + 推送时间已迁至「📮 转发对象」子页, 本页只留「本群启用」。
+        // v1.4.0 §20: 本群每日定时统计开关 (即时生效, 独立于红包统计开关)。
+        final boolean[] dailyHolder = new boolean[]{ isDailyEnabled(groupId) };
+        final android.widget.Button dailyBtn = _rpBtn(ctx, dailyHolder[0] ? ("🔕 关闭本群每日定时 (每天" + cfgDailyHour() + "点)") : ("⏰ 开启本群每日定时 (每天" + cfgDailyHour() + "点)"), dailyHolder[0] ? "#FF6B6B" : "#5CB6FF");
+        dailyBtn.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) {
+                if (dailyHolder[0]) { disableDailyGroup(groupId); dailyHolder[0] = false; dailyBtn.setText("⏰ 开启本群每日定时 (每天" + cfgDailyHour() + "点)"); dailyBtn.setBackground(_rpRound("#5CB6FF", 24)); toast("已关闭本群每日定时"); }
+                else { enableDailyGroup(groupId); dailyHolder[0] = true; dailyBtn.setText("🔕 关闭本群每日定时 (每天" + cfgDailyHour() + "点)"); dailyBtn.setBackground(_rpRound("#FF6B6B", 24)); toast("已开启本群每日定时"); }
+            }
+        });
+        root.addView(dailyBtn);
+        _rpSpacer(root, ctx, 6 * dp);
 
         android.widget.TextView hint = new android.widget.TextView(ctx);
-        hint.setText("提示: 开关点击即时生效 (无需保存)。每日定时开关/推送时间见「📮 转发对象」子页。");
+        hint.setText("提示: 开关点击即时生效 (无需保存)。");
         hint.setTextColor(_rpC("#7C828E"));
         hint.setTextSize(11);
         root.addView(hint);
@@ -3426,218 +3374,6 @@ void showPageExclude(final String groupId) {
         // 排除名单移除即时生效, 无延迟写 key, onSave 传 null → 「保存」等同返回主菜单。
         _rpShowSubPage(ctx, groupId, "🚫 排除名单", root, null);
     } catch (Throwable t) { try { toast("打开排除名单失败: " + t); } catch (Throwable t2) {} }
-}
-
-// ----- 子页: 📮 转发对象 (v1.9.0 §24.2): 显当前目标 + 选好友/选群 + 手动输入兜底。 -----
-//   选好友/选群: 后台线程调 getFriendList()/getGroupList() (缓存 sCachedFriendList/sCachedGroupList),
-//   完成后 Handler(Looper.getMainLooper()).post 回主线程弹单选 AlertDialog (setItems, 无 UI 遍历, §7 ANR)。
-//   选中/手填 → 存 rp_export_target + rp_export_target_name → toast → sendForwardNotice(§24.3)。
-void showPageForward(final String groupId) {
-    final Activity ctx = getTopActivity();
-    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
-    try {
-        android.widget.LinearLayout root = _rpPageRoot(ctx);
-
-        final boolean hasGroup = (normGroupId(groupId).length() > 0);
-        // 当前目标 (§24.2 顶部): 显示【当前群】的转发对象 (按群, 未设回退全局默认)。无群上下文则提示需在群内设置。
-        android.widget.TextView cur = new android.widget.TextView(ctx);
-        if (hasGroup) {
-            String curT = cfgExportTargetFor(groupId);
-            String curN = cfgExportTargetNameFor(groupId);
-            String curTail = (curT != null && curT.length() >= 4) ? curT.substring(curT.length() - 4) : curT;
-            cur.setText("本群转发对象: " + ((curN != null && !curN.isEmpty()) ? curN : "(未命名)")
-                + (rpTargetIsGroup(curT) ? "（群）" : "（好友）") + " 尾4: " + curTail);
-        } else {
-            cur.setText("⚠️ 无群上下文, 请在群内打开本设置以设置该群转发对象");
-        }
-        cur.setTextColor(_rpC("#E8E9EC"));
-        cur.setTextSize(13);
-        root.addView(cur);
-        _rpLabel(root, ctx, "（本群每日定时/手动导出都发到此对象; 未设则回退全局默认）");
-
-        // 选好友 / 选群 按钮。
-        final android.widget.Button bFriend = _rpBtn(ctx, "👤 选好友", "#5CB6FF");
-        bFriend.setOnClickListener(new android.view.View.OnClickListener() {
-            public void onClick(android.view.View v) { try { rpPickTarget(ctx, groupId, false); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
-        });
-        root.addView(bFriend);
-        _rpSpacer(root, ctx, 6);
-
-        final android.widget.Button bGroup = _rpBtn(ctx, "👥 选群", "#5CB6FF");
-        bGroup.setOnClickListener(new android.view.View.OnClickListener() {
-            public void onClick(android.view.View v) { try { rpPickTarget(ctx, groupId, true); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
-        });
-        root.addView(bGroup);
-
-        // 手动输入兜底 (§24.2)。
-        _rpLabel(root, ctx, "手动输入 (列表找不到时): 填 wxid 或 xxx@chatroom");
-        final android.widget.EditText manualBox = _rpEdit(ctx, "", false);
-        root.addView(manualBox);
-        final android.widget.Button bSaveManual = _rpBtn(ctx, "💾 保存手填", "#3FB27F");
-        bSaveManual.setOnClickListener(new android.view.View.OnClickListener() {
-            public void onClick(android.view.View v) {
-                try {
-                    String t = manualBox.getText().toString().trim();
-                    if (t.isEmpty()) { try { toast("请输入 wxid 或 xxx@chatroom"); } catch (Throwable t2) {} return; }
-                    rpApplyForwardTarget(groupId, t, t);   // 手填: 显示名同 target, 作用当前群
-                } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
-            }
-        });
-        root.addView(bSaveManual);
-
-        // v1.9.2 §20/§24: —— 每日定时 (从基础开关页迁来) ——
-        _rpLabel(root, ctx, "—— 每日定时统计 ——");
-
-        // 📅 本群每日定时开关 (即时生效, 独立于红包统计开关; 沿用 enable/disableDailyGroup)。
-        if (hasGroup) {
-            final boolean[] dailyHolder = new boolean[]{ isDailyEnabled(groupId) };
-            final android.widget.Button dailyBtn = _rpBtn(ctx, dailyHolder[0] ? "✅ 已开启每日定时 (点击关闭)" : "🔴 未开启每日定时 (点击开启)", dailyHolder[0] ? "#FF6B6B" : "#5CB6FF");
-            dailyBtn.setOnClickListener(new android.view.View.OnClickListener() {
-                public void onClick(android.view.View v) {
-                    try {
-                        if (dailyHolder[0]) { disableDailyGroup(groupId); dailyHolder[0] = false; dailyBtn.setText("🔴 未开启每日定时 (点击开启)"); dailyBtn.setBackground(_rpRound("#5CB6FF", 24)); toast("已关闭本群每日定时"); }
-                        else { enableDailyGroup(groupId); dailyHolder[0] = true; dailyBtn.setText("✅ 已开启每日定时 (点击关闭)"); dailyBtn.setBackground(_rpRound("#FF6B6B", 24)); toast("已开启本群每日定时"); }
-                        try { showPageForward(groupId); } catch (Throwable t) {}   // 即时写后刷新本页
-                    } catch (Throwable t) { try { toast("切换失败: " + t); } catch (Throwable t2) {} }
-                }
-            });
-            root.addView(dailyBtn);
-        } else {
-            android.widget.TextView dn = new android.widget.TextView(ctx);
-            dn.setText("⚠️ 每日定时开关需在群内设置 (当前无群上下文)");
-            dn.setTextColor(_rpC("#7C828E"));
-            dn.setTextSize(12);
-            root.addView(dn);
-        }
-
-        // ⏰ 每日推送时间 (全局, 影响所有群; 沿用 K_DAILY_HOUR/cfgDailyHour, 0-23 夹取)。
-        _rpLabel(root, ctx, "⏰ 每日推送时间 (小时, 0-23; 全局, 影响所有群)");
-        final android.widget.EditText hourBox = _rpEdit(ctx, String.valueOf(cfgDailyHour()), true);
-        root.addView(hourBox);
-
-        // 「💾 保存」校验小时 0-23 后写 K_DAILY_HOUR (全局); 定时开关已即时生效, 不在此写。
-        Runnable onSave = new Runnable() {
-            public void run() {
-                try {
-                    String s = hourBox.getText().toString().trim();
-                    if (s.isEmpty()) return;
-                    int h;
-                    try { h = Integer.parseInt(s); } catch (Throwable t) { try { toast("❌ 推送时间需为 0-23 的整数"); } catch (Throwable t2) {} return; }
-                    if (h < 0 || h > 23) { try { toast("❌ 推送时间需在 0-23 之间"); } catch (Throwable t2) {} return; }
-                    putString(K_DAILY_HOUR, String.valueOf(h));
-                    try { toast("✅ 每日推送时间已设为 " + h + " 点 (全局)"); } catch (Throwable t2) {}
-                } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
-            }
-        };
-        _rpShowSubPage(ctx, groupId, "📮 转发对象", root, onSave);
-    } catch (Throwable t) { try { toast("打开转发对象失败: " + t); } catch (Throwable t2) {} }
-}
-
-// v1.9.0 §24.2: 后台线程加载好友/群 list (缓存), 完成后主线程弹单选 AlertDialog。isGroup=true 选群, false 选好友。
-void rpPickTarget(final Activity ctx, final String groupId, final boolean isGroup) {
-    try {
-        try { toast("正在加载…"); } catch (Throwable t) {}
-        new Thread(new Runnable() {
-            public void run() {
-                try {
-                    final java.util.List list;
-                    if (isGroup) {
-                        if (sCachedGroupList == null) { try { sCachedGroupList = getGroupList(); } catch (Throwable t) { sCachedGroupList = null; } }
-                        list = sCachedGroupList;
-                    } else {
-                        if (sCachedFriendList == null) { try { sCachedFriendList = getFriendList(); } catch (Throwable t) { sCachedFriendList = null; } }
-                        list = sCachedFriendList;
-                    }
-                    // 主线程构建/弹 Dialog (§7 ANR: 只 setItems 单选, 无 UI 遍历)。
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                        public void run() {
-                            try {
-                                if (list == null || list.isEmpty()) { try { toast("未获取到列表"); } catch (Throwable t) {} return; }
-                                final int n = list.size();
-                                final String[] ids = new String[n];
-                                final String[] names = new String[n];
-                                final String[] items = new String[n];
-                                for (int i = 0; i < n; i++) {
-                                    Object info = list.get(i);
-                                    String id = ""; String nm = "";
-                                    if (isGroup) {
-                                        try { Object r = info.getClass().getMethod("getRoomId").invoke(info); if (r != null) id = r.toString(); } catch (Throwable t) {}
-                                        try { Object nn = info.getClass().getMethod("getName").invoke(info); if (nn != null) nm = nn.toString(); } catch (Throwable t) {}
-                                        if (nm == null || nm.trim().isEmpty()) nm = id;
-                                        items[i] = "🏠 " + nm + "\nID:" + id;
-                                    } else {
-                                        try { Object w = info.getClass().getMethod("getWxid").invoke(info); if (w != null) id = w.toString(); } catch (Throwable t) {}
-                                        String rmk = null; String nick = null;
-                                        try { Object r = info.getClass().getMethod("getRemark").invoke(info); if (r != null) rmk = r.toString().trim(); } catch (Throwable t) {}
-                                        try { Object nn = info.getClass().getMethod("getNickname").invoke(info); if (nn != null) nick = nn.toString().trim(); } catch (Throwable t) {}
-                                        if (rmk != null && !rmk.isEmpty()) nm = rmk;
-                                        else if (nick != null && !nick.isEmpty()) nm = nick;
-                                        else nm = id;
-                                        items[i] = "👤 " + nm + "\nID:" + id;
-                                    }
-                                    ids[i] = id; names[i] = nm;
-                                }
-                                new android.app.AlertDialog.Builder(ctx)
-                                    .setTitle(isGroup ? "👥 选群" : "👤 选好友")
-                                    .setItems(items, new android.content.DialogInterface.OnClickListener() {
-                                        public void onClick(android.content.DialogInterface d, int which) {
-                                            try {
-                                                if (which < 0 || which >= ids.length) return;
-                                                rpApplyForwardTarget(groupId, ids[which], names[which]);
-                                            } catch (Throwable t) { try { toast("选择失败: " + t); } catch (Throwable t2) {} }
-                                        }
-                                    })
-                                    .setNegativeButton("取消", null)
-                                    .create()
-                                    .show();
-                            } catch (Throwable t) { try { toast("弹窗失败: " + t); } catch (Throwable t2) {} }
-                        }
-                    });
-                } catch (Throwable t) {
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                        public void run() { try { toast("加载失败"); } catch (Throwable t2) {} }
-                    });
-                }
-            }
-        }).start();
-    } catch (Throwable t) { try { toast("加载失败: " + t); } catch (Throwable t2) {} }
-}
-
-// v1.9.1 §24.2/§24.3: 写【按群】目标 + 显示名 (rp_export_target_<gid>/name_<gid>) → toast → sendForwardNotice(groupId, target)。target trim 非空才写。
-//   无群上下文 (groupId 为空) → 不写按群键, 提示需在群内设置。
-void rpApplyForwardTarget(String groupId, String target, String name) {
-    try {
-        if (target == null) return;
-        final String t = target.trim();
-        if (t.isEmpty()) { try { toast("目标为空"); } catch (Throwable t2) {} return; }
-        String g = normGroupId(groupId);
-        if (g.isEmpty()) { try { toast("请在群内设置转发对象"); } catch (Throwable t2) {} return; }
-        String nm = (name == null) ? "" : name.trim();
-        try { putString(K_EXPORT_TARGET + "_" + g, t); } catch (Throwable e) {}
-        try { putString(K_EXPORT_TARGET_NAME + "_" + g, nm); } catch (Throwable e) {}
-        try { toast("✅ 本群转发对象已设为: " + (nm.isEmpty() ? t : nm)); } catch (Throwable e) {}
-        sendForwardNotice(g, t);
-    } catch (Throwable t) { try { toast("设置失败: " + t); } catch (Throwable t2) {} }
-}
-
-// v1.9.1 §24.3: 设置后给目标发一条通知 (好友=私聊; 群=发在群, 已与用户确认接受)。文本实时取配置, 【只讲当前群】。
-//   当前群名用 rpGroupName(gid) 取 (本插件已验证的 getGroupList→getRoomId→getName 反射; 取不到回退 gid)。整段 try/catch, 失败 toast 不崩。
-void sendForwardNotice(final String groupId, final String target) {
-    try {
-        if (target == null || target.trim().isEmpty()) return;
-        int hour = cfgDailyHour();
-        String gn = null;
-        try { gn = rpGroupName(groupId); } catch (Throwable t) { gn = null; }
-        if (gn == null || gn.trim().isEmpty()) gn = (groupId == null) ? "" : groupId;
-
-        StringBuilder msg = new StringBuilder();
-        msg.append("✅ 本群「").append(gn).append("」红包统计转发已开启到这里\n");
-        msg.append("每日 ").append(hour).append(":00 推送过去24小时统计\n");
-        msg.append("范围: ").append(hour).append(":00 ~ 次日").append(hour).append(":00\n");
-        msg.append("(可在该群「红包统计设置 → 转发对象」调整)");
-        final String text = msg.toString();
-        try { sendText(target, text); } catch (Throwable t) { try { toast("通知发送失败 (目标已保存)"); } catch (Throwable t2) {} }
-    } catch (Throwable t) { try { toast("通知发送失败: " + t); } catch (Throwable t2) {} }
 }
 
 // v1.0.6 §12: 重建排除名单行 (每人一行: 昵称/wxid + "移除"按钮)。移除后即时刷新本块。

@@ -487,3 +487,41 @@ NewDetailUI.onResume (类名过滤 + 去重):
   - **排除名单**：成员列表 + 移除（沿用现 exclBox 逻辑）。
 - **只重构 Dialog 展示层**：worker / onHandleMsg 热路径 / 文字命令 / 存储键 全不动；命令入口仍作 Dialog 之外的兜底。
 - 健壮：每个子页构建/保存整段 try/catch，异常 toast 不崩 Dialog。
+
+## 24. 转发对象**按群**可选好友/群 + 设置后通知（v1.9.1）
+
+红包统计的转发/导出对象**按群独立设置**——每个群的红包统计转发到该群自己选的好友或群；在哪个群打开设置就设哪个群。设置后给目标发一条只讲**当前群**的通知。
+
+### 24.1 存储（按群）
+- `rp_export_target_<gid>`（新增）：该群的转发目标（好友 wxid 或群 `xxx@chatroom`，`sendText` 通用）。**未设置 → 回退全局默认 `rp_export_target`**（保留旧默认 `wxid_REDACTED`，向后兼容：所有群当前都发默认目标）。
+- `rp_export_target_name_<gid>`（新增）：该群目标显示名。
+- helper：`cfgExportTargetFor(gid)`（`rp_export_target_<gid>` 非空则用，否则全局 `cfgExportTarget()`）、`cfgExportTargetNameFor(gid)`。类型由 id 含 `@chatroom` 自动区分。
+
+### 24.2 选择界面（设置子页「📮 转发对象」，作用**当前群** groupId）
+- 顶部显示**当前群**的转发对象：`名字（好友/群）` + 尾 4 位（无群上下文则提示需在群内设）。
+- 两个按钮「👤 选好友」「👥 选群」：
+  - **后台线程**调 `getFriendList()` / `getGroupList()`（可能慢；缓存到顶层 `sCachedFriendList`/`sCachedGroupList`），完成后 `new Handler(Looper.getMainLooper()).post(...)` 回主线程弹单选 AlertDialog（`setItems`，无 UI 遍历，§7 ANR）。
+  - 列表项：好友 `👤 {remark|nickname}`（`FriendInfo.getRemark()`→`getNickname()`→wxid）；群 `🏠 {name}`（`GroupInfo.getName()` / `getRoomId()`）。
+  - 选中 → 存 `rp_export_target_<当前gid>` + `rp_export_target_name_<当前gid>`，toast，发设置通知（§24.3，针对当前群）。
+- **手动输入兜底**：EditText 填 wxid/`xxx@chatroom`，保存到当前群键、同样发通知。
+- 列表空 → toast 不崩；加载前 toast「正在加载…」。
+
+### 24.3 设置后通知（只讲当前群）
+- 选定/保存后，立即 `sendText(目标, 通知文本)`（好友=私聊；群=发在该群，全员可见，已确认接受）。
+- 文本（取实时配置，**只讲当前群**）：
+  ```
+  ✅ 本群「{当前群名 rpGroupName(gid)}」红包统计转发已开启到这里
+  每日 {rp_daily_hour}:00 推送过去24小时统计
+  范围: {hour}:00 ~ 次日{hour}:00
+  (可在该群「红包统计设置 → 转发对象」调整)
+  ```
+- 整段 try/catch，发送失败只 toast 不崩。
+
+### 24.4 发送路由按群（每日定时 §20 + 手动导出 §18）
+- `rpBuildGroupedMsgs` 已按群（grp）分组——改为返回**带 groupId 的分组消息**（grp→message，如 `List<Object[]{grp, msg}>` 或 LinkedHashMap）。
+- `rpDailySend` / `rpExportToday` 发送循环：每条按 `sendText(cfgExportTargetFor(该grp), msg)` 发到**该群自己的目标**（未设回退全局默认 → 旧行为不变）。
+- 「无达标红包」心跳（rpDailySend）发到全局默认 `cfgExportTarget()`（边缘场景，不按群散发，避免噪音）。
+
+### 24.5 范围 / 热路径
+- 只动 Dialog + 发送路由层；`getFriendList/getGroupList` 在 Dialog 后台线程，**不在 onHandleMsg 热路径**；写库/检测/worker/分档 不动。
+- `状态` 显示当前群「转发对象: {name}（好友/群）尾4」（无群上下文显示全局默认）。
