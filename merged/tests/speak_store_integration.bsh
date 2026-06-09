@@ -1,0 +1,38 @@
+// L2 集成：speak_store 领域 + sqlite-jdbc 真库（验真 SQL 语义 = coalesce 防 NULL）。
+// 含 RED 演示：旧 SQL(无 coalesce) 留 NULL，证明该测试能抓回归。
+// 运行 cwd = merged/，classpath 含 sqlite-jdbc.jar。
+import java.sql.*;
+source("tests/_harness.bsh");
+source("src/domain/speak_store.bsh");
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(SPEAK_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+long NOW = 1749470000000L;
+long EARLIER = 1700000000000L;
+
+// 构造三类行
+conn.createStatement().execute("INSERT INTO speak VALUES('g','NULL_FS',123,NULL)");
+conn.createStatement().execute("INSERT INTO speak VALUES('g','EARLIER_FS',123," + EARLIER + ")");
+// MISSING: 不插入
+
+speakUpsertFirstSeen("g", "NULL_FS", NOW);
+speakUpsertFirstSeen("g", "EARLIER_FS", NOW);
+speakUpsertFirstSeen("g", "MISSING", NOW);
+
+check("NULL first_seen -> NOW (coalesce 生效)", speakQueryFirstSeen("g", "NULL_FS").longValue() == NOW);
+check("EARLIER 保留 (min 不覆盖更早)", speakQueryFirstSeen("g", "EARLIER_FS").longValue() == EARLIER);
+check("MISSING 插入 = NOW", speakQueryFirstSeen("g", "MISSING").longValue() == NOW);
+
+// ---- RED 演示：旧 SQL(无 coalesce) 对 NULL 行留 NULL（历史 bug）→ 证明测试有效 ----
+String OLD_SQL = "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,NULL,?) "
+    + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=min(first_seen,excluded.first_seen)";
+conn.createStatement().execute("INSERT INTO speak VALUES('g','OLDBUG',123,NULL)");
+PreparedStatement ps = conn.prepareStatement(OLD_SQL);
+ps.setString(1, "g"); ps.setString(2, "OLDBUG"); ps.setLong(3, NOW); ps.executeUpdate(); ps.close();
+check("旧 SQL 留 NULL (复现历史 bug，证明断言能抓回归)", speakQueryFirstSeen("g", "OLDBUG") == null);
+
+conn.close();
+done();

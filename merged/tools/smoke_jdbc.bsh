@@ -1,0 +1,52 @@
+// 冒烟测试: BeanShell 本地驱动 sqlite-jdbc 跑真 SQLite，验证 coalesce UPSERT 语义。
+// 运行: java -cp bsh-2.0b6.jar:sqlite-jdbc.jar bsh.Interpreter smoke_jdbc.bsh
+import java.sql.*;
+
+int fails = 0;
+void check(String name, boolean ok) {
+    System.out.println((ok ? "PASS " : "FAIL ") + name);
+    if (!ok) fails++;
+}
+
+Class.forName("org.sqlite.JDBC");
+Connection c = DriverManager.getConnection("jdbc:sqlite::memory:");
+Statement st = c.createStatement();
+st.execute("CREATE TABLE speak(grp TEXT, wxid TEXT, last_speak INTEGER, first_seen INTEGER, PRIMARY KEY(grp,wxid))");
+
+String UPSERT = "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,NULL,?) "
+    + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)";
+
+long NOW = 1749470000000L;
+long EARLIER = 1700000000000L;
+
+// 三类行
+st.execute("INSERT INTO speak VALUES('g','NULL_FS',123,NULL)");
+st.execute("INSERT INTO speak VALUES('g','EARLIER_FS',123," + EARLIER + ")");
+// MISSING: 不插入
+
+void upsert(Connection c, String wxid, long ts) {
+    PreparedStatement ps = c.prepareStatement(UPSERT);
+    ps.setString(1, "g"); ps.setString(2, wxid); ps.setLong(3, ts);
+    ps.executeUpdate(); ps.close();
+}
+upsert(c, "NULL_FS", NOW);
+upsert(c, "EARLIER_FS", NOW);
+upsert(c, "MISSING", NOW);
+
+Long fsOf(Connection c, String wxid) {
+    PreparedStatement ps = c.prepareStatement("SELECT first_seen FROM speak WHERE grp='g' AND wxid=?");
+    ps.setString(1, wxid);
+    ResultSet rs = ps.executeQuery();
+    if (!rs.next()) return null;
+    long v = rs.getLong(1); boolean wasNull = rs.wasNull();
+    rs.close(); ps.close();
+    return wasNull ? null : new Long(v);
+}
+
+check("NULL first_seen -> NOW (coalesce)", fsOf(c,"NULL_FS") != null && fsOf(c,"NULL_FS").longValue() == NOW);
+check("EARLIER preserved (min)",          fsOf(c,"EARLIER_FS") != null && fsOf(c,"EARLIER_FS").longValue() == EARLIER);
+check("MISSING inserted = NOW",           fsOf(c,"MISSING") != null && fsOf(c,"MISSING").longValue() == NOW);
+
+c.close();
+System.out.println(fails == 0 ? "SMOKE_OK" : ("SMOKE_FAIL(" + fails + ")"));
+System.exit(fails == 0 ? 0 : 1);

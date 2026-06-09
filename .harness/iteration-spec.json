@@ -1,63 +1,97 @@
 {
-  "iteration": "redpacket-freeloader-since-lazyinit-v1.11.4",
+  "iteration": "merge-P0-modular-build-and-test-foundation",
   "date": "2026-06-09",
-  "summary_one_line": "修升级缺口：开关在 since 机制(v1.11.3)之前已开 → since=0 安全网整包跳过 → 伸手党静默失效。判定时若开关开但 since<=0 则自动补写 since=now(lazy-init)，自愈、免手动重切。",
+  "summary_one_line": "合并项目 P0 地基：源码分模块 + build.sh 拼接 → main.java + 端口/适配器 + 本地 bsh 测试 runner(含 sqlite-jdbc 真库)，用 speak-store UPSERT 缝做 red→green 打通全链路。先出设计文档待用户过目。",
   "user_confirmed": true,
-  "root_cause": "since 锚点只在『关→开』切换时写。用户在 v1.11.2 已打开开关，升级到 v1.11.3 时带着『已开』状态 → 从未经历 OFF→ON → cfgFreeloaderSince 返 0 → 判定段 since<=0 安全网整包跳过。日志实证:10:00/10:02 v1.11.2 真发警告(warned=4/2)；12:52/12:54/13:08 v1.11.3 后『freeloader skip: no since anchor』。normGroupId=trim，无 key 错配。",
   "requirements": [
-    { "id": "R1", "priority": "must", "text": "判定线程中若 cfgFreeloaderSince(talker)<=0 且开关开，自动 putString 补写 since=System.currentTimeMillis()(lazy-init)，本轮仍跳过(从此刻起算宽限)，并记 lazy-init 日志。自愈『开关在 since 机制前已开』的升级缺口，免手动关→开重切。" },
-    { "id": "R2", "priority": "must", "text": "版本 bump v1.11.4(顶部注释 + onLoad 日志 + info.prop)+ SPEC §25.9 注记；不改其他判定/宽限/命令/Dialog/安全网逻辑。" }
+    { "id": "R1", "priority": "must", "text": "设计文档(架构=端口与适配器 + 测试金字塔 + 分期 P0-P3)写入 docs/superpowers/specs/ 并提交；onboarding/README 记录工具(bsh-2.0b6.jar、sqlite-jdbc 来源)。用户过目后再建基建。" },
+    { "id": "R2", "priority": "must", "text": "核实并记录 WAuxiliary getString/putString 的 config store 是否全宿主共享(决定 P2 迁移工作量)；记入设计文档/记忆。" },
+    { "id": "R3", "priority": "must", "text": "仓库模块化结构 + build.sh：按声明顺序拼接 src 模块 + 选定生产适配器 → 单一可部署 main.java；产物过现有 bsh 离线解析(去 final EXIT=0)。" },
+    { "id": "R4", "priority": "must", "text": "端口骨架 HostPort/StoragePort/Clock，各有生产(android/System)与测试(fake/sqlite-jdbc/假时钟)适配器；build 选生产集、test 选测试集。" },
+    { "id": "R5", "priority": "must", "text": "本地测试 runner(run-tests.sh 跑 tests/*.bsh，失败非零退出)+ check.sh = build→bsh解析→单测→集成。证明缝=speak-store last_speak/first_seen UPSERT 抽成 StoragePort 模块，单测(fake)+集成(sqlite-jdbc 真库)断言 coalesce-NULL 语义，对旧 SQL red、对 coalesce SQL green。" }
   ],
   "design": {
-    "summary": "唯一改动在判定后台线程的 since<=0 分支：原来只 hbBgLog skip+return，改为先 putString(K_FREELOADER_SINCE_PREFIX+fTalker, now) 再 skip+return。putString 在后台判定线程(非 onHandleMsg 热路径)，key 与 cfgFreeloaderSince 读一致(均经 trim/normGroupId)。lazy-init 后本轮仍跳过、从此刻起 winMs 宽限，保守不误警。命令/Dialog 的 OFF→ON 写 since 不变。",
+    "summary": "P0 只搭地基+证明链路可行，不迁业务。端口与适配器把所有外部依赖(宿主 KV/发消息/成员表、SQLite、时钟)收敛成可替换缝；领域逻辑只依赖端口。build.sh 按 manifest 顺序 cat 源模块 + 选定适配器拼成 main.java。测试用 bsh-2.0b6.jar 本地执行 .bsh 测试脚本(与设备同解释器=高保真)，StoragePort 测试适配器用 sqlite-jdbc 跑真 SQLite(本地复现 max/min(NULL,x) 类 bug)。证明缝选 speak-store UPSERT：既打通 build+runner+jdbc 全链路，又把 v1.19.2/v1.20.0 的 coalesce 修复变成本地回归测试。",
     "risk_points": [
-      { "id": "RISK1", "text": "破坏性上游(累计触发群管踢人)：lazy-init 必须仍保守——补 since 后本轮跳过 + 30min(winMs)宽限，绝不因自愈立即判定/误警告。" },
-      { "id": "RISK2", "text": "线程/键一致：putString 在后台线程(非热路径)安全；写 key K_FREELOADER_SINCE_PREFIX+fTalker 必须与 cfgFreeloaderSince 读 key 一致(normGroupId=trim)，否则补了也读不到。" }
+      { "id": "RISK1", "text": "拼接产物与手写单文件行为须一致：build.sh 拼接顺序(全局变量/函数声明)错会导致 BeanShell 未定义引用；产物必须过 bsh 解析 + 后续真机加载验证。P0 不部署业务，仅产物解析门禁。" },
+      { "id": "RISK2", "text": "本地测试保真度：bsh 本地执行与设备 WAuxiliary 同解释器，差异仅在被 mock 的宿主/Android API；StoragePort 用 sqlite-jdbc 与 android SQLite 的 SQL 方言须一致(UPSERT/coalesce 标准 SQL，两端一致)。" },
+      { "id": "RISK3", "text": "P0 不改动现有线上两个插件(GroupAdmin/RedPacketStats 照常运行)；地基在新目录独立推进，零触碰生产部署，避免影响在用群管/红包。" }
     ]
   },
   "traffic_flows": [
-    { "id": "F1", "text": "判定线程 since<=0 分支：cfgFreeloaderSince→0 → putString since=now → hbBgLog lazy-init → return(skip)；下一个包读到 since>0 走原宽限/判定。" }
+    { "id": "F1", "text": "构建路径：src 模块(manifest 顺序) + 生产适配器 → build.sh cat → main.java → bsh 解析门禁。" },
+    { "id": "F2", "text": "测试路径：src 模块 + 测试适配器(fake host / sqlite-jdbc / 假时钟) → bsh 本地执行 tests/*.bsh → 断言 → 聚合 PASS/FAIL。" }
   ],
   "test_plan": [
     {
       "id": "T1",
-      "scenario": "lazy-init 触发：开关开 + since 未设(=升级现状)，抢一个拼手气包。",
+      "scenario": "证明缝 单测(fake StoragePort)：speak-store upsertFirstSeen/upsertLastSpeak 对内存 fake 的行为。",
       "assertions": [
-        "rp.log 记『no since anchor → lazy-init now ... skip this round』",
-        "本轮不发任何警告(仍跳过)；下一个包不再『no since anchor』(since 已写)，进入宽限期"
+        "对已有更早 first_seen 取 min 不被覆盖；缺失行被插入",
+        "对 NULL first_seen 行(coalesce 语义) → 被设为新值"
       ],
       "negative_or_boundary": true,
-      "negative_case": "lazy-init 当轮就发警告即 FAIL(必须保守跳过)。",
-      "covers": ["R1"],
+      "negative_case": "若实现退回 min(NULL,x) 语义致 NULL 留 NULL，单测须 red。",
+      "covers": ["R5"],
+      "risks": ["RISK2"],
+      "traffic_flows": ["F2"]
+    },
+    {
+      "id": "T2",
+      "scenario": "证明缝 集成(真 sqlite-jdbc 库)：跑实际 UPSERT SQL。",
+      "assertions": [
+        "coalesce SQL：NULL→now、更早值保留、无行插入 三例全绿",
+        "旧 SQL(min 无 coalesce)：NULL 行测试 red(复现历史 bug，证明测试有效)"
+      ],
+      "negative_or_boundary": true,
+      "negative_case": "集成测试对旧 SQL 不 red = 测试没真连库/没断到点，FAIL。",
+      "covers": ["R5"],
+      "risks": ["RISK2"],
+      "traffic_flows": ["F2"]
+    },
+    {
+      "id": "T3",
+      "scenario": "build.sh 拼接产物可解析。",
+      "assertions": [
+        "build.sh 输出单一 main.java，按 manifest 顺序拼接含选定生产适配器",
+        "产物经 bsh.Parser 去 final 解析 EXIT=0"
+      ],
+      "negative_or_boundary": true,
+      "negative_case": "拼接顺序错致未定义引用/解析失败 → check.sh red。",
+      "covers": ["R3", "R4"],
       "risks": ["RISK1"],
       "traffic_flows": ["F1"]
     },
     {
-      "id": "T2",
-      "scenario": "不回归 + 键一致 + 版本：since 已设的群、bsh 解析、加载、版本三处。",
+      "id": "T4",
+      "scenario": "交付物/事实核实 + 不触碰线上插件(验证检查，非 bsh 单测)。",
       "assertions": [
-        "since 已设的群行为不变(不被 lazy-init 覆盖，走原宽限/判定)",
-        "bsh.Parser EXIT=0；真机干净加载 v1.11.4；顶部注释/onLoad 日志/info.prop 三处版本一致"
+        "设计文档存在于 docs/superpowers/specs/ 且含架构+测试金字塔+分期；config store 共享性事实已记录(设计文档/记忆)",
+        "git diff --name-only 显示 P0 期间 plugins/group-admin/main.java 与 plugins/redpacket-stats/main.java 零改动(线上不受影响)"
       ],
       "negative_or_boundary": true,
-      "negative_case": "since 已设却被 lazy-init 覆盖(重置宽限)即 FAIL。",
+      "negative_case": "P0 改动了任一线上插件 main.java，或设计文档/config 事实缺失 → FAIL。",
       "covers": ["R1", "R2"],
-      "risks": ["RISK2"],
-      "traffic_flows": ["F1"]
+      "risks": ["RISK3"],
+      "traffic_flows": ["F1", "F2"]
     }
   ],
   "acceptance": [
-    { "id": "A1", "text": "lazy-init 自愈 since 且保守不误警(补 since 后本轮跳过)。", "must_have_evidence": true, "tests": ["T1"], "covers": ["R1"] },
-    { "id": "A2", "text": "不回归 + 键一致 + 版本三处一致 + 干净加载。", "must_have_evidence": true, "tests": ["T2"], "covers": ["R2"] }
+    { "id": "A1", "text": "设计文档提交 + config store 事实核实记录(用户过目确认) + P0 不触碰线上插件。", "must_have_evidence": true, "tests": ["T3", "T4"], "covers": ["R1", "R2"] },
+    { "id": "A2", "text": "build+端口+runner 地基跑通：证明缝 单测+集成 red→green，check.sh 全绿。", "must_have_evidence": true, "tests": ["T1", "T2", "T3"], "covers": ["R3", "R4", "R5"] }
   ],
   "tasks": [
-    { "id": "W1", "stage": "EXECUTE", "title": "判定线程 since<=0 分支改 lazy-init putString since=now + 版本 bump v1.11.4 + SPEC 注记", "covers": ["R1", "R2"], "risk": "medium" },
-    { "id": "W2", "stage": "VERIFY", "title": "bsh 解析 → 部署 → 干净加载 → lazy-init 日志实测 + Santa 审", "covers": ["R1", "R2"], "risk": "medium" }
+    { "id": "W0", "stage": "EXECUTE", "title": "上设备核实 config store 共享性(只读诊断) + 写设计文档 docs/superpowers/specs/ + 暂停待用户过目", "covers": ["R1", "R2"], "risk": "low" },
+    { "id": "W1", "stage": "EXECUTE", "title": "建仓库模块结构 + build.sh(manifest 拼接) + 端口骨架/适配器", "covers": ["R3", "R4"], "risk": "medium" },
+    { "id": "W2", "stage": "EXECUTE", "title": "test runner + sqlite-jdbc + 证明缝 speak-store + 单测/集成 red→green + check.sh", "covers": ["R5"], "risk": "medium" }
   ],
   "irreversible_actions": [
-    "部署 RedPacketStats 插件到真机(可回滚：留底 main.java；功能仍默认行为不变)",
-    "lazy-init 会向 WAuxiliary 存储 putString 一次 since(幂等:只在 since<=0 时补)"
+    "P0 不部署、不触碰线上 GroupAdmin/RedPacketStats(照常运行)；仅在仓库新增 build/test 基建文件",
+    "fetch sqlite-jdbc(一次性网络下载到本地 tools/，记入 README)"
   ],
-  "out_of_scope": ["伸手党判定/宽限/排除名单逻辑本身(v1.11.3 已定)", "30min 宽限期长度(用户可用 伸手党窗口 N 调)"],
-  "delivery": "改 RedPacketStats 判定段 since<=0 分支 + 部署 + bump v1.11.4。用户原测试群开关仍开着，部署后下一个拼手气包会自动补 since、本轮跳过，之后按宽限/判定生效(嫌 30min 久可 伸手党窗口 1 快测)。"
+  "out_of_scope": [
+    "P1+ 业务迁移(GroupAdmin/RedPacketStats 进骨架)——P0 只搭地基 + 一个证明缝",
+    "freeloader→doWarn 直连(P3)"
+  ],
+  "delivery": "P0 交付：设计文档(待用户过目)+ config store 核实 + 模块化 build + 端口/适配器 + 本地 bsh 测试 runner(sqlite-jdbc 真库)+ speak-store 证明缝 red→green。不动线上插件。"
 }

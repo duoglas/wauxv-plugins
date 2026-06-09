@@ -1,0 +1,13 @@
+// 测试 harness：check + 哨兵输出。各测试首行 source 它。
+// 用 int[] 计数器避免 bsh 方法内改外层 typed 变量的作用域坑。
+int[] _CNT = { 0, 0 };   // {fails, total}
+
+void check(String name, boolean ok) {
+    _CNT[1]++;
+    System.out.println((ok ? "PASS " : "FAIL ") + name);
+    if (!ok) _CNT[0]++;
+}
+
+void done() {
+    System.out.println(_CNT[0] == 0 ? ("TEST_OK (" + _CNT[1] + ")") : ("TEST_FAIL (" + _CNT[0] + "/" + _CNT[1] + ")"));
+}

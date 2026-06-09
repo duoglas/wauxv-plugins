@@ -1,0 +1,25 @@
+// L1 单测：speak_store 领域 vs fake StoragePort（契约/交互，无 DB）。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("src/domain/speak_store.bsh");
+source("tests/fakes/storage_fake.bsh");
+
+// upsert 用正确 SQL + binds 调端口
+FAKE_EXEC_CALLS.clear();
+speakUpsertFirstSeen("g1", "wA", 12345L);
+check("exec 调用一次", FAKE_EXEC_CALLS.size() == 1);
+Object[] call = (Object[]) FAKE_EXEC_CALLS.get(0);
+check("SQL == upsert(含 coalesce)", call[0].equals(SPEAK_UPSERT_FIRSTSEEN_SQL));
+check("SQL 含 coalesce", ((String) call[0]).indexOf("coalesce(first_seen") >= 0);
+Object[] binds = (Object[]) call[1];
+check("bind[0]=grp", binds[0].equals("g1"));
+check("bind[1]=wxid", binds[1].equals("wA"));
+check("bind[2]=ts(Long)", (binds[2] instanceof Long) && ((Long) binds[2]).longValue() == 12345L);
+
+// queryLong 透传端口返回
+FAKE_QUERY_RET = new Long(999);
+check("query 透传=999", speakQueryFirstSeen("g1", "wA").longValue() == 999L);
+FAKE_QUERY_RET = null;
+check("query 透传 null", speakQueryFirstSeen("g1", "wA") == null);
+
+done();

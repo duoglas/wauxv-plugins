@@ -1,0 +1,28 @@
+// ============================================================
+// domain/speak_store — 发言时间(last_speak/first_seen)持久化领域逻辑。
+// 只依赖 StoragePort(全局 STORAGE)，不碰 android/jdbc 具体实现 → 可本地测。
+// 端口契约: STORAGE.exec(String sql, Object[] binds) ; STORAGE.queryLong(String sql, Object[] binds) -> Long|null
+// binds 元素为 String 或 Long。
+// ============================================================
+
+// SQL 由领域拥有(这是被测的真正逻辑)。coalesce 兜底 NULL(对齐 v1.19.2/v1.20.0 教训:
+//   SQLite min/max(NULL,x)=NULL，旧列可能 NULL 必须 coalesce)。
+SPEAK_UPSERT_FIRSTSEEN_SQL =
+    "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,NULL,?) "
+    + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)";
+
+SPEAK_QUERY_FIRSTSEEN_SQL = "SELECT first_seen FROM speak WHERE grp=? AND wxid=?";
+
+// 建表(测试/迁移用；生产由各自 onLoad 建)。
+SPEAK_CREATE_SQL =
+    "CREATE TABLE IF NOT EXISTS speak(grp TEXT, wxid TEXT, last_speak INTEGER, first_seen INTEGER, PRIMARY KEY(grp,wxid))";
+
+// 补 first_seen(冲突取 min，绝不改晚；NULL 经 coalesce 被设值)。
+void speakUpsertFirstSeen(String grp, String wxid, long ts) {
+    STORAGE.exec(SPEAK_UPSERT_FIRSTSEEN_SQL, new Object[]{ grp, wxid, new Long(ts) });
+}
+
+// 查 first_seen(无行/NULL → null)。
+Long speakQueryFirstSeen(String grp, String wxid) {
+    return STORAGE.queryLong(SPEAK_QUERY_FIRSTSEEN_SQL, new Object[]{ grp, wxid });
+}
