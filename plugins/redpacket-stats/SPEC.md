@@ -1,7 +1,8 @@
 # RedPacketStats SPEC（正式版 v1.0）
 
 > 插件行为规格（C-PLUGIN-03 要求）。**改行为先改本文件，再改 `main.java`。**
-> 当前版本：**v1.11.4（待部署）**——在 v1.11.3 之上**修升级缺口**（§25.9.1）：判定段 `since<=0` 由"直接跳过"改为"**lazy-init 补写 since=now 再跳过**"。根因：`since` 只在开关 OFF→ON 写，用户在 v1.11.2 已开开关、升级到 v1.11.3 时带"已开"状态从未经历 OFF→ON → `since=0` → 安全网整包跳过 → 伸手党静默失效。自愈、免手动重切，下一个包即生效，仍保守不当轮判。详见 §25.9.1。
+> 当前版本：**v1.11.5（待部署）**——修**「抢后发言洗白」漏判**（§25.10）。根因（真机实证）：伸手党判定在 RP 延迟开包后（~90s）才跑，读的是**判定那一刻**的 `last_speak`；GA speak 表只存最近一次发言。抢包者抢完马上说句话（如"谢谢老板"）→ `last_speak` 被推过窗口阈值 → 误判活跃 → 漏警告。修：红包**检测到那一刻**后台快照本群 `wxid→last_speak`（赶在抢后发言之前），判定改**快照值 + 当前值双判据**——快照抓"抢后才发言"的洗白者，当前值兜住"抢前发言但 flush 延迟未落盘"的正常人；快照不可用则降级回 v1.11.4 当前值判据（保守不误警告）。热路径只多一次 fire-and-forget 线程 spawn。详见 §25.10。
+> 历史：**v1.11.4**——在 v1.11.3 之上**修升级缺口**（§25.9.1）：判定段 `since<=0` 由"直接跳过"改为"**lazy-init 补写 since=now 再跳过**"。根因：`since` 只在开关 OFF→ON 写，用户在 v1.11.2 已开开关、升级到 v1.11.3 时带"已开"状态从未经历 OFF→ON → `since=0` → 安全网整包跳过 → 伸手党静默失效。自愈、免手动重切，下一个包即生效，仍保守不当轮判。详见 §25.9.1。
 > 历史：**v1.11.3**——在 v1.11.2 之上**收尾红包伸手党治理**（§25.9）：撤 DRY-RUN/GFDBG 调试态、恢复真发送警告。豁免模型改为「**全局开关时刻宽限**」——新增 per-group 键 `rp_freeloader_since_<gid>`（开关 OFF→ON 写当前 ms），判定段先闸门：`since<=0`（安全网跳过）或红包检测时刻 `packetMs` 在 `since+winMs` 内 → **整包跳过（全员豁免，数据预热期）**；宽限过后所有领取者（含新进群）按 `last_speak` 判，**不用 `first_seen`**（与 `#潜水` 区分）。复用红包排除名单 `getExcludeList` 豁免领取者。后台线程/cap10/容差/安全网/命令/Dialog 不变，日志脱敏。默认关。详见 §25.9。
 > 历史：**v1.11.2**——把伸手党判定基准由「每人领取时刻」改为「**红包检测时刻**」（全员统一）。原因：真机确认当前微信版本领取者反射模型无 per-person 领取时刻字段（`g` 取不到），故退用红包检测/到达时刻做统一基准。Job 增 `JOB_DETECTMS` 第 10 槽承载检测时刻；撤掉 `hbExtractTriple` 的 `g`/`grabMs` 提取 + `receivers` 回 3 元素；删临时 GPROBE。详见 §25.8。
 >
@@ -636,3 +637,32 @@ hbDetailExtract: 反射读领取者明细 (仅 wxid; 无 per-person 领取时刻
 - **根因（真机实证）**：`since` 锚点只在开关 **OFF→ON** 切换时写。若开关在 `since` 机制（v1.11.3）**之前就已打开**（如 v1.11.2 测试时开的），升级到 v1.11.3 时带着「已开」状态、从未经历 OFF→ON → `cfgFreeloaderSince` 返 `0` → 判定段 `since<=0` 安全网**整包跳过** → 伸手党静默失效。rp.log 实证：`10:00 freeloader warned=4`（v1.11.2 工作）→ `12:52/13:08 freeloader skip: no since anchor`（v1.11.3 后失效）。
 - **修复**：判定线程发现「开关开 但 `since<=0`」时，**lazy-init**：`putString(rp_freeloader_since_<gid>, now)` 补写锚点，**本轮仍跳过**（从此刻起算 `winMs` 宽限），并记 `lazy-init now ... skip this round` 日志。下一个红包即按宽限/判定正常生效。自愈、免手动 `伸手党 关`→`伸手党 开` 重切；以后任何「升级时开关已开」都自动补。
 - **仍保守**：补 `since` 后**不在当轮判定**（避免对已开很久、数据其实成熟的群突然误警告）；统一从「补 since 的此刻」起算 30min（或 `伸手党窗口 N`）宽限。`putString` 在后台判定线程（非 `onHandleMsg` 热路径）。**v1.11.4 起三处 `since` 写点（lazy-init / 命令 OFF→ON / Dialog OFF→ON）写 key 均显式经 `normGroupId()` 归一**，与 `cfgFreeloaderSince` 读 key（`normGroupId=trim`）无条件一致（消除「写裸 groupId、读 trim」的潜在错配，Santa 修复）。命令/Dialog 的 OFF→ON 写 `since` 时机不变。
+
+### 25.10 v1.11.5「抢后发言洗白」漏判修复（检测时刻快照 + 双判据）
+
+> **根因（真机实证，2026-06-09）**：群 `GROUP_B_ID@chatroom`（伸手党开、win=10、宽限已过），红包 14:29:00 检测，领取者 🐽 抢前最近一次发言是**昨晚 20:00**（窗口内沉默=伸手党），但抢完在 **14:29:14**（包后 14 秒）发了句话。判定在 RP 延迟开包后 **14:30:26** 才跑，`rpQueryLastSpeak` 读到的 `last_speak=14:29:14 > thr(14:18)` → 误判活跃 → **漏警告**。
+> **本质**：判定读的是「**判定那一刻**」的 `last_speak`，而 GA `speak` 表只存「最近一次发言」（无历史）。判定被反检测开包延迟推后 ~90s，期间伸手党"抢完说句话"就把 `last_speak` 推过阈值，判定再也分不清这句话是抢包**前**还是**后**说的。
+
+- **语义（用户拍板）**：伸手党 = 在**红包检测时刻往前 N 分钟内没发言**的领取者；**抢完之后再发言不能洗白**。
+- **检测时刻快照（核心）**：`onHandleMsg` 检测到红包入队后，**spawn 一个 fire-and-forget 后台线程**立即快照本群 `speak`：`SELECT wxid,last_speak FROM speak WHERE grp=?`（只读、用完即关），结果存为 `Map<wxid, Long>`（`last_speak` 为 NULL 存 `0L`；不在表里=不 put → 读时 `-1`）。快照按 `JOB_KEY` 存入模块级 `FREELOADER_SNAP`（`ConcurrentHashMap`）。
+  - **时机**：快照必须在「红包到达那一刻」做，赶在领取者抢后发言落盘之前 → 捕获的是**抢包前**的发言状态。spawn 在 `onHandleMsg` 入队之后，线程内查库，**热路径只多一次 `Thread.start()`（O(1)）**，DB 查询全在后台线程（C-PERF-01/03 守住）。
+  - **一次性**：快照只在原始检测时 spawn 一次；重试重入队不重新快照（要的就是检测时刻的值）。
+  - **生命周期**：判定读完即 `FREELOADER_SNAP.remove(key)`；`DONE.add(key)` / 关页清理路径也兜底 remove，防泄漏；`FREELOADER_SNAP` 设容量上限（如 >200 时清空）做 backstop。
+- **判定双判据（替换 §25.9 单判据 `inactive=(ls==0)||(ls<thr)`）**：抽出纯函数 `freeloaderInactive(curLs, snapLs, packetMs, winMs, graceMs)`：
+  - `thr = packetMs - winMs - graceMs`（`graceMs = FREELOADER_FLUSH_GRACE_MS = 60s`，含义不变）。
+  - `curLs = rpQueryLastSpeak(talker, w)`（判定时刻当前值）：`-1`=无行/DB 不可用 → **SKIP**（安全网，不变）；`0`=NULL=从未发言；`>0`=毫秒。
+  - `snapLs = FREELOADER_SNAP[key].get(w)`（检测时刻快照值）：`-1`=快照里无此人/快照不可用；`0`=快照时 NULL；`>0`=毫秒。
+  - 判据：
+    - `if (curLs < 0) → SKIP`（安全网，不变）。
+    - `hasSnap = (snapLs >= 0)`（快照存在且含此人）。
+    - **有快照**：`spokeInWindow = (curLs >= thr && curLs <= packetMs) || (snapLs >= thr)`；`inactive = !spokeInWindow`。
+      - `curLs∈[thr,packetMs]`：当前最近发言落在「窗口内且不晚于红包」→ 抢前发过言（兜 flush 延迟）→ 活跃。
+      - `snapLs >= thr`：检测时刻快照显示窗口内发过言 → 抢前活跃（兜"抢前抢后都发言"的真活跃者）。
+      - 两者皆否 → 抢前窗口内没发言 → 伸手党（含"只在抢后发言"和"从未发言 curLs==0"）。
+    - **无快照（降级）**：回退 v1.11.4 当前值判据 `inactive = (curLs == 0) || (curLs < thr)`——**不**因「`curLs>packetMs`(抢后发言)」单独判伸手党（无快照佐证抢前是否发言，宁可漏判不误警告，致踢人风险高）。
+  - 真值表（L1 单测必覆盖）：①🐽 抢后发言(curLs>packetMs, snapLs<thr)→**警告** ②抢前发言+flush 延迟(curLs∈[thr,packetMs])→放过 ③抢前抢后都发言(snapLs≥thr)→放过 ④从未发言(curLs=0)→警告 ⑤只昨天发过(curLs<thr,snapLs<thr)→警告 ⑥窗口内发言无抢后(curLs∈[thr,packetMs])→放过 ⑦无快照+抢后发言(降级)→放过(保守漏判) ⑧curLs<0 无行/DB→SKIP。
+- **观测补盲（§25.7 留痕扩展）**：判定段末尾改为**恒定**写一条 summary：`freeloader judged=N warned=W active=A skip_norow=X excluded=E capped=C snap=ok/fail`（`judged` = 进入逐人循环的总领取者数，含被排除名单豁免的 `excluded`；原仅 `warned>0||capped>0` 才写 → 静默盲区，是本次排查难定位的直接原因）。仍脱敏（只计数 + wxid 尾 4）。
+- **快照生命周期补全（leak 防护）**：`FREELOADER_SNAP` 的 put（检测时）须与 remove 配平。判定线程 `finally` remove（覆盖判定/grace/lazy-init 各 return）；**判定线程未起的所有路径**也须兜底 remove：`hbProcess` ABORT（hostContext 不可用）、`hbDetailExtract` 反射无领取者列表早退、均分包过滤早退、详情错误 catch、专属/普通/放弃终结路径、以及伸手党块条件不成立（开关在判定时已关 / packetMs<=0 / talker 空）的 `else` 分支。`>200` backstop 仅作最后兜底，不作常规依赖。
+- **不变项**：`rpQueryLastSpeak` 查询/返回约定不变；`since` 宽限闸门（§25.9/§25.9.1）、排除名单豁免、后台 fire-and-forget 线程、`FREELOADER_MAX_WARN=10`、`Thread.sleep(800)`、命令/Dialog/状态、`JOB_DETECTMS` 基准全不变。新增仅：检测时快照线程 + `FREELOADER_SNAP` 表 + 判定双判据 + 恒定 summary 日志。
+- **本地测试要求（项目硬规：所有功能本地单测+集成）**：`freeloaderInactive` 纯函数离线 bsh L1 单测覆盖①–⑧；快照+判定链路 L2（sqlite-jdbc 真库喂 speak 行 + 模拟"抢后发言推进 last_speak"）。全绿才进真机 VERIFY。
+- **风险**：破坏性上游（最终累计踢人）→ Layer 4 Santa 双独立 Reviewer。误警告（致误踢）由"无快照降级保守 + 双判据兜抢前发言"消解。

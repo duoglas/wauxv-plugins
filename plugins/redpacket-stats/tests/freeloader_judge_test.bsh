@@ -1,0 +1,65 @@
+// freeloader_judge_test.bsh — RedPacketStats v1.11.5 伸手党判定 L1 单测 (SPEC §25.10 真值表①–⑧)
+//
+// 运行: java -cp merged/tools/bsh-2.0b6.jar bsh.Interpreter plugins/redpacket-stats/tests/freeloader_judge_test.bsh
+//   (从仓库根目录跑; 期望输出每条 PASS + 末尾 TEST_OK (8), 无 FAIL)
+//
+// 自带简易 check/done (仿 merged/tests/_harness.bsh, 无外部 source 依赖)。
+
+int[] _CNT = { 0, 0 };   // {fails, total}
+void check(String name, boolean ok) {
+    _CNT[1]++;
+    System.out.println((ok ? "PASS " : "FAIL ") + name);
+    if (!ok) _CNT[0]++;
+}
+void done() {
+    System.out.println(_CNT[0] == 0 ? ("TEST_OK (" + _CNT[1] + ")") : ("TEST_FAIL (" + _CNT[0] + "/" + _CNT[1] + ")"));
+}
+
+// ================================================================
+// ⚠️ 与 main.java 的 freeloaderDecide 逐字一致 — 改一处必须改两处!
+//   返回: -1=SKIP(安全网, 不发) ; 0=OK(活跃, 不发) ; 1=WARN(判伸手党, 发警告)
+// ================================================================
+int freeloaderDecide(long curLs, long snapLs, long packetMs, long winMs, long graceMs) {
+    long thr = packetMs - winMs - graceMs;
+    if (curLs < 0L) return -1;                          // 安全网: 无行/DB 不可用 → SKIP
+    boolean hasSnap = (snapLs >= 0L);                    // 快照存在且含此人
+    if (hasSnap) {
+        boolean spokeInWindow = (curLs >= thr && curLs <= packetMs) || (snapLs >= thr);
+        return spokeInWindow ? 0 : 1;
+    }
+    // 无快照降级
+    return ((curLs == 0L) || (curLs < thr)) ? 1 : 0;
+}
+
+// ---- 固定参数 ----
+long packetMs = 1000000000L;     // 红包检测时刻 (任意大常量)
+long winMs    = 600000L;         // 10 分钟窗口
+long graceMs  = 60000L;          // flush 容差 60s
+// thr = packetMs - winMs - graceMs = 1000000000 - 600000 - 60000 = 999340000
+long thr = packetMs - winMs - graceMs;
+
+// ① 🐽 抢后发言: curLs=packetMs+14000(包后14s发言洗白), snapLs=昨晚(远早于 thr) → 期望 1 (WARN)
+check("① 🐽抢后发言→WARN", freeloaderDecide(packetMs + 14000L, packetMs - 64000000L, packetMs, winMs, graceMs) == 1);
+
+// ② flush延迟抢前发言: curLs∈[thr,packetMs](抢前发过但快照没赶上), snapLs=-1(快照无此人) → 期望 0 (OK)
+check("② flush延迟抢前发言(无快照兜底)→OK", freeloaderDecide(packetMs - 120000L, -1L, packetMs, winMs, graceMs) == 0);
+
+// ③ 抢前抢后都发言: curLs=packetMs+14000(抢后), snapLs=packetMs-120000(>=thr, 抢前窗口内) → 期望 0 (OK)
+check("③ 抢前抢后都发言(snapLs>=thr)→OK", freeloaderDecide(packetMs + 14000L, packetMs - 120000L, packetMs, winMs, graceMs) == 0);
+
+// ④ 从未发言: curLs=0, snapLs=0 → 期望 1 (WARN)
+check("④ 从未发言(curLs=0,snapLs=0)→WARN", freeloaderDecide(0L, 0L, packetMs, winMs, graceMs) == 1);
+
+// ⑤ 只昨天发过(有快照): curLs=packetMs-64000000, snapLs=packetMs-64000000(都<thr) → 期望 1 (WARN)
+check("⑤ 只昨天发过(有快照,皆<thr)→WARN", freeloaderDecide(packetMs - 64000000L, packetMs - 64000000L, packetMs, winMs, graceMs) == 1);
+
+// ⑥ 窗口内发言无抢后: curLs=packetMs-120000(∈[thr,packetMs]), snapLs=packetMs-120000 → 期望 0 (OK)
+check("⑥ 窗口内发言无抢后→OK", freeloaderDecide(packetMs - 120000L, packetMs - 120000L, packetMs, winMs, graceMs) == 0);
+
+// ⑦ 无快照+抢后发言(降级): curLs=packetMs+14000(>thr 且 !=0), snapLs=-1 → 期望 0 (OK, 保守漏判)
+check("⑦ 无快照+抢后发言(降级)→OK保守漏判", freeloaderDecide(packetMs + 14000L, -1L, packetMs, winMs, graceMs) == 0);
+
+// ⑧ curLs<0: 无行/DB 不可用 → 期望 -1 (SKIP)
+check("⑧ curLs<0(无行/DB不可用)→SKIP", freeloaderDecide(-1L, -1L, packetMs, winMs, graceMs) == -1);
+
+done();
