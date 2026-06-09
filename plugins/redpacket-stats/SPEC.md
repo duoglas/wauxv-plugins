@@ -1,7 +1,8 @@
 # RedPacketStats SPEC（正式版 v1.0）
 
 > 插件行为规格（C-PLUGIN-03 要求）。**改行为先改本文件，再改 `main.java`。**
-> 当前版本：**v1.11.3（待部署）**——在 v1.11.2 之上**收尾红包伸手党治理**（§25.9）：撤 DRY-RUN/GFDBG 调试态、恢复真发送警告。豁免模型改为「**全局开关时刻宽限**」——新增 per-group 键 `rp_freeloader_since_<gid>`（开关 OFF→ON 写当前 ms），判定段先闸门：`since<=0`（安全网跳过）或红包检测时刻 `packetMs` 在 `since+winMs` 内 → **整包跳过（全员豁免，数据预热期）**；宽限过后所有领取者（含新进群）按 `last_speak` 判，**不用 `first_seen`**（与 `#潜水` 区分）。复用红包排除名单 `getExcludeList` 豁免领取者。后台线程/cap10/容差/安全网/命令/Dialog 不变，日志脱敏。默认关。详见 §25.9。
+> 当前版本：**v1.11.4（待部署）**——在 v1.11.3 之上**修升级缺口**（§25.9.1）：判定段 `since<=0` 由"直接跳过"改为"**lazy-init 补写 since=now 再跳过**"。根因：`since` 只在开关 OFF→ON 写，用户在 v1.11.2 已开开关、升级到 v1.11.3 时带"已开"状态从未经历 OFF→ON → `since=0` → 安全网整包跳过 → 伸手党静默失效。自愈、免手动重切，下一个包即生效，仍保守不当轮判。详见 §25.9.1。
+> 历史：**v1.11.3**——在 v1.11.2 之上**收尾红包伸手党治理**（§25.9）：撤 DRY-RUN/GFDBG 调试态、恢复真发送警告。豁免模型改为「**全局开关时刻宽限**」——新增 per-group 键 `rp_freeloader_since_<gid>`（开关 OFF→ON 写当前 ms），判定段先闸门：`since<=0`（安全网跳过）或红包检测时刻 `packetMs` 在 `since+winMs` 内 → **整包跳过（全员豁免，数据预热期）**；宽限过后所有领取者（含新进群）按 `last_speak` 判，**不用 `first_seen`**（与 `#潜水` 区分）。复用红包排除名单 `getExcludeList` 豁免领取者。后台线程/cap10/容差/安全网/命令/Dialog 不变，日志脱敏。默认关。详见 §25.9。
 > 历史：**v1.11.2**——把伸手党判定基准由「每人领取时刻」改为「**红包检测时刻**」（全员统一）。原因：真机确认当前微信版本领取者反射模型无 per-person 领取时刻字段（`g` 取不到），故退用红包检测/到达时刻做统一基准。Job 增 `JOB_DETECTMS` 第 10 槽承载检测时刻；撤掉 `hbExtractTriple` 的 `g`/`grabMs` 提取 + `receivers` 回 3 元素；删临时 GPROBE。详见 §25.8。
 >
 > 历史当前版本：**v1.11.0（待部署）**——在 v1.10.0 之上新增**红包伸手党治理**（§25）：抢红包者在抢到时刻前 N 分钟（默认 30）未在群发言 → 后台反射线程自动发群管警告命令 `[AtWx=wxid] 警告 {N}分钟内未发言`，由 GroupAdmin v1.19.0 按原流程执行（v1.11.2 已把基准改为红包检测时刻，见上）。per-group 开关 `rp_freeloader_on_<gid>`（默认关）/ 窗口 `rp_freeloader_win_<gid>`（默认 30）。**全程后台线程、零 onHandleMsg 热路径、不直接踢人**。
@@ -629,3 +630,9 @@ hbDetailExtract: 反射读领取者明细 (仅 wxid; 无 per-person 领取时刻
 - **隐私**：撤销 DRY-RUN 的 `[GFDBG]` 昵称日志；判定日志只记 `tail4`（wxid 尾 4）+ `NULL/old` + 计数，不落昵称、不落完整 wxid（`[AtWx=wxid]` 仅出现在发往微信的命令文本中，是机制本身，不入 log 文件）。
 - **不变项**：`rpQueryLastSpeak` 不改；后台 fire-and-forget 线程 / `FREELOADER_MAX_WARN=10` / `FREELOADER_FLUSH_GRACE_MS=60s` / `JOB_DETECTMS` 基准 / `onHandleMsg` 零热路径全部不变。`since` 写入只在命令/Dialog 路径（非热路径）。
 - **默认关 + 启用提示**：`rp_freeloader_on_<gid>` 仍默认空（关）。⚠️ 因 `last_speak` 刚修复+重置仍大量 NULL（自愈中），30min 全局宽限盖不住多小时自愈期；**建议数据自愈后或仅在小测试群临时开**，启用即累计可触发 GroupAdmin 踢人。
+
+#### 25.9.1 v1.11.4 升级缺口自愈（lazy-init since）
+
+- **根因（真机实证）**：`since` 锚点只在开关 **OFF→ON** 切换时写。若开关在 `since` 机制（v1.11.3）**之前就已打开**（如 v1.11.2 测试时开的），升级到 v1.11.3 时带着「已开」状态、从未经历 OFF→ON → `cfgFreeloaderSince` 返 `0` → 判定段 `since<=0` 安全网**整包跳过** → 伸手党静默失效。rp.log 实证：`10:00 freeloader warned=4`（v1.11.2 工作）→ `12:52/13:08 freeloader skip: no since anchor`（v1.11.3 后失效）。
+- **修复**：判定线程发现「开关开 但 `since<=0`」时，**lazy-init**：`putString(rp_freeloader_since_<gid>, now)` 补写锚点，**本轮仍跳过**（从此刻起算 `winMs` 宽限），并记 `lazy-init now ... skip this round` 日志。下一个红包即按宽限/判定正常生效。自愈、免手动 `伸手党 关`→`伸手党 开` 重切；以后任何「升级时开关已开」都自动补。
+- **仍保守**：补 `since` 后**不在当轮判定**（避免对已开很久、数据其实成熟的群突然误警告）；统一从「补 since 的此刻」起算 30min（或 `伸手党窗口 N`）宽限。`putString` 在后台判定线程（非 `onHandleMsg` 热路径）。**v1.11.4 起三处 `since` 写点（lazy-init / 命令 OFF→ON / Dialog OFF→ON）写 key 均显式经 `normGroupId()` 归一**，与 `cfgFreeloaderSince` 读 key（`normGroupId=trim`）无条件一致（消除「写裸 groupId、读 trim」的潜在错配，Santa 修复）。命令/Dialog 的 OFF→ON 写 `since` 时机不变。

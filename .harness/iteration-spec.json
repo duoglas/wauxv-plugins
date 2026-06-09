@@ -1,129 +1,63 @@
 {
-  "iteration": "groupadmin-lurk-exempt-and-baseline-v1.20.0",
+  "iteration": "redpacket-freeloader-since-lazyinit-v1.11.4",
   "date": "2026-06-09",
-  "summary_one_line": "GroupAdmin v1.20.0：#潜水 新成员豁免改固定 1 天 + onLoad 主动补全员 first_seen 基线（堵伸手党漏检）+ l3UpsertFirstSeen coalesce 防 NULL。",
+  "summary_one_line": "修升级缺口：开关在 since 机制(v1.11.3)之前已开 → since=0 安全网整包跳过 → 伸手党静默失效。判定时若开关开但 since<=0 则自动补写 since=now(lazy-init)，自愈、免手动重切。",
   "user_confirmed": true,
+  "root_cause": "since 锚点只在『关→开』切换时写。用户在 v1.11.2 已打开开关，升级到 v1.11.3 时带着『已开』状态 → 从未经历 OFF→ON → cfgFreeloaderSince 返 0 → 判定段 since<=0 安全网整包跳过。日志实证:10:00/10:02 v1.11.2 真发警告(warned=4/2)；12:52/12:54/13:08 v1.11.3 后『freeloader skip: no since anchor』。normGroupId=trim，无 key 错配。",
   "requirements": [
-    { "id": "R1", "priority": "must", "text": "#潜水 新成员豁免由 days 窗口改为固定 1 天（新增常量 LURK_NEWMEMBER_EXEMPT_MS）：豁免判定 fst>now-1天；活跃判定 lst>cutoff(=now-days) 不变；冷启动提示『请等待 N 天』改『请等待 1 天』。" },
-    { "id": "R2", "priority": "must", "text": "onLoad 延迟基线块对所有已启用群都跑 initFirstSeenBaseline（幂等，只补缺失成员），不再只对 l3CountFirstSeen==0 的群补——堵『入群从不发言者无 speak 行 → 伸手党 rpQueryLastSpeak 返 -1 漏检』窄缝。" },
-    { "id": "R3", "priority": "must", "text": "修 l3UpsertFirstSeen 的 UPSERT min(first_seen,excluded.first_seen) → min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)，防已有 first_seen=NULL 行补不进（对齐 v1.19.2 last_speak coalesce 教训）。" },
-    { "id": "R4", "priority": "must", "text": "版本 bump v1.20.0（顶部注释 + onLoad 日志 + info.prop）+ SPEC 更新；不回归其他 #潜水/管理/热路径逻辑。" }
+    { "id": "R1", "priority": "must", "text": "判定线程中若 cfgFreeloaderSince(talker)<=0 且开关开，自动 putString 补写 since=System.currentTimeMillis()(lazy-init)，本轮仍跳过(从此刻起算宽限)，并记 lazy-init 日志。自愈『开关在 since 机制前已开』的升级缺口，免手动关→开重切。" },
+    { "id": "R2", "priority": "must", "text": "版本 bump v1.11.4(顶部注释 + onLoad 日志 + info.prop)+ SPEC §25.9 注记；不改其他判定/宽限/命令/Dialog/安全网逻辑。" }
   ],
   "design": {
-    "summary": "改三处 GroupAdmin：(1) doShowInactive 把豁免 cutoff 与潜水 cutoff 拆开——豁免用固定 1 天常量，活跃仍用 days；冷启动文案同步。(2) onLoad 5s 延迟块去掉 l3CountFirstSeen>0 的 skip，对每个已启用群都调 initFirstSeenBaseline（幂等 upsert，min 不覆盖更早，返回新增数）。(3) l3UpsertFirstSeen 的 UPSERT 用 coalesce 兜底 NULL。全部非热路径（命令/onLoad）。#潜水 仍是手动列表不自动踢；admin/owner/protected 豁免不变。",
+    "summary": "唯一改动在判定后台线程的 since<=0 分支：原来只 hbBgLog skip+return，改为先 putString(K_FREELOADER_SINCE_PREFIX+fTalker, now) 再 skip+return。putString 在后台判定线程(非 onHandleMsg 热路径)，key 与 cfgFreeloaderSince 读一致(均经 trim/normGroupId)。lazy-init 后本轮仍跳过、从此刻起 winMs 宽限，保守不误警。命令/Dialog 的 OFF→ON 写 since 不变。",
     "risk_points": [
-      { "id": "RISK1", "text": "#潜水 名单语义变化：豁免缩短到 1 天 → 列出更多人（进群 1~N 天内从没发言的也上榜）。必须保证活跃者（窗口内发过言）不被误列、判定方向正确。" },
-      { "id": "RISK2", "text": "onLoad 正确性/成本：幂等补基线不能覆盖更早 first_seen（min 语义），不能拖慢加载（5s 延迟块、非热路径）；coalesce 修复不能引入回归（NULL 行才走 coalesce，正常行不变）。" },
-      { "id": "RISK3", "text": "破坏性间接：#潜水 是管理员踢人前置参考，错误名单可能导致误踢。admin/owner/native-owner/protected 豁免必须保持不变。" }
+      { "id": "RISK1", "text": "破坏性上游(累计触发群管踢人)：lazy-init 必须仍保守——补 since 后本轮跳过 + 30min(winMs)宽限，绝不因自愈立即判定/误警告。" },
+      { "id": "RISK2", "text": "线程/键一致：putString 在后台线程(非热路径)安全；写 key K_FREELOADER_SINCE_PREFIX+fTalker 必须与 cfgFreeloaderSince 读 key 一致(normGroupId=trim)，否则补了也读不到。" }
     ]
   },
   "traffic_flows": [
-    { "id": "F1", "text": "#潜水 命令路径：doShowInactive → l3Flush → l3QueryLastSpeak/FirstSeen → 逐成员（机器人/admin/owner/protected 跳过 → 豁免 fst>now-1天 → 活跃 lst>cutoff → 否则潜水）→ 名单。" },
-    { "id": "F2", "text": "onLoad 基线补全路径：onLoad 5s delay → l3MigrateCsvToDb → 遍历 getEnabledGroups → initFirstSeenBaseline → l3UpsertFirstSeen（INSERT 缺失成员 first_seen=now / 冲突 min coalesce）。" }
+    { "id": "F1", "text": "判定线程 since<=0 分支：cfgFreeloaderSince→0 → putString since=now → hbBgLog lazy-init → return(skip)；下一个包读到 since>0 走原宽限/判定。" }
   ],
   "test_plan": [
     {
       "id": "T1",
-      "scenario": "#潜水 豁免边界：成员 A 进群 2 天从未发言、成员 B 进群 12 小时从未发言，跑 #潜水 7。",
+      "scenario": "lazy-init 触发：开关开 + since 未设(=升级现状)，抢一个拼手气包。",
       "assertions": [
-        "A（fst=2天前 < now-1天）→ 列入潜水名单",
-        "B（fst=12小时前 > now-1天）→ 仍豁免，计入『新成员在豁免期』不列"
+        "rp.log 记『no since anchor → lazy-init now ... skip this round』",
+        "本轮不发任何警告(仍跳过)；下一个包不再『no since anchor』(since 已写)，进入宽限期"
       ],
       "negative_or_boundary": true,
-      "negative_case": "B（<1天）被列入潜水即 FAIL（误把豁免期新成员当潜水）。",
+      "negative_case": "lazy-init 当轮就发警告即 FAIL(必须保守跳过)。",
       "covers": ["R1"],
       "risks": ["RISK1"],
       "traffic_flows": ["F1"]
     },
     {
       "id": "T2",
-      "scenario": "#潜水 活跃/管理豁免不回归：窗口内发过言者、admin、owner、protected 各一例。",
+      "scenario": "不回归 + 键一致 + 版本：since 已设的群、bsh 解析、加载、版本三处。",
       "assertions": [
-        "窗口内发过言（lst>cutoff）→ 不列",
-        "admin/owner/native-owner/protected → 不列"
+        "since 已设的群行为不变(不被 lazy-init 覆盖，走原宽限/判定)",
+        "bsh.Parser EXIT=0；真机干净加载 v1.11.4；顶部注释/onLoad 日志/info.prop 三处版本一致"
       ],
       "negative_or_boundary": true,
-      "negative_case": "活跃者或管理员被列入潜水即 FAIL。",
-      "covers": ["R1"],
-      "risks": ["RISK1", "RISK3"],
+      "negative_case": "since 已设却被 lazy-init 覆盖(重置宽限)即 FAIL。",
+      "covers": ["R1", "R2"],
+      "risks": ["RISK2"],
       "traffic_flows": ["F1"]
-    },
-    {
-      "id": "T3",
-      "scenario": "onLoad 补基线：已启用且已有基线的群里，存在无 speak 行的当前成员。",
-      "assertions": [
-        "onLoad 后该成员被补 first_seen=now（DB 出现其行）",
-        "已有更早 first_seen 的成员不被覆盖（min 语义）"
-      ],
-      "negative_or_boundary": true,
-      "negative_case": "已有更早 first_seen 被改晚成 now 即 FAIL（破坏单调）。",
-      "covers": ["R2", "R3"],
-      "risks": ["RISK2"],
-      "traffic_flows": ["F2"]
-    },
-    {
-      "id": "T4",
-      "scenario": "coalesce 修复：构造 first_seen=NULL 的已有行，跑补基线。",
-      "assertions": [
-        "first_seen=NULL 的行被设为 now（不再卡 NULL）",
-        "first_seen 已有非空值的行仍取 min 不被改晚"
-      ],
-      "negative_or_boundary": true,
-      "negative_case": "NULL 行补基线后仍为 NULL 即 FAIL（min(NULL,x)=NULL 老 bug 未修）。",
-      "covers": ["R3"],
-      "risks": ["RISK2"],
-      "traffic_flows": ["F2"]
-    },
-    {
-      "id": "T5",
-      "scenario": "版本一致 + 加载。",
-      "assertions": [
-        "bsh.Parser 去 final 全文解析 EXIT=0",
-        "真机干净加载 v1.20.0，LSPosed 无 eval/parse 异常；顶部注释/onLoad 日志/info.prop 三处版本一致"
-      ],
-      "negative_or_boundary": true,
-      "negative_case": "加载报解析异常或版本不一致即 FAIL。",
-      "covers": ["R4"],
-      "risks": ["RISK3"],
-      "traffic_flows": ["F1", "F2"]
     }
   ],
   "acceptance": [
-    {
-      "id": "A1",
-      "text": "#潜水 豁免=固定 1 天，活跃/管理豁免不回归。",
-      "must_have_evidence": true,
-      "tests": ["T1", "T2"],
-      "covers": ["R1"]
-    },
-    {
-      "id": "A2",
-      "text": "onLoad 全启用群幂等补基线 + coalesce 防 NULL，不覆盖更早 first_seen。",
-      "must_have_evidence": true,
-      "tests": ["T3", "T4"],
-      "covers": ["R2", "R3"]
-    },
-    {
-      "id": "A3",
-      "text": "版本三处一致 + 真机干净加载。",
-      "must_have_evidence": true,
-      "tests": ["T5"],
-      "covers": ["R4"]
-    }
+    { "id": "A1", "text": "lazy-init 自愈 since 且保守不误警(补 since 后本轮跳过)。", "must_have_evidence": true, "tests": ["T1"], "covers": ["R1"] },
+    { "id": "A2", "text": "不回归 + 键一致 + 版本三处一致 + 干净加载。", "must_have_evidence": true, "tests": ["T2"], "covers": ["R2"] }
   ],
   "tasks": [
-    { "id": "W1", "stage": "EXECUTE", "title": "doShowInactive 豁免拆固定 1 天 + 常量 + 冷启动文案", "covers": ["R1"], "risk": "medium" },
-    { "id": "W2", "stage": "EXECUTE", "title": "onLoad 对所有已启用群补基线 + l3UpsertFirstSeen coalesce 修复", "covers": ["R2", "R3"], "risk": "medium" },
-    { "id": "W3", "stage": "EXECUTE", "title": "版本 bump v1.20.0 + SPEC 更新", "covers": ["R4"], "risk": "low" },
-    { "id": "W4", "stage": "VERIFY", "title": "bsh 解析 → 部署 → 干净加载 → 补基线 DB 核对 + Santa 审", "covers": ["R1", "R2", "R3", "R4"], "risk": "medium" }
+    { "id": "W1", "stage": "EXECUTE", "title": "判定线程 since<=0 分支改 lazy-init putString since=now + 版本 bump v1.11.4 + SPEC 注记", "covers": ["R1", "R2"], "risk": "medium" },
+    { "id": "W2", "stage": "VERIFY", "title": "bsh 解析 → 部署 → 干净加载 → lazy-init 日志实测 + Santa 审", "covers": ["R1", "R2"], "risk": "medium" }
   ],
   "irreversible_actions": [
-    "部署 GroupAdmin 插件到真机（可回滚：留底 main.java）",
-    "onLoad 会向 groupadmin.db 补 first_seen 行（幂等、单调 min、不删不改晚，影响可控）"
+    "部署 RedPacketStats 插件到真机(可回滚：留底 main.java；功能仍默认行为不变)",
+    "lazy-init 会向 WAuxiliary 存储 putString 一次 since(幂等:只在 since<=0 时补)"
   ],
-  "out_of_scope": [
-    "伸手党功能本身（上一轮 RP v1.11.3 已收尾）",
-    "#潜水 自动踢人（仍是手动列表）"
-  ],
-  "delivery": "改 GroupAdmin 插件 + 部署 + bump v1.20.0。#潜水 仍手动列表不自动踢；不动 denylist、不刷模块、不批量踢人。"
+  "out_of_scope": ["伸手党判定/宽限/排除名单逻辑本身(v1.11.3 已定)", "30min 宽限期长度(用户可用 伸手党窗口 N 调)"],
+  "delivery": "改 RedPacketStats 判定段 since<=0 分支 + 部署 + bump v1.11.4。用户原测试群开关仍开着，部署后下一个拼手气包会自动补 since、本轮跳过，之后按宽限/判定生效(嫌 30min 久可 伸手党窗口 1 快测)。"
 }
