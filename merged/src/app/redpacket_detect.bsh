@@ -189,7 +189,10 @@ boolean rpDetectAndEnqueue(String groupId, String sender, String content, int ty
         Object[] job = new Object[]{ fKey, fTalker, sender0, Long.valueOf(msgid), Long.valueOf(dueAt),
                                      Integer.valueOf(0), "", content, Boolean.FALSE, Long.valueOf(detectMs) };
         rpEnqueue(job);
-        // ★刻意未搬: v1.11.5 检测时刻快照线程 (线上 @1281-1318)。合并版伸手党快照改 in-process T_snap 拍照 (T5)。
+        // ★T5 伸手党 in-process 单快照调度 (替代 v1.11.5 检测时快照线程 @1281-1318, spec §3.1):
+        //   在 T_snap=detectMs+G_eff 拍整群冻结快照存 FREELOADER_SNAP[fKey] (抢后污染前)。
+        //   fire-and-forget (开关读/G夹取/sleep/l3Flush/SELECT 全在后台线程), 热路径只多一次 Thread.start (C-PERF-01)。
+        try { rpScheduleFreeloaderSnapshot(fTalker, fKey, detectMs); } catch (Throwable t) {}
         hbBgLog("[RP] " + hbNow() + " redpacket candidate in enabled group (type=" + type
             + "). enqueued raw (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ". (extract/exclusive deferred to worker)");
         return false;   // 红包入队≠消费: 红包消息仍要让 GA 记发包人 last_speak (见 hooks 注释)

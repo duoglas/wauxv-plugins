@@ -1,0 +1,91 @@
+// ============================================================
+// L2 (P3-b T5): freeloaderRunWithSnapshot —— 生产判定路径(注入 P+G 预拍快照)。
+//   与 redpacket_app_freeloader_integration(走 DB+wrapper 自拍) 互补: 本片【直接注入快照 Map】,
+//   专验 T5 拆出的 in-process 判定契约 + 降级红线回归 #21(注入 null → 整批 SKIP 零 doWarn)。
+//   无需 DB(快照注入), 只接 HOST/CLOCK fake + warning 域(doWarn 真调副作用)。
+//
+// 权威 spec §3/§4.1/§5.2: #1 前1s活跃 / #6 略超窗伸手党 / #8 从未+老伸手党 / #8b 从未+新人豁免 /
+//   #14 排除 / #22 无此人 SKIP / #16 since 预热期跳过 / reason 守护 / #18 capped(11→10+1)。
+// 运行 cwd = merged/。
+// ============================================================
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");        // HOST(fake)/CLOCK(fake)/FAKE_SENT/FAKE_KICKED/FAKE_KV/FAKE_LOGIN_WXID
+source("src/domain/membership.bsh");        // canActOn/isOwner/normGroupId
+source("src/domain/warning.bsh");           // doWarn/setWarnKick
+source("src/domain/freeloader.bsh");        // freeloaderJudge/FL_*/FREELOADER_WARN_GAP_MS
+source("src/app/redpacket_app.bsh");        // freeloaderRunWithSnapshot (被测)
+
+FAKE_LOGIN_WXID = "bot";
+FREELOADER_WARN_GAP_MS = 0L;                 // 测试不 sleep(防拖慢)
+
+long P  = 1749470000000L;
+long N  = 30L * 60L * 1000L;                 // 窗口 30min
+long EX = 86400000L;                         // EXEMPT 1 天
+String GRP = "g1@chatroom";
+Long L(long v) { return new Long(v); }
+Long oldFs = L(P - 10L * EX);                // 老成员
+Long newFs = L(P - 2L * 3600000L);           // 新人(P-2h, 在 EXEMPT 内)
+
+void setSince(String w, long ms) { HOST.putString("rp_freeloader_since_" + normGroupId(w), String.valueOf(ms)); }
+setSince(GRP, P - 2L * N);                    // 锚点过预热期 → 正常判定
+setWarnKick(GRP, 99);                         // 阈值设高 → 只警告不踢(踢人累计另有 #25 测)
+void reset() { FAKE_SENT.clear(); FAKE_KICKED.clear(); }
+
+// ---- 构造注入快照 (无需 DB): Map<wxid, Object[]{ls,fs}> = "P+G 那一刻冻结的整群行" ----
+java.util.Map snap = new java.util.HashMap();
+snap.put("u_active", new Object[]{ L(P - 1000L),     oldFs });   // #1 前1s → 活跃
+snap.put("u_warn",   new Object[]{ L(P - N - 5000L), oldFs });   // #6 略超窗+老 → 伸手党
+snap.put("u_never",  new Object[]{ null,             oldFs });   // #8 从未+老 → 伸手党
+snap.put("u_new",    new Object[]{ null,             newFs });   // #8b 从未+新人 → 豁免
+snap.put("u_excl",   new Object[]{ null,             oldFs });   // #14 排除 → excluded
+// u_norow: 不在快照 → #22 SKIP
+
+java.util.Set exSet = new java.util.HashSet(); exSet.add("u_excl");
+java.util.List rcv = new java.util.ArrayList();
+rcv.add("u_active"); rcv.add("u_warn"); rcv.add("u_never"); rcv.add("u_new"); rcv.add("u_excl"); rcv.add("u_norow");
+
+reset();
+java.util.Map sum = freeloaderRunWithSnapshot(GRP, rcv, "bot", P, N, EX, exSet, FREELOADER_MAX_WARN, "30分钟内未发言", snap);
+java.util.Map v = (java.util.Map) sum.get("verdicts");
+check("#1  前1s发言 → ACTIVE",        ((Integer) v.get("u_active")).intValue() == FL_ACTIVE);
+check("#6  略超窗+老 → WARN",          ((Integer) v.get("u_warn")).intValue()   == FL_WARN);
+check("#8  从未发言+老 → WARN",        ((Integer) v.get("u_never")).intValue()  == FL_WARN);
+check("#8b 从未发言+新人 → EXEMPT",    ((Integer) v.get("u_new")).intValue()    == FL_EXEMPT_NEW);
+check("#14 排除名单 → excluded=1",     ((Integer) sum.get("excluded")).intValue() == 1);
+check("#22 快照无此人 → SKIP",         ((Integer) v.get("u_norow")).intValue()  == FL_SKIP);
+check("判伸手党总数 warned=2",         ((Integer) sum.get("warned")).intValue() == 2);
+check("toWarn 实发=2 (warn+never)",    ((java.util.List) sum.get("toWarn")).size() == 2);
+check("doWarn in-process 真调: ≥2 条 sendText", FAKE_SENT.size() >= 2);
+
+// ---- #21 ★降级红线回归: 注入 null 快照 → snapFail 整批 SKIP, 零 doWarn ----
+reset();
+java.util.Map sumNull = freeloaderRunWithSnapshot(GRP, rcv, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言", null);
+check("#21 null 快照 → snapFail",       ((Boolean) sumNull.get("snapFail")).booleanValue());
+check("#21 null 快照 → toWarn 空",      ((java.util.List) sumNull.get("toWarn")).isEmpty());
+check("#21 null 快照 → 零 doWarn",      FAKE_SENT.isEmpty());
+
+// ---- #16 since 预热期: packetMs 在 since+winMs 内 → 整包跳过零 doWarn ----
+reset();
+setSince(GRP, P - 1000L);                     // since 很近 → packetMs-since=1s < N → 预热期
+java.util.Map sumGrace = freeloaderRunWithSnapshot(GRP, rcv, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言", snap);
+check("#16 预热期 → gate=within_activation_grace", "within_activation_grace".equals(sumGrace.get("gate")));
+check("#16 预热期 → 零 doWarn",         FAKE_SENT.isEmpty());
+setSince(GRP, P - 2L * N);                     // 还原
+
+// ---- reason 守护: reason 空白 → 整批不发 (绝不落手动语义) ----
+reset();
+java.util.Map sumNoReason = freeloaderRunWithSnapshot(GRP, rcv, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "   ", snap);
+check("reason 空 → gate=no_reason",     "no_reason".equals(sumNoReason.get("gate")));
+check("reason 空 → 零 doWarn",          FAKE_SENT.isEmpty());
+
+// ---- #18 capped: 11 伸手党 → 判定 11, 实发 10, capped 1(留痕不静默截断) ----
+reset();
+java.util.Map snap2 = new java.util.HashMap();
+java.util.List rcv2 = new java.util.ArrayList();
+for (int i = 0; i < 11; i++) { String w = "ld_" + i; snap2.put(w, new Object[]{ null, oldFs }); rcv2.add(w); }
+java.util.Map sumCap = freeloaderRunWithSnapshot(GRP, rcv2, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言", snap2);
+check("#18 判伸手党 warned=11",         ((Integer) sumCap.get("warned")).intValue() == 11);
+check("#18 实发 toWarn=10",             ((java.util.List) sumCap.get("toWarn")).size() == 10);
+check("#18 capped=1",                   ((Integer) sumCap.get("capped")).intValue() == 1);
+
+done();

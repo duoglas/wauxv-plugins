@@ -1,0 +1,444 @@
+// ============================================================
+// app/device_recv — RedPacketStats 设备层【反射领取者 + 伸手党 in-process 调度】(P3-b T5)。
+//
+// 两块内容:
+//  (A) 反射领取者 (RECV) — 逐字保真移植自线上 plugins/redpacket-stats/main.java v1.11.5:
+//      hbFindReceiverList(@3125)/hbIsReceiverList(@3180)/hbIsLeaf(@3206)/hbExtractTriple(@2846)/
+//      hbReadFields(@2909)/hbLooksWxid(@2939)/hbLooksNick(@2954)/finishDetailAndCover(@2829)。
+//  (B) 伸手党【合并后判定】调度 —— ★非逐字, 是按设计重写★:
+//      权威 docs/superpowers/specs/2026-06-09-红包伸手党-合并后判定重设计.md。
+//      取代线上 v1.11.5 §25.10(检测时快照 + curLs/snapLs 双判据, 真机实证三类误判, 见 spec §0)。
+//
+// ★T5 设计核心发现(时序矛盾的解法):
+//   快照必须冻结在 T_snap=packetMs+G(≈P+3s, 抢后污染发生前), 但领取者要到 P+~125s 反射详情页才拿得到。
+//   → 拆开: 拍快照(整群, 不需领取者)由 rpScheduleFreeloaderSnapshot 在【检测时】调度的延迟任务在 P+G 拍, 存 FREELOADER_SNAP[jobKey];
+//          判定(需领取者)在 hbDetailExtract(P+125s)读冻结快照 → freeloaderRunWithSnapshot(注入快照) → in-process doWarn。
+//   故快照与判定解耦; freeloaderRunForPacket 的"调用即拍"对生产时序不成立(已在 redpacket_app 拆出 freeloaderRunWithSnapshot)。
+//
+// ★降级红线(命根, spec §4.1): 无快照/无此人/拿不准 = SKIP, 绝不误踢 (语义在 freeloaderDecide/Judge 内, 本片不绕过)。
+//
+// 依赖(manifest 在本片之前拼入, 运行期均先定义): device_base(FREELOADER_SNAP/常量/hbBgLog/hbJitter)、
+//   device_ui(hbIsLuckyMoneyTop)、redpacket_detect(cfgFreeloaderOn/cfgDelay/rpClearInFlight via worker)、
+//   redpacket_app(freeloaderRunWithSnapshot/rpProcessReceivers)、redpacket_qualify(rpIsEqualSplit/getExcludeList)、
+//   freeloader(FREELOADER_* 常量/judge)、speak_buffer(l3Flush)、speak_store(speakSnapshotAll)、
+//   core(HOST.getLoginWxid)、membership(normGroupId)。getTopActivity/delay/log = WAuxiliary 宿主注入(leaf)。
+// ============================================================
+
+// ==================== (config) 伸手党 per-group 配置读 ====================
+// 窗口 N(分钟): 线上 K_FREELOADER_WIN_PREFIX @279 / DEF_FREELOADER_WIN @281。
+String RP_K_FREELOADER_WIN_PREFIX = "rp_freeloader_win_";
+int    RP_DEF_FREELOADER_WIN      = 30;
+int cfgFreeloaderWin(String gid) {
+    try { int v = Integer.parseInt(HOST.getString(RP_K_FREELOADER_WIN_PREFIX + normGroupId(gid), "").trim()); return (v >= 1 && v <= 1440) ? v : RP_DEF_FREELOADER_WIN; }
+    catch (Throwable t) { return RP_DEF_FREELOADER_WIN; }
+}
+// 事后宽限 G(ms, spec 新增 per-group 键): 默认 FREELOADER_GRACE_AFTER_MS(=3s, 用户拍板 D1, 2026-06-10 确认)。
+//   建议生产先用较大值观察再收紧(spec §6 D1 已知风险)。范围 0..600000ms。
+String RP_K_FREELOADER_GRACE_PREFIX = "rp_freeloader_grace_after_";
+long cfgFreeloaderGraceMs(String gid) {
+    try { long v = Long.parseLong(HOST.getString(RP_K_FREELOADER_GRACE_PREFIX + normGroupId(gid), "").trim()); return (v >= 0L && v <= 600000L) ? v : FREELOADER_GRACE_AFTER_MS; }
+    catch (Throwable t) { return FREELOADER_GRACE_AFTER_MS; }
+}
+// G 运行期夹取安全余量(ms): 确保 T_snap=P+G_eff 在判定(开包延迟下界)之前拍好 (spec §3.1)。
+long RP_FREELOADER_SNAP_MARGIN_MS = 2000L;
+// 纯函数(L1 可测, spec §3.1 G 夹取 + 测试 #26): G_eff = min(gCfgMs, openDelaySec*1000*0.75 − marginMs)。
+//   开包延迟下界 = openDelaySec*1000*0.75 (hbJitter ±25% 下界)。返回 <=0 = 来不及拍(G 太大/开包太短) →
+//   调用方不拍快照 → 判定按 §4.1 整包 SKIP(不误判)。
+long rpClampGraceMs(long gCfgMs, long openDelaySec, long marginMs) {
+    long openLowerMs = (long) (openDelaySec * 1000L * 0.75);
+    long clampTo = openLowerMs - marginMs;
+    long gEff = gCfgMs;
+    if (gEff > clampTo) gEff = clampTo;
+    return gEff;
+}
+
+// ==================== (A) 反射领取者 (逐字保真线上) ====================
+// 关页(详情 + 封面) — 线上 @2829。仅当前台是红包页(类名含 luckymoney)才 finish(复用 device_ui.hbIsLuckyMoneyTop)。
+void finishDetailAndCover(String key) {
+    try {
+        Activity top = getTopActivity();
+        if (top != null && hbIsLuckyMoneyTop(top)) {
+            top.runOnUiThread(new Runnable() {
+                public void run() { try { top.finish(); } catch (Throwable t) {} }
+            });
+        } else if (top != null) {
+            hbBgLog("[RP] " + hbNow() + " finishDetailAndCover skipped: top not luckymoney.");
+        }
+    } catch (Throwable t) {}
+    if (key != null) COVER_ACT.remove(key);
+}
+
+// BFS 找领取者 List (线上 @3125) — 有界 (MAX_VISIT/MAX_DEPTH, device_base)。
+Object hbFindReceiverList(Object root) {
+    if (root == null) return null;
+    java.util.Set visited = new java.util.HashSet();
+    java.util.ArrayDeque queue = new java.util.ArrayDeque();
+    queue.add(new Object[]{ root, Integer.valueOf(0) });
+    visited.add(Integer.valueOf(System.identityHashCode(root)));
+    int visitCount = 0;
+    try {
+        while (!queue.isEmpty()) {
+            if (visitCount >= MAX_VISIT) break;
+            Object[] entry = (Object[]) queue.poll();
+            Object obj = entry[0];
+            int depth = ((Integer) entry[1]).intValue();
+            visitCount++;
+            if (obj == null) continue;
+
+            if (hbIsReceiverList(obj)) return obj;
+            if (depth >= MAX_DEPTH) continue;
+            if (hbIsLeaf(obj)) continue;
+
+            Class c = obj.getClass();
+            int superHops = 0;
+            while (c != null && superHops <= 3) {
+                if (visitCount >= MAX_VISIT) break;
+                java.lang.reflect.Field[] fields = null;
+                try { fields = c.getDeclaredFields(); } catch (Throwable t) { fields = null; }
+                if (fields != null) {
+                    for (int i = 0; i < fields.length; i++) {
+                        if (visitCount >= MAX_VISIT) break;
+                        java.lang.reflect.Field f = fields[i];
+                        try {
+                            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                            f.setAccessible(true);
+                            Object child = null;
+                            try { child = f.get(obj); } catch (Throwable t) { continue; }
+                            if (child == null) continue;
+                            Integer h = Integer.valueOf(System.identityHashCode(child));
+                            if (visited.contains(h)) continue;
+                            visited.add(h);
+                            if (hbIsLeaf(child)) continue;
+                            queue.add(new Object[]{ child, Integer.valueOf(depth + 1) });
+                        } catch (Throwable t) { continue; }
+                    }
+                }
+                try { c = c.getSuperclass(); } catch (Throwable t) { c = null; }
+                superHops++;
+            }
+        }
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " find-list BFS err: " + t + " (visited=" + visitCount + ").");
+    }
+    return null;
+}
+
+// 候选判定: 非空 List/数组, 元素类名匹配领取者特征 (线上 @3180)。
+boolean hbIsReceiverList(Object obj) {
+    try {
+        Object firstElem = null;
+        int size = 0;
+        if (obj instanceof java.util.List) {
+            java.util.List lst = (java.util.List) obj;
+            size = lst.size();
+            if (size == 0) return false;
+            firstElem = lst.get(0);
+        } else if (obj.getClass().isArray()) {
+            size = java.lang.reflect.Array.getLength(obj);
+            if (size == 0) return false;
+            firstElem = java.lang.reflect.Array.get(obj, 0);
+        } else return false;
+        if (firstElem == null) return false;
+        String ecn = firstElem.getClass().getName();
+        if (ecn == null) return false;
+        if (ecn.startsWith(LM_PKG)) return true;
+        String low = ecn.toLowerCase();
+        if (low.indexOf("receiver") >= 0 || low.indexOf("detail") >= 0
+            || low.indexOf("hb") >= 0 || low.indexOf("member") >= 0
+            || low.indexOf("luckymoney") >= 0) return true;
+        return false;
+    } catch (Throwable t) { return false; }
+}
+
+boolean hbIsLeaf(Object o) {
+    if (o == null) return true;
+    if (o instanceof Number) return true;
+    if (o instanceof String) return true;
+    if (o instanceof Boolean) return true;
+    if (o instanceof Character) return true;
+    if (o instanceof Enum) return true;
+    if (o instanceof Class) return true;
+    if (o instanceof java.math.BigDecimal) return true;
+    return false;
+}
+
+// 结构化字段提取 (抗版本, 线上 @2846)。返回 Object[]{nickname, amountCent(Long), wxid, pathLog}; 失败 null。
+Object[] hbExtractTriple(Object el) {
+    try {
+        java.util.Map fields = hbReadFields(el);  // name -> value (含继承链)
+        if (fields == null || fields.isEmpty()) return null;
+
+        // 金额: 首选名为 f 的 long/int, 值>=0; 否则遍历 long/int 找合理值。
+        Long amount = null;
+        String amtPath = "?";
+        Object fv = fields.get("f");
+        if (fv instanceof Number && ((Number) fv).longValue() >= 0) { amount = Long.valueOf(((Number) fv).longValue()); amtPath = "f"; }
+        if (amount == null) {
+            java.util.Iterator it = fields.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry e = (java.util.Map.Entry) it.next();
+                Object val = e.getValue();
+                String nm = (String) e.getKey();
+                if (nm.equals("g")) continue; // g = 领取时间戳, 排除
+                if (val instanceof Long || val instanceof Integer) {
+                    long lv = ((Number) val).longValue();
+                    if (lv >= 0 && lv < 100000000L) { amount = Long.valueOf(lv); amtPath = nm + "(struct)"; break; }
+                }
+            }
+        }
+
+        // wxid: 首选名为 n 的 String 且像 wxid; 否则遍历 String 找 wxid_ 开头。
+        String wxid = null;
+        String wxPath = "?";
+        Object nv = fields.get("n");
+        if (nv instanceof String && hbLooksWxid((String) nv)) { wxid = (String) nv; wxPath = "n"; }
+        if (wxid == null) {
+            java.util.Iterator it = fields.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry e = (java.util.Map.Entry) it.next();
+                Object val = e.getValue();
+                if (val instanceof String && hbLooksWxid((String) val)) { wxid = (String) val; wxPath = (String) e.getKey() + "(struct)"; break; }
+            }
+        }
+
+        // 昵称: 首选名为 d 的 String (非 wxid/非纯数字/非"手气最佳"); 否则遍历。
+        String nick = null;
+        String nkPath = "?";
+        Object dv = fields.get("d");
+        if (dv instanceof String && hbLooksNick((String) dv)) { nick = (String) dv; nkPath = "d"; }
+        if (nick == null) {
+            java.util.Iterator it = fields.entrySet().iterator();
+            while (it.hasNext()) {
+                java.util.Map.Entry e = (java.util.Map.Entry) it.next();
+                Object val = e.getValue();
+                String nm = (String) e.getKey();
+                if (nm.equals("n")) continue; // n 是 wxid
+                if (val instanceof String && hbLooksNick((String) val)) { nick = (String) val; nkPath = nm + "(struct)"; break; }
+            }
+        }
+
+        if (amount == null && wxid == null) return null;
+        if (nick == null) nick = (wxid != null ? wxid : "?");
+        if (amount == null) amount = Long.valueOf(0L);
+        String pathLog = "amt=" + amtPath + ",wx=" + wxPath + ",nk=" + nkPath;
+        return new Object[]{ nick, amount, wxid, pathLog };
+    } catch (Throwable t) { return null; }
+}
+
+// 读元素所有非 static 字段 (含继承链 ≤3 层) → name->value Map (线上 @2909)。
+java.util.Map hbReadFields(Object el) {
+    java.util.LinkedHashMap m = new java.util.LinkedHashMap();
+    try {
+        Class ec = el.getClass();
+        int hops = 0;
+        while (ec != null && hops <= 3) {
+            java.lang.reflect.Field[] fs = null;
+            try { fs = ec.getDeclaredFields(); } catch (Throwable t) { fs = null; }
+            if (fs != null) {
+                for (int i = 0; i < fs.length; i++) {
+                    java.lang.reflect.Field f = fs[i];
+                    try {
+                        if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                        f.setAccessible(true);
+                        String nm = f.getName();
+                        if (!m.containsKey(nm)) {
+                            Object v = null;
+                            try { v = f.get(el); } catch (Throwable t) { v = null; }
+                            m.put(nm, v);
+                        }
+                    } catch (Throwable t) {}
+                }
+            }
+            try { ec = ec.getSuperclass(); } catch (Throwable t) { ec = null; }
+            hops++;
+        }
+    } catch (Throwable t) {}
+    return m;
+}
+
+boolean hbLooksWxid(String s) {
+    if (s == null || s.isEmpty()) return false;
+    if (s.startsWith("wxid_")) return true;
+    if (s.length() < 6 || s.length() > 40) return false;
+    boolean hasLetter = false;
+    for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        boolean ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '-';
+        if (!ok) return false;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) hasLetter = true;
+    }
+    return hasLetter;
+}
+
+boolean hbLooksNick(String s) {
+    if (s == null || s.isEmpty()) return false;
+    if (hbLooksWxid(s)) return false;          // 非 wxid
+    if (s.indexOf("@chatroom") >= 0) return false;
+    if (s.indexOf("http") >= 0 || s.indexOf("://") >= 0) return false;
+    if (s.equals("手气最佳")) return false;
+    boolean allDigit = true;
+    for (int i = 0; i < s.length(); i++) { char c = s.charAt(i); if (c < '0' || c > '9') { allDigit = false; break; } }
+    if (allDigit) return false;
+    if (s.length() > 30) return false;          // 昵称一般不长
+    return true;
+}
+
+// ==================== (B) 伸手党单快照调度 (检测时调度, P+G 拍照) ====================
+// spec §3.1 时序: t0=检测入队(热路径只入队) → t0+G_eff 拍快照(本函数延迟任务) → t0+开包延迟(~125s)判定(hbDetailExtract)。
+// 由 rpDetectAndEnqueue 在【检测时】调用 (热路径只多一次 Thread.start, C-PERF-01; 开关读/G夹取/sleep/l3Flush/SELECT 全在后台)。
+// 注: 本片不用 `final`(其余设备模块如 device_ui 用 final) —— 本模块被本地测试 source(bsh.Interpreter 原样解析,
+//   不像 check.sh 装配体会先剥 final); bsh 匿名内部类按命名空间捕获闭包变量, 无 final 也正确(装配体仍 GREEN, 部署同)。
+void rpScheduleFreeloaderSnapshot(String grp, String jobKey, long packetMs) {
+    try {
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    if (grp == null || jobKey == null || packetMs <= 0L) return;
+                    if (!cfgFreeloaderOn(grp)) return;   // 开关关 → 不拍 (FUSE 读在后台线程)
+                    // G 运行期夹取 (spec §3.1 + 测试 #26): G_eff = min(G配置, 开包延迟下界 − 安全余量)。
+                    //   开包延迟下界 = cfgDelay()*1000*0.75 (hbJitter ±25% 下界)。G_eff<=0 → 不拍 → 判定按 §4.1 整包 SKIP(不误判)。
+                    long gCfg = cfgFreeloaderGraceMs(grp);
+                    long gEff = rpClampGraceMs(gCfg, cfgDelay(), RP_FREELOADER_SNAP_MARGIN_MS);
+                    if (gEff <= 0L) { hbBgLog("[RP] " + hbNow() + " freeloader snap: G clamped<=0 (gCfg=" + gCfg + " openDelay=" + cfgDelay() + "s), no snapshot (judge SKIP整包)."); return; }
+                    try { Thread.sleep(gEff); } catch (Throwable t) {}
+                    // 拍照-终结竞态 (#24): job 在 [t0,t0+G] 被放弃/终结 → 已 DONE → 不 put 孤儿快照 (终结路径自带 remove, 幂等)。
+                    if (DONE.contains(jobKey)) { hbBgLog("[RP] " + hbNow() + " freeloader snap: job terminated before T_snap, no put (race #24 guard)."); return; }
+                    // backstop 防泄漏: put 前 size 超上界 → clear。
+                    try { if (FREELOADER_SNAP.size() > FREELOADER_SNAP_MAX) FREELOADER_SNAP.clear(); } catch (Throwable t) {}
+                    // l3Flush: 热路径内存缓冲逼进表 (合并核心, 消除跨插件 flush 延迟 → 快照含红包前最后 ~30s 发言, 病根#3)。
+                    try { l3Flush(); } catch (Throwable t) {}
+                    // 拍整群快照 (wxid → Object[]{ls,fs})。失败/null → 不 put → 判定 §4.1 整包 SKIP。
+                    java.util.Map snap = null;
+                    try { snap = speakSnapshotAll(grp); } catch (Throwable t) { snap = null; }
+                    if (snap == null) { hbBgLog("[RP] " + hbNow() + " freeloader snap: speakSnapshotAll null/threw, no put (judge SKIP整包)."); return; }
+                    // 双检 (race #24 收窄, Review Finding 1): l3Flush+SELECT 期间 hbDetailExtract 可能已终结(DONE.add+remove);
+                    //   若此刻仍 put 会留无人删的孤儿快照(只能等 >200 backstop). put 前再查一次 DONE, 把 TOCTOU 窗口收到不可再小。
+                    if (DONE.contains(jobKey)) { hbBgLog("[RP] " + hbNow() + " freeloader snap: job terminated during snapshot, no put (race #24 double-check)."); return; }
+                    FREELOADER_SNAP.put(jobKey, snap);
+                    hbBgLog("[RP] " + hbNow() + " freeloader snap: frozen at T_snap=P+" + (gEff / 1000L) + "s, rows=" + snap.size() + ".");
+                } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " freeloader snap thread err: " + t); }
+            }
+        }).start();
+    } catch (Throwable t) {}
+}
+
+// ==================== (B) 判定侧: hbDetailExtract (反射→均分门→伸手党判定→发送 seam→关页) ====================
+// 由 device_ui.hbOnActivityResume 的 NewDetailUI 分支在后台反射线程调入 (T4 留的 T5 seam)。
+// 顺序对齐线上 hbDetailExtract @2653: 反射→均分跳过→[写库+发送]→伸手党→关页。
+//   ★合并适配: 均分用 redpacket_qualify.rpIsEqualSplit; 伸手党换成 in-process 单快照(读 P+G 预拍 FREELOADER_SNAP);
+//     写库+发送 = T6 seam rpDeliverReceivers(本片 leaf)。FREELOADER_SNAP 清理(各终结路径)收口到本片(T3/T4 协调点)。
+void hbDetailExtract(Object root, String key) {
+    try {
+        if (key == null) { hbBgLog("[RP] " + hbNow() + " detail: key null, skip. clear in-flight."); rpClearInFlight(); return; }
+        if (DONE.contains(key)) { hbBgLog("[RP] " + hbNow() + " detail: already done, skip. clear in-flight."); rpClearInFlight(); return; }
+
+        Object[] job = CUR_JOB;
+        String talker = (job != null) ? (String) job[JOB_TALKER] : null;
+        boolean jobIsCustom = false;
+        try { if (job != null && job[JOB_ISCUSTOM] != null) jobIsCustom = ((Boolean) job[JOB_ISCUSTOM]).booleanValue(); } catch (Throwable t) { jobIsCustom = false; }
+        long packetMs = 0L;
+        try { if (job != null && job[JOB_DETECTMS] != null) packetMs = ((Long) job[JOB_DETECTMS]).longValue(); } catch (Throwable t) { packetMs = 0L; }
+        String jobKey = (job != null && job[JOB_KEY] != null) ? (String) job[JOB_KEY] : key;
+
+        // ---- 反射找领取者 List (线上 @2674) ----
+        Object listObj = hbFindReceiverList(root);
+        if (listObj == null) {
+            hbBgLog("[RP] " + hbNow() + " detail: no receiver list found (reflect). clear in-flight.");
+            finishDetailAndCover(key);
+            DONE.add(key);   // 已到详情页=领完, 不重入队
+            SEEN.clear();
+            try { FREELOADER_SNAP.remove(jobKey); } catch (Throwable t) {}   // 终结路径兜底清快照 (spec §4 配平, T5 收口)
+            rpClearInFlight();
+            return;
+        }
+
+        // ---- 提取每个元素 → receivers Object[]{nick, amountCent(Long), wxid} (线上 @2686) ----
+        java.util.List receivers = new java.util.ArrayList();
+        int size = 0;
+        boolean isArr = false;
+        java.util.List asList = null;
+        if (listObj instanceof java.util.List) { asList = (java.util.List) listObj; size = asList.size(); }
+        else if (listObj.getClass().isArray()) { isArr = true; size = java.lang.reflect.Array.getLength(listObj); }
+
+        String pathLog = null;
+        for (int i = 0; i < size; i++) {
+            Object el = isArr ? java.lang.reflect.Array.get(listObj, i) : asList.get(i);
+            if (el == null) continue;
+            Object[] tri = hbExtractTriple(el);
+            if (tri == null) continue;
+            if (pathLog == null) pathLog = (String) tri[3];
+            receivers.add(new Object[]{ tri[0], tri[1], tri[2] });
+        }
+        hbBgLog("[RP] " + hbNow() + " detail: extracted " + receivers.size() + "/" + size
+            + " receivers (path=" + pathLog + "). nicknames/amounts/wxids NOT logged (privacy).");
+
+        // ---- 均分跳过: 仅处理拼手气 (线上 @2711-2733; 复用 redpacket_qualify.rpIsEqualSplit)。----
+        //   普通均分包 → 不发不判, 关页清状态。均分包刻意不跑伸手党 (spec §4 不变项)。
+        if (rpIsEqualSplit(receivers)) {
+            hbBgLog("[RP] " + hbNow() + " skip normal(equal amounts): all equal. no message/no judge. clear in-flight.");
+            finishDetailAndCover(key);
+            DONE.add(key);
+            SEEN.clear();
+            try { FREELOADER_SNAP.remove(jobKey); } catch (Throwable t) {}
+            rpClearInFlight();
+            return;
+        }
+
+        // ---- 伸手党判定 (T5 核心, spec §3): 读 P+G 预拍快照 → freeloaderRunWithSnapshot → in-process doWarn。----
+        //   gate(线上 @2747): 开关 ON + talker非空 + packetMs>0。降级红线在 judge 内: 无快照/无此人/拿不准=SKIP, 绝不误踢。
+        try {
+            if (talker != null && packetMs > 0L && cfgFreeloaderOn(talker)) {
+                java.util.List wxids = new java.util.ArrayList();
+                for (int i = 0; i < receivers.size(); i++) {
+                    Object[] r = (Object[]) receivers.get(i);
+                    String w = (r.length > 2) ? (String) r[2] : null;
+                    if (w != null && !w.isEmpty()) wxids.add(w);
+                }
+                // 读 P+G 预拍的整群冻结快照 (Map<wxid, Object[]{ls,fs}>); 拿不到=null → judge 整批 SKIP。
+                java.util.Map snap = null;
+                try { Object so = FREELOADER_SNAP.get(jobKey); if (so instanceof java.util.Map) snap = (java.util.Map) so; } catch (Throwable t) { snap = null; }
+                // 排除名单 → Set (命中者豁免不判)。
+                java.util.Set exSet = new java.util.HashSet();
+                try { java.util.List ex = getExcludeList(talker); if (ex != null) for (int i = 0; i < ex.size(); i++) { String e = (String) ex.get(i); if (e != null) exSet.add(e.trim()); } } catch (Throwable t) {}
+                int win = cfgFreeloaderWin(talker);
+                String reason = win + "分钟内未发言";   // doWarn auto 来源理由 (线上 @2794 "警告 {N}分钟内未发言")
+                // 操作人=bot 自己(群主); doWarn auto 分支对管理员/群主/白名单/保护静默豁免, canActOn(bot→target)成立。
+                java.util.Map sum = freeloaderRunWithSnapshot(talker, wxids, HOST.getLoginWxid(), packetMs,
+                    (long) win * 60000L, FREELOADER_NEWMEMBER_EXEMPT_MS, exSet, FREELOADER_MAX_WARN, reason, snap);
+                // 恒定 summary 日志 (spec §4, 脱敏: 仅计数; sent=实发=toWarn.size, warned=判伸手党总数含capped)。
+                java.util.List tw = (java.util.List) sum.get("toWarn");
+                boolean snapFailed = false;
+                try { snapFailed = ((Boolean) sum.get("snapFail")).booleanValue(); } catch (Throwable t) { snapFailed = false; }
+                String snapState = snapFailed ? "fail" : (snap == null ? "none" : "ok");
+                hbBgLog("[RP] " + hbNow() + " freeloader judged=" + sum.get("judged") + " warned=" + sum.get("warned")
+                    + " active=" + sum.get("active") + " exemptNew=" + sum.get("exemptNew") + " skip=" + sum.get("skip")
+                    + " excluded=" + sum.get("excluded") + " capped=" + sum.get("capped")
+                    + " sent=" + (tw == null ? 0 : tw.size()) + " snap=" + snapState + " gate=" + sum.get("gate") + " win=" + win + "min.");
+            }
+        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " freeloader outer err: " + t); }
+
+        // ---- 写库 + 发送 (★T6 seam rpDeliverReceivers, 本片 leaf 占位)。----
+        try { rpDeliverReceivers(job, receivers, jobIsCustom); } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " deliver err: " + t); }
+
+        // ---- 关页 + 完成 + 清状态 + 清快照 (线上 §15.5 退出点) ----
+        finishDetailAndCover(key);
+        DONE.add(key);
+        SEEN.clear();
+        try { FREELOADER_SNAP.remove(jobKey); } catch (Throwable t) {}   // 判定读完即清, 防泄漏 (spec §4 配平)
+        rpClearInFlight();
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " detail extract err: " + t + ". finish + clear in-flight.");
+        try { finishDetailAndCover(key); } catch (Throwable t2) {}
+        try {
+            Object[] j = CUR_JOB;
+            String jk = (j != null && j[JOB_KEY] != null) ? (String) j[JOB_KEY] : key;
+            if (jk != null) FREELOADER_SNAP.remove(jk);   // 错误路径(判定可能未起)兜底清快照
+        } catch (Throwable t2) {}
+        try { if (key != null) DONE.add(key); SEEN.clear(); rpClearInFlight(); } catch (Throwable t2) {}
+    }
+}
+
+// ★T6 seam (leaf): 写库(rpRecordStats) + 发送(hbTierAndSend 引用群规条/@条/随机语气/限频/间隔延迟 + rpSendQuote 健壮回退)。
+//   T6 接 rpProcessReceivers(P3-a 已实现: 均分门/达标/写库/最小发送) + 发送 richness + groupName(rpGroupName)/rulePrefix(cfgRulePrefix) 接线。
+//   T5 仅保证反射 + 伸手党判定 + 状态机; 占位无副作用 (本地暂不写库/发送, 不影响伸手党判定的可测性)。
+void rpDeliverReceivers(Object[] job, java.util.List receivers, boolean isCustom) { }

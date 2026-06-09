@@ -152,9 +152,16 @@ java.util.Map rpFreeloaderGateSkip(java.util.List receivers, String gate) {
     return res;
 }
 
-java.util.Map freeloaderRunForPacket(String grp, java.util.List receivers, String sender,
-                                     long packetMs, long winMs, long exemptMs,
-                                     java.util.Set excludeSet, int maxWarn, String reason) {
+// ★P3-b T5 重构: 拆出 freeloaderRunWithSnapshot(注入已拍快照) —— 生产时序的命根。
+//   背景(T5 设计发现): 快照必须冻结在 T_snap=packetMs+G(抢后污染前), 但领取者要到 P+~125s 反射详情页才拿得到。
+//   故快照(整群, 不需领取者)由 device_recv 的延迟任务在 P+G 预拍进 FREELOADER_SNAP[jobKey];
+//   判定(P+125s, 需领取者)在 hbDetailExtract 读冻结快照并调本函数(snapshot 注入)。
+//   → 本函数【不】内联 l3Flush/speakSnapshotAll(那是 P+G 快照任务的事); 只做 reason 守护 + since 闸门 + judge + doWarn。
+//   freeloaderRunForPacket(下方)保留"自拍快照"的旧签名 = 测试/兜底用(L2 既有用例不改), 生产不走。
+java.util.Map freeloaderRunWithSnapshot(String grp, java.util.List receivers, String sender,
+                                        long packetMs, long winMs, long exemptMs,
+                                        java.util.Set excludeSet, int maxWarn, String reason,
+                                        java.util.Map snapshot) {
     // ---- (a0) reason 守护 (MAJOR 2): auto 来源必须带非空理由才能走 doWarn 的 auto 分支。----
     //   doWarn(grp,sender,w,reason) 内 auto = (reason!=null && !reason.trim().isEmpty()) (warning.bsh:67)。
     //   若 reason 为 null / 空白 → auto=false → 不再静默豁免管理员/群主, 且 canActOn 不足时往群里发"❌ 权限不足"——
@@ -168,7 +175,7 @@ java.util.Map freeloaderRunForPacket(String grp, java.util.List receivers, Strin
     //   逐字对齐线上 plugins/redpacket-stats/main.java:2761-2772 (v1.11.4 修复):
     //     ① since<=0 (无锚点, 老用户升级缺口 → 键空) → lazy-init 补写 since=now 再整包跳过 (自愈, 下个包才生效)。
     //     ② packetMs 在 since+winMs 内 (开关刚打开预热期) → 整包跳过 (全员豁免, 数据未预热完整防误警告全群)。
-    //     ③ 否则正常走 l3Flush→快照→judge→doWarn。
+    //     ③ 否则正常走 judge→doWarn (快照已由调用方在 P+G 预拍)。
     //   读/写键经 normGroupId(grp) (rpFreeloaderSince + 下方写点一致, 对齐线上 v1.11.4 Santa 修复)。
     //   闸门触发整包跳过时绝不调 doWarn (降级红线同向: 宁可漏判不可误踢)。
     long since = rpFreeloaderSince(grp);
@@ -182,17 +189,8 @@ java.util.Map freeloaderRunForPacket(String grp, java.util.List receivers, Strin
         return rpFreeloaderGateSkip(receivers, "within_activation_grace");
     }
 
-    // ---- (a) l3Flush: 把内存缓冲逼进表 (合并核心, 消除跨插件 flush 延迟, spec §1)。----
-    //   让随后的快照含红包前最后 ~30s 的发言 (病根 #3 解决)。整段保护性 try, flush 失败不阻断判定;
-    //   失败会让快照缺数据 → 至多某人走 SKIP (降级, 不误警告), 与 §4.1 一致。
-    try { l3Flush(); } catch (Throwable t) {}
-
-    // ---- (b) 拍单快照 (spec §3): 在"判定那一刻"冻结整群 last_speak/first_seen。----
-    //   ★降级: 快照拍失败 (SELECT 抛异常) → snapshot=null → freeloaderJudge 整批 SKIP, 零警告 (§4.1 #1)。
-    java.util.Map snapshot = null;
-    try { snapshot = speakSnapshotAll(grp); } catch (Throwable t) { snapshot = null; }
-
     // ---- (c) 判定 (纯逻辑, 复用 freeloader.freeloaderJudge; 降级语义在其内, 本编排不绕过)。----
+    //   ★降级: 注入快照为 null (P+G 拍照失败/G 夹取没拍成/job 已终结没 put) → freeloaderJudge 整批 SKIP, 零警告 (§4.1 #1)。
     Object resObj = freeloaderJudge(snapshot, receivers, packetMs, winMs, exemptMs, excludeSet, maxWarn);
     java.util.Map res = (java.util.Map) resObj;
 
@@ -207,7 +205,25 @@ java.util.Map freeloaderRunForPacket(String grp, java.util.List receivers, Strin
             String w = (String) toWarn.get(i);
             if (w == null || w.isEmpty()) continue;
             doWarn(grp, sender, w, reason);   // auto 来源 (reason 非空) → 累计 wn_, 到 wk_ 上限触发踢 (跨多包累计)
+            // 防刷屏 (spec §4 不变项, 线上 Thread.sleep(800)): 多伸手党间隔; 末条不 sleep; 测试置 GAP=0 不拖慢。
+            if (FREELOADER_WARN_GAP_MS > 0L && i < toWarn.size() - 1) {
+                try { Thread.sleep(FREELOADER_WARN_GAP_MS); } catch (Throwable t) {}
+            }
         }
     }
     return res;
+}
+
+// 旧签名 = "调用那一刻自拍快照" (l3Flush→speakSnapshotAll→注入)。L2 既有用例 + 兜底用, 生产不走 (生产在 P+G 预拍)。
+//   保留是为 (1) 既有集成测试零改动; (2) 任何"判定即拍"场景的兜底。语义同重构前。
+java.util.Map freeloaderRunForPacket(String grp, java.util.List receivers, String sender,
+                                     long packetMs, long winMs, long exemptMs,
+                                     java.util.Set excludeSet, int maxWarn, String reason) {
+    // ---- (a) l3Flush: 把内存缓冲逼进表 (合并核心, 消除跨插件 flush 延迟, spec §1)。----
+    //   失败不阻断: 至多某人走 SKIP (降级, 不误警告), 与 §4.1 一致。
+    try { l3Flush(); } catch (Throwable t) {}
+    // ---- (b) 拍单快照 (spec §3): 冻结整群 last_speak/first_seen。拍失败 → null → judge 整批 SKIP。----
+    java.util.Map snapshot = null;
+    try { snapshot = speakSnapshotAll(grp); } catch (Throwable t) { snapshot = null; }
+    return freeloaderRunWithSnapshot(grp, receivers, sender, packetMs, winMs, exemptMs, excludeSet, maxWarn, reason, snapshot);
 }

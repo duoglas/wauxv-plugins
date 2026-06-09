@@ -373,13 +373,7 @@ void afterCoverNoDetail() {
 // ============================================================
 // seam 占位 (leaf): 真实实现在后续任务接, 解析门只解析语法 + 调用骨架成立。占位返回值非真实语义。
 // ============================================================
-// ★UI 启动器 (T4): 线上 hbProcess @1810-1822 取 hostContext/getTopActivity + Intent(key_native_url/key_username/key_is_self_sent) + startLuckyMoneyReceive。
-//   返回 true=已开封面页(在飞交 onResume 链路清); false=未开(无 hostContext/版本漂移开页失败) → hbProcess 兜底清在飞。
-//   占位恒返 false (= 不开页, 兜底清在飞, 调用骨架成立); T4 接真实 Intent + 反射 startActivity。
-boolean rpOpenCover(String talker, String key, String nativeurl) { return false; }
-// ★UI finish (T4): 线上 afterCoverNoDetail @2074 finishActivityByHash(COVER_ACT.get(key)) + getTopActivity + runOnUiThread。
-//   占位无副作用; T4 接真实 Activity finish。
-void rpFinishCover(String key) { }
+// ★UI seam rpOpenCover / rpFinishCover 已由 T4 (app/device_ui.bsh) 接真实实现 → 本片 leaf 占位移除, 避免装配体双重定义。
 // ★发送 (T6): 线上 rpDailySend @2530 每日统计"组装+发送" (rpDb/rpReadRow/getDailyGroups/rpBuildGroupedMsgs/sendText, 后台线程)。
 //   占位无副作用; T6 接真实组装+发送 (其中 rpBuildGroupedMsgs 已在 domain/redpacket_export.bsh 抽好, T6 直接调)。
 void rpDailySend(long windowStart, long windowEnd, boolean manual) { }

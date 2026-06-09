@@ -1,0 +1,312 @@
+// ============================================================
+// app/device_ui — RedPacketStats 设备层【UI 自动化】(P3-b T4)。
+// 逐字保真移植自线上 plugins/redpacket-stats/main.java v1.11.5:
+//   · hbOnActivityResume       (@1919-1969): onResume 路由 NewReceiveUI/NewDetailUI。
+//   · hbReceiveDecide          (@1976-2051): 封面页有界 BFS 找详情入口 → 拼手气 performClick / 普通 skip / 没领完重试。
+//   · afterCoverNormalSkip     (@2056-2066): 普通红包(已领完不需明细)退出点。
+//   · findClickableSelfOrAncestor (@2104-2120): 找可点自身或祖先。
+//   · finishActivityByHash     (@2124-2140) + hbIsLuckyMoneyTop (@2143-2150): 精确 finish 封面页(仅 luckymoney 前台)。
+//   · startLuckyMoneyReceive   (@1832-1867): 启动器, 反射拉起 NewReceiveUI 封面页。
+//   · hbTextSkeleton           (@4023-4030): 日志脱敏骨架 (仅本片 receive-decide 日志用)。
+// 接掉 T3 worker 留的两个 UI seam (worker 内 leaf 占位本任务已移除 → 无双重定义):
+//   · rpOpenCover(talker, key, nativeurl) — 线上 hbProcess @1810-1822 取 hostContext + Intent + startLuckyMoneyReceive。
+//   · rpFinishCover(key)                  — 线上 afterCoverNoDetail @2074 finishActivityByHash(COVER_ACT.get(key))。
+//
+// ★合并适配 (非行为改动, 仅换载体/重命名):
+//   - 线上 curKey() → 合并版 rpCurKey() (detect.bsh:94, 防命名冲突, 同义)。
+//   - hbDetailExtract(act, key) = T5 反射领取者 seam → 本片 leaf 调用 (解析门只查语法, 运行期由 T5 提供; 见 redpacket_detect/worker 未搬声明)。
+//   - getTopActivity/delay/hostContext/log = WAuxiliary 宿主注入 (单文件运行期由框架提供, 解析门 leaf), 非本仓定义。
+//
+// ★刻意未搬 (FREELOADER_SNAP 生命周期交 T5, 与 worker 同策略):
+//   线上各 UI 终结路径 (afterCoverNormalSkip @2062 / rpOpenCover 无 hostCtx abort @1815) 的 FREELOADER_SNAP.remove —
+//   合并版 P3-a 伸手党快照改 in-process T_snap=packetMs+G 拍照 (T5 freeloaderRunForPacket, 晚于 hbProcess), 拍照+清理(含终结路径兜底清)
+//   由 T5 自带, 不依赖设备 UI 侧 remove → 本片不移植这些 remove 行, 仅在退出点留注释标记。
+// ============================================================
+
+// ================================================================
+// ============ onResume 路由: NewReceiveUI / NewDetailUI ============
+// ================================================================
+void hbOnActivityResume(Object thisObject) {
+    try {
+        if (thisObject == null) return;
+        final Activity act = (Activity) thisObject;
+        String cn = act.getClass().getName();
+        if (cn == null) return;
+        boolean isReceive = cn.indexOf(UI_RECEIVE) >= 0;
+        boolean isDetail  = cn.indexOf(UI_DETAIL) >= 0;
+        if (!isReceive && !isDetail) return;
+
+        // 只处理 bot 自己正在跟的红包 (CUR_JOB 非空说明工作者刚开了页; 单飞下只一个)
+        String curKey = rpCurKey();
+        if (CUR_JOB == null || curKey == null) return;
+
+        Integer idHash = Integer.valueOf(System.identityHashCode(act));
+        if (!SEEN.add(idHash)) return;
+        final String fcn = cn;
+
+        if (isReceive) {
+            COVER_ACT.put(curKey, idHash);
+            final int clickDelay = (int) hbJitter((long) RECEIVE_CLICK_DELAY_BASE_MS, (long) RECEIVE_CLICK_DELAY_SPAN_MS);
+            hbBgLog("[RP] " + hbNow() + " HIT " + fcn + " (cover). schedule UI find detail-entry in " + clickDelay + "ms (jittered).");
+            delay(clickDelay, new Runnable() {
+                public void run() {
+                    try { hbReceiveDecide(act); }
+                    catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " receive-decide err: " + t); }
+                }
+            });
+            return;
+        }
+
+        // NewDetailUI: 后台反射读明细 (hbDetailExtract = T5 反射领取者 seam)
+        final String fKey = curKey;
+        final int reflectDelay = (int) hbJitter((long) REFLECT_DELAY_BASE_MS, (long) REFLECT_DELAY_SPAN_MS);
+        hbBgLog("[RP] " + hbNow() + " HIT " + fcn + " (detail). schedule bg-reflect in " + reflectDelay + "ms (jittered).");
+        delay(reflectDelay, new Runnable() {
+            public void run() {
+                try {
+                    new Thread() {
+                        public void run() {
+                            try { hbDetailExtract(act, fKey); }
+                            catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " detail extract bg err: " + t); }
+                        }
+                    }.start();
+                } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " detail reflect schedule err: " + t); }
+            }
+        });
+    } catch (Throwable t) {
+        try { log("RedPacketStats onResume route err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ================================================================
+// ============ 封面页判定: 领完→点详情 / 没领完→关页+重试 ============
+// ================================================================
+// UI 线程, 一次性有界 BFS。找"看看大家的手气"/"查看领取详情" 且【可点击】=已领完。
+// 找不到可点入口 = 没领完: 绝不点领取按钮(不抢), finish 封面, 按 attempt 重试或放弃。
+void hbReceiveDecide(Activity act) {
+    int[] nodes = new int[]{0};
+    View hitView = null;
+    String hitText = null;
+    try {
+        View root = null;
+        try { root = act.getWindow().getDecorView(); } catch (Throwable t) { root = null; }
+        if (root == null) { hbBgLog("[RP] " + hbNow() + " receive-decide: no DecorView."); afterCoverNoDetail(); return; }
+
+        java.util.ArrayDeque queue = new java.util.ArrayDeque();
+        queue.add(new Object[]{ root, Integer.valueOf(0) });
+
+        while (!queue.isEmpty()) {
+            if (nodes[0] >= CLICK_MAX_NODES) break;
+            Object[] entry = (Object[]) queue.poll();
+            View v = (View) entry[0];
+            int depth = ((Integer) entry[1]).intValue();
+            if (v == null) continue;
+            nodes[0]++;
+
+            String text = null;
+            if (v instanceof TextView) {
+                try { CharSequence cs = ((TextView) v).getText(); if (cs != null) text = cs.toString(); } catch (Throwable t) { text = null; }
+            }
+            if (text != null && text.length() > 0) {
+                boolean matchDetail = false;
+                for (int i = 0; i < DETAIL_TEXTS.length; i++) { if (text.indexOf(DETAIL_TEXTS[i]) >= 0) { matchDetail = true; break; } }
+                if (matchDetail) {
+                    // 该文本本身或最近可点祖先可点 → 视为"已领完, 有详情入口"
+                    View target = findClickableSelfOrAncestor(v);
+                    if (target != null) { hitView = target; hitText = text; break; }
+                    // 文案在但不可点 → 继续找(也可能别处有可点入口)
+                }
+            }
+            if (depth < CLICK_MAX_DEPTH && v instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) v;
+                int cc = 0;
+                try { cc = vg.getChildCount(); } catch (Throwable t) { cc = 0; }
+                for (int i = 0; i < cc; i++) {
+                    if (nodes[0] >= CLICK_MAX_NODES) break;
+                    View child = null;
+                    try { child = vg.getChildAt(i); } catch (Throwable t) { child = null; }
+                    if (child != null) queue.add(new Object[]{ child, Integer.valueOf(depth + 1) });
+                }
+            }
+        }
+
+        if (hitView == null) {
+            // 没找到可点的详情入口 = 没领完。绝不点领取/不抢。
+            hbBgLog("[RP] " + hbNow() + " receive-decide: NO clickable detail-entry (not finished, nodes=" + nodes[0] + "). will NOT grab; finish + retry/give-up.");
+            afterCoverNoDetail();
+            return;
+        }
+
+        // 已找到可点 detail 入口 = 已领完。按入口文字区分拼手气/普通:
+        //   含"手气"(看看大家的手气) → 拼手气 → 照旧点进详情(反射→分档→@)。
+        //   不含"手气"(查看领取详情) → 普通红包 → 不点击、关封面、清状态、跳过, 不开详情/不发消息。
+        // (反射后"金额全等→跳过"仍作兜底, 见 hbDetailExtract。)
+        boolean isLucky = (hitText != null && hitText.indexOf("手气") >= 0);
+        if (!isLucky) {
+            hbBgLog("[RP] " + hbNow() + " receive-decide: skip normal (cover='" + hbTextSkeleton(hitText)
+                + "') -> NOT clicking; finish cover + drop (nodes=" + nodes[0] + ").");
+            afterCoverNormalSkip();
+            return;
+        }
+
+        boolean clicked = false;
+        try { clicked = hitView.performClick(); } catch (Throwable t) { clicked = false; }
+        hbBgLog("[RP] " + hbNow() + " receive-decide: finished -> clicked detail-entry '" + hbTextSkeleton(hitText)
+            + "' clicked=" + clicked + " (nodes=" + nodes[0] + "). NewDetailUI.onResume will follow.");
+        // 不在此 finish 封面: 等详情页提取成功后连封面一起 finish (COVER_ACT)。
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " receive-decide err: " + t + " (nodes=" + nodes[0] + ").");
+        afterCoverNoDetail();
+    }
+}
+
+// 普通红包(封面入口"查看领取详情", 不含手气): 已领完, 但不需开详情/不发消息。
+// finish 封面 + 清状态/去重, 直接结束本红包流转。不重试(已领完, 不是没领完)。
+// v1.1.0 §15.5: 这是流水线退出点 → 必清在飞。
+void afterCoverNormalSkip() {
+    Object[] job = CUR_JOB;
+    final String key = (job != null) ? (String) job[JOB_KEY] : null;
+    finishActivityByHash(COVER_ACT.get(key));
+    if (key != null) COVER_ACT.remove(key);
+    if (key != null) DONE.add(key);   // 普通红包: 标记完成, 避免再次入队
+    // ★刻意未搬 (交 T5): 线上 v1.11.5 @2062 此处 FREELOADER_SNAP.remove(key) — 不进判定的快照兜底清。
+    //   合并版伸手党快照 in-process(T5 freeloaderRunForPacket)管理, 终结路径兜底清由 T5 自带 → 本片不在此 remove。
+    SEEN.clear(); // 本红包流转结束, 清 Activity 去重防内存增长
+    rpClearInFlight();
+    hbBgLog("[RP] " + hbNow() + " skip normal: cover finished, in-flight cleared, no detail/no msg.");
+}
+
+View findClickableSelfOrAncestor(View v) {
+    try {
+        if (v == null) return null;
+        if (v.isClickable()) return v;
+        Object p = v.getParent();
+        int up = 0;
+        while (p != null && up < CLICK_MAX_DEPTH) {
+            if (p instanceof View) {
+                View pv = (View) p;
+                if (pv.isClickable()) return pv;
+                p = pv.getParent();
+            } else break;
+            up++;
+        }
+    } catch (Throwable t) {}
+    return null;
+}
+
+// finish 一个 Activity (按 identityHashCode 在当前 task 找) — 简化: 直接 finish topActivity 若 hash 匹配,
+// 否则 finish getTopActivity (bot 自己开的页一般就是前台)。UI 线程, try/catch。
+void finishActivityByHash(Object hashObj) {
+    try {
+        final Activity top = getTopActivity();
+        if (top == null) return;
+        // v1.0.6 §13.5: finish 精确 — 仅当前台 Activity 类名含 luckymoney(bot 开的红包页)才 finish,
+        //              否则不 finish(避免误关用户正在看的非红包页面)。
+        if (!hbIsLuckyMoneyTop(top)) {
+            hbBgLog("[RP] " + hbNow() + " finish skipped: top activity not luckymoney (avoid closing user's page).");
+            return;
+        }
+        top.runOnUiThread(new Runnable() {
+            public void run() {
+                try { top.finish(); } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " finish err: " + t); }
+            }
+        });
+    } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " finishActivityByHash err: " + t); }
+}
+
+// v1.0.6 §13.5: 判定前台 Activity 是否红包页 (类名含 luckymoney, 大小写不敏感)。
+boolean hbIsLuckyMoneyTop(Activity top) {
+    try {
+        if (top == null) return false;
+        String cn = top.getClass().getName();
+        if (cn == null) return false;
+        return cn.toLowerCase().indexOf("luckymoney") >= 0;
+    } catch (Throwable t) { return false; }
+}
+
+// ============ 启动器 (源: 自动抢红包) — 目标 NewReceiveUI ============
+void startLuckyMoneyReceive(Object hostCtx, Intent intent) {
+    boolean success = false;
+    String landedOn = "?";
+    try {
+        String[] possibleClasses = {"nk4.l", "oq4.l", "pn4.l", "qm4.l", "rm4.l", "sm4.l", "tm4.l", "um4.l", "vm4.l", "wl4.l"};
+        String[] possibleMethods = {"A", "B", "C", "D"};
+        String activity = ".ui.LuckyMoneyNewReceiveUI";
+
+        for (int ci = 0; ci < possibleClasses.length && !success; ci++) {
+            String className = possibleClasses[ci];
+            for (int mi = 0; mi < possibleMethods.length && !success; mi++) {
+                String methodName = possibleMethods[mi];
+                try {
+                    Class clazz = XposedHelpers.findClass(className, hostCtx.getClassLoader());
+                    XposedHelpers.callStaticMethod(clazz, methodName, hostCtx, "luckymoney", activity, intent);
+                    success = true;
+                    landedOn = className + "." + methodName;
+                } catch (Throwable ignored) {}
+            }
+        }
+        if (!success) {
+            try {
+                String pkg = hostCtx.getPackageName();
+                intent.setClassName(pkg, "com.tencent.mm.plugin.luckymoney" + activity);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                hostCtx.startActivity(intent);
+                success = true;
+                landedOn = "fallback startActivity";
+            } catch (Throwable ignored2) {}
+        }
+        if (!success) hbBgLog("[RP] " + hbNow() + " OPEN FAIL: launcher + fallback both failed (version drift?).");
+        else hbBgLog("[RP] " + hbNow() + " OPEN OK via " + landedOn + " -> " + UI_RECEIVE + ".onResume will route.");
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " startLuckyMoneyReceive err: " + t);
+    }
+}
+
+// 日志脱敏骨架 (线上 @4023 逐字; 仅本片 receive-decide 日志调用)。
+String hbTextSkeleton(String s) {
+    try {
+        if (s == null) return "null";
+        String t = s.replace('\n', ' ').trim();
+        if (t.length() <= 12) return t;
+        return t.substring(0, 12) + "…(len=" + t.length() + ")";
+    } catch (Throwable t) { return "?"; }
+}
+
+// ================================================================
+// ============ T3 worker 的两个 UI seam 真实实现 (本片接掉) ============
+// ================================================================
+// ★UI 启动器: 线上 hbProcess @1810-1822。取 hostContext (null 回退 getTopActivity().getApplicationContext()),
+//   无 hostCtx → 返回 false (worker 兜底清在飞, 对齐线上 ABORT); 否则建 Intent + startLuckyMoneyReceive → 返回 true。
+// ★逐字保真要点 (与 worker stub 注释的细化): 线上"版本漂移开页失败"【不】当场清在飞 —
+//   startLuckyMoneyReceive 内部 log OPEN FAIL 但在飞保留, 由 onResume 链路 / 看门狗 30s 兜底强清。
+//   故 hostCtx 非空时本函数恒返 true (= 已尝试开页, 在飞交链路清); false 仅限无 hostContext (= 线上唯一当场 ABORT 清在飞处)。
+// ★刻意未搬 (交 T5): 线上 @1815 无 hostCtx abort 处的 FREELOADER_SNAP.remove(key) — 旧快照生命周期, T5 in-process 管理。
+boolean rpOpenCover(String talker, String key, String nativeurl) {
+    try {
+        Object hostCtx = null;
+        try { hostCtx = hostContext; } catch (Throwable t) { hostCtx = null; }
+        if (hostCtx == null) {
+            try { Activity top = getTopActivity(); if (top != null) hostCtx = top.getApplicationContext(); } catch (Throwable t) {}
+        }
+        // 线上 @1815 此处 log 含 "clear in-flight." — 合并版 in-flight 清理移到 worker(false 返回后 rpClearInFlight + 自带 ABORT log),
+        // 故本行 log 不再带该后缀(避免与 worker 重复声称清理); 清理动作行为不变, 仅 log 措辞随载体拆分。
+        if (hostCtx == null) { hbBgLog("[RP] " + hbNow() + " ABORT: no hostContext."); return false; }
+
+        Intent intent = new Intent();
+        if (nativeurl != null) intent.putExtra("key_native_url", nativeurl);
+        if (talker != null) intent.putExtra("key_username", talker);
+        intent.putExtra("key_is_self_sent", false);
+
+        startLuckyMoneyReceive(hostCtx, intent);
+        return true;   // 已尝试开页; 在飞由 onResume 链路(封面/详情→各退出点)清, 版本漂移失败由看门狗 30s 兜底
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " rpOpenCover err: " + t + ".");
+        return false;
+    }
+}
+
+// ★UI finish: 线上 afterCoverNoDetail @2074 finishActivityByHash(COVER_ACT.get(key))。
+//   worker 的 afterCoverNoDetail / 重试阶梯调它先关封面页 (UI 线程, 仅 luckymoney 前台才 finish)。
+void rpFinishCover(String key) {
+    finishActivityByHash(COVER_ACT.get(key));
+}

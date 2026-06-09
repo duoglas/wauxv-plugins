@@ -1,0 +1,35 @@
+// ============================================================
+// L1 (P3-b T5): device_recv 纯函数 —— G 运行期夹取(#26) + 反射字段判别(抗版本)。
+//   rpClampGraceMs 无 IO; hbLooksWxid/hbLooksNick/hbExtractTriple 只吃对象, 不碰 HOST/线程/UI。
+//   反射 BFS(hbFindReceiverList)/调度线程/真领取者对象 = 真机(P3-c), 本片只验可本地构造的部分。
+// 运行 cwd = merged/。
+// ============================================================
+source("tests/_harness.bsh");
+source("src/app/device_recv.bsh");          // rpClampGraceMs/hbLooksWxid/hbLooksNick/hbExtractTriple/hbReadFields
+
+// ---- #26 G 运行期夹取: G_eff = min(gCfg, openDelaySec*1000*0.75 − margin) ----
+check("G=3s 开包120s → 不夹(3000)",     rpClampGraceMs(3000L, 120L, 2000L) == 3000L);
+// 开包120s 下界=90000, clampTo=88000; G 配 100s=100000 → 夹到 88000。
+check("G=100s 开包120s → 夹到88000",    rpClampGraceMs(100000L, 120L, 2000L) == 88000L);
+// 开包2s 下界=1500, clampTo=-500; → G_eff<=0 (来不及拍 → 调用方不拍 → 判定 SKIP整包, 不误判)。
+check("开包2s → G_eff<=0(来不及拍)",     rpClampGraceMs(3000L, 2L, 2000L) <= 0L);
+
+// ---- 反射字段判别 (抗版本) ----
+check("wxid_ 前缀 → looksWxid",          hbLooksWxid("wxid_abc123"));
+check("纯数字时间戳 → 非 wxid",          !hbLooksWxid("1749470000000"));
+check("@chatroom → 非 nick",            !hbLooksNick("12345678@chatroom"));
+check("手气最佳 → 非 nick",              !hbLooksNick("手气最佳"));
+check("正常昵称 → looksNick",            hbLooksNick("张三老板"));
+check("wxid 串 → 非 nick",               !hbLooksNick("wxid_abc123"));
+
+// ---- hbExtractTriple: d/f/n 首选 + g(时间戳)不当金额 ----
+class RcvPojo { public long f; public String n; public String d; public long g; }
+RcvPojo r = new RcvPojo();
+r.f = 588L; r.n = "wxid_test01"; r.d = "李四"; r.g = 1749470000000L;
+Object[] tri = hbExtractTriple(r);
+check("extract 非 null",                 tri != null);
+check("extract 金额=f(588)",             tri != null && ((Long) tri[1]).longValue() == 588L);
+check("extract wxid=n",                  tri != null && "wxid_test01".equals(tri[2]));
+check("extract nick=d",                  tri != null && "李四".equals(tri[0]));
+
+done();

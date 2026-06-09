@@ -17,8 +17,10 @@ src/domain/redpacket_export.bsh
 src/app/device_base.bsh
 src/app/redpacket_detect.bsh
 src/app/redpacket_worker.bsh
+src/app/device_ui.bsh
 src/app/speak_buffer.bsh
 src/app/redpacket_app.bsh
+src/app/device_recv.bsh
 src/app/commands.bsh
 src/app/dialogs.bsh
 src/app/hooks.bsh
