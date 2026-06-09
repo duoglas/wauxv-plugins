@@ -15,6 +15,7 @@ src/domain/redpacket_tiers.bsh
 src/domain/redpacket_qualify.bsh
 src/domain/redpacket_export.bsh
 src/app/speak_buffer.bsh
+src/app/redpacket_app.bsh
 src/app/commands.bsh
 src/app/dialogs.bsh
 src/app/hooks.bsh

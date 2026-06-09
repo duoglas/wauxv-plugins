@@ -1,0 +1,213 @@
+// ============================================================
+// app/redpacket_app — 红包"拿到领取者之后"的纯编排 (P3-a)。
+// 把已抽好的红包领域模块 (redpacket_qualify / redpacket_store / redpacket_tiers / freeloader /
+//   speak_store / speak_buffer / warning) 装配成两条编排:
+//   (1) rpProcessReceivers — 均分跳过 → 达标+序列化 → 写库 → 分档+发送 (逐字对齐线上 hbDetailExtract 顺序)。
+//   (2) freeloaderRunForPacket — l3Flush → 单快照 → freeloaderJudge → in-process 直调 doWarn (合并核心)。
+//
+// 权威依据:
+//   · 编排顺序: plugins/redpacket-stats/main.java hbDetailExtract @2653-2826 (均分跳过@2711-2733 →
+//     rpRecordStats@2739 → 伸手党判定@2742-2808 → finishDetailAndCover@2811 → hbTierAndSend@2814)。
+//   · 伸手党合并后判定: docs/superpowers/specs/2026-06-09-红包伸手党-合并后判定重设计.md §3/§3.1/§4.1/§5。
+//
+// ★端口/seam 边界 (本片不做, 留 P3-b 接生产实现; 反射/UI/Job调度/延迟拍照/真发送全在 P3-b):
+//   · 反射取领取者列表        → 调用方入参 receivers (P3-b: hbFindReceiverList/hbExtractTriple, main.java:2674/2698)。
+//   · 引用条发送 sendQuoteMsg → HOST.sendQuote 端口 (P3-b 生产接 rpSendQuote, main.java:1721)。
+//   · @条发送                 → HOST.sendText 端口 (已有; 生产即 WAuxiliary sendText, main.java:2794/3048)。
+//   · 何时拍快照 / T_snap=P+G 延迟调度 / G 运行期夹取 → 调用方负责 (P3-b: T_snap 延迟任务, spec §3.1)。
+//     本片 freeloaderRunForPacket 只保证"给定 packetMs+winMs+排除集 → l3Flush→拍单快照→正确判定→doWarn"这段可测。
+//   · per-group 配置读 (win/grace/exempt/排除名单/档表前缀) → 调用方入参 (P3-b: cfgFreeloaderWin 等)。
+//
+// 依赖 (manifest 在本片之前拼入): redpacket_qualify / redpacket_store / redpacket_tiers /
+//   freeloader / speak_store / speak_buffer / warning / membership; 全局端口 STORAGE/HOST/CLOCK。
+// 扁平函数 + 全局变量风格 (BeanShell 解释执行, 弱 OO), 与现有模块一致。
+// ============================================================
+
+// ---- 编排返回码 (rpProcessReceivers 的处置结果, 供调用方/测试断言走了哪条分支) ----
+int RP_PROC_EQUAL_SPLIT = 0;   // 均分包 → 清状态不发不判 (仅拼手气继续)
+int RP_PROC_SENT        = 1;   // 拼手气 → 已写库 + 分档发送 (达标≥1)
+int RP_PROC_NO_QUALIFY  = 2;   // 拼手气但无人达标 → 写库跳过(线上 qualified==0 不录), 不发送
+
+// ---- 伸手党 since 闸门键 (逐字保真线上 plugins/redpacket-stats/main.java:280 K_FREELOADER_SINCE_PREFIX) ----
+//   per-group 键 "rp_freeloader_since_<normGroupId(gid)>" = 全局开关 OFF→ON 写的当前 ms (宽限锚点)。
+//   命令『伸手党 开』/Dialog OFF→ON 的写点在 P3-b 接线 (main.java:1545/3689, 键经 normGroupId 与读一致)。
+//   读/lazy-init 写都经 normGroupId(gid) 规整, 与线上 cfgFreeloaderSince(@847)/v1.11.4 Santa 修复键一致。
+String K_FREELOADER_SINCE_PREFIX = "rp_freeloader_since_";
+
+// 读 since 锚点 (逐字对齐线上 cfgFreeloaderSince @846-849): 走 HOST.getString, 空/解析失败/≤0 → 0L。
+long rpFreeloaderSince(String grp) {
+    try { long v = Long.parseLong(HOST.getString(K_FREELOADER_SINCE_PREFIX + normGroupId(grp), "").trim()); return (v > 0L) ? v : 0L; }
+    catch (Throwable t) { return 0L; }
+}
+
+// ============================================================
+// (1) 红包处理编排 — rpProcessReceivers
+//   逐字对齐线上 hbDetailExtract 的"拿到 receivers 之后"段 (@2707-2814)。
+//   反射/关页(finishDetailAndCover)/DONE/in-flight 状态机 = 调用方/P3-b 关注点, 本片不碰。
+// ----
+// 入参:
+//   key        : 红包去重/录入主键 (线上 job[JOB_KEY], 喂 rpRecord 第 1 列 + INSERT OR REPLACE 幂等)。
+//   msgid      : 原红包本地 msgId (线上 job[JOB_MSGID]; 喂 sendQuote 引用原红包; 反射取出, 入参 seam, msgid<=0 端口回退 sendText)。
+//   date       : 录入日期串 "yyyy-MM-dd" (线上 hbToday(), 喂 rpRecord date 列)。
+//   ts         : 红包记录时刻 ms (线上写库用的 ts)。
+//   grp        : 群 id (talker)。
+//   groupName  : 群名 (线上 rpGroupName(talker), 取不到留空串)。
+//   senderWxid : 发包人 wxid。  senderName: 发包人昵称 (线上 lookupName)。
+//   title      : 红包标题。
+//   isCustom   : 包类型 (线上 worker 回填 job[JOB_ISCUSTOM]; 决定档表来源 getTiersByType)。
+//   rulePrefix : 群规第一条前缀 (线上 isCustom?cfgCustomRulePrefix:cfgRulePrefix; 本片不读该 config, 调用方传)。
+//   receivers  : 领取者 List<Object[]{ String 昵称[0], Long 金额分[1], String wxid[2] }> (反射已取出, 入参 seam)。
+// 返回 int 处置码 (RP_PROC_*)。
+int rpProcessReceivers(String key, long msgid, String date, long ts, String grp, String groupName,
+                       String senderWxid, String senderName, String title,
+                       boolean isCustom, String rulePrefix, java.util.List receivers) {
+    // ---- (a) 均分跳过: 仅处理拼手气 (线上 @2711-2733)。----
+    //   普通均分包 (≥2 人金额全等) → 直接清状态不发不判。状态清理(关页/DONE)由调用方做, 本片只回 EQUAL_SPLIT。
+    if (rpIsEqualSplit(receivers)) {
+        return RP_PROC_EQUAL_SPLIT;
+    }
+
+    // ---- (b) 达标判定 + qualifiers 序列化 (线上 rpRecordStats @2228-2248, 复用 redpacket_qualify)。----
+    //   档表来源按包类型切换 (线上 getTiersByType, 复用 redpacket_tiers)。
+    //   排除名单复用 getExcludeList (线上 @2226, redpacket_qualify 已实现, 走 HOST config)。
+    java.util.List tiers = getTiersByType(grp, isCustom);
+    java.util.List excl = getExcludeList(grp);
+    Object[] q = rpComputeQualified(tiers, excl, receivers);
+    int qualifiedCount = ((Integer) q[0]).intValue();
+    String qualifiers = (String) q[1];
+
+    // ---- (c) 统计写库 (线上 rpRecordStats 录入核心 @2279, 复用 redpacket_store, 走 STORAGE)。----
+    //   线上 qualified==0 时 not recorded (@2250); 本片对齐: 仅达标≥1 才录入。
+    if (qualifiedCount < 1) {
+        return RP_PROC_NO_QUALIFY;
+    }
+    rpRecord(key, date, ts, grp, groupName, senderWxid, senderName, title,
+             (long) qualifiedCount, qualifiers);
+
+    // ---- (d) 分档 + 发送 (线上 hbTierAndSend @2972-)。----
+    //   本片只做"达标≥1 发引用群规条 + @达标者"的核心编排:
+    //     引用条 = renderTierRuleLine(prefix, tiers) (复用 redpacket_tiers, v1.6.0a 未设档不泄漏)
+    //             → HOST.sendQuote 端口 (P3-b 接 sendQuoteMsg/rpSendQuote; 失败回退已在端口实现内)。
+    //     @条   = 逐达标者 sendText("[AtWx=wxid] ...") (线上 @条 真@到人, main.java:2794/3048)。
+    //   不抽 (留 P3-b): 同群 @限频 RP_LAST_MSG、>at上限汇总 notice、逐档随机语气 pickActionPhrase/Math.random、
+    //                  两条间隔 rp_two_msg_gap_sec 延迟。本片发"达标即 @"的确定性最小集, 随机/限频/延迟属运行时编排。
+    String rule = renderTierRuleLine(rulePrefix, tiers);
+    HOST.sendQuote(grp, msgid, rule);   // 引用条 (msgid 由 job 透传; 端口内 msgid<=0/异常回退 sendText, P3-b 接 rpSendQuote)
+
+    // @条: 逐达标者真 @。复用 qualify 的达标口径(同 tierOf>=1 + 排除名单), 与写库 qualifiers 一致。
+    java.util.List ex = (excl == null) ? new java.util.ArrayList() : excl;
+    for (int i = 0; i < receivers.size(); i++) {
+        Object[] r = (Object[]) receivers.get(i);
+        String wxid = (String) r[2];
+        if (wxid == null || wxid.isEmpty()) continue;            // @ 需 wxid (线上 @3010)
+        boolean skip = false;                                    // 排除名单不 @ (线上 @3013)
+        for (int j = 0; j < ex.size(); j++) { if (wxid.equals(((String) ex.get(j)).trim())) { skip = true; break; } }
+        if (skip) continue;
+        long cent = ((Long) r[1]).longValue();
+        if (tierOf(tiers, cent) >= 1) {                          // 达标 (严格 > 最低档, 线上 @3016-3017)
+            HOST.sendText(grp, "[AtWx=" + wxid + "] 已收到, 请按群规执行");
+        }
+    }
+    return RP_PROC_SENT;
+}
+
+// ============================================================
+// (2) 伸手党 in-process 直连 — freeloaderRunForPacket
+//   合并核心收益 (根治 v1.11.5 跨插件 flush 延迟): l3Flush → 单快照 → freeloaderJudge → doWarn 直调。
+//   权威 spec §3 (单快照机制) / §3.1 (时序) / §4.1 (降级红线, 命根) / §5 (测试矩阵)。
+// ----
+// 本片职责 = "给定红包基准 + 领取者 + 配置 → 拍单快照 → 正确判定 → 对伸手党 in-process 直调 doWarn"。
+// ★何时拍快照 (T_snap=packetMs+G 延迟调度) / G 运行期夹取 / 拍照-终结竞态 → P3-b 调用方负责 (spec §3.1)。
+//   本片在【被调用那一刻】拍快照 = 模拟"判定线程在 T_snap 之后跑"; 红包后 G 内的发言是否进快照,
+//   取决于调用方在拍照前是否已把那些发言 recordSpeak+flush 进表 (与 spec "G 体现在快照造表" 一致, freeloader.bsh 文件头钉死)。
+//
+// 入参:
+//   grp        : 群 id。
+//   receivers  : 拼手气领取者 wxid 列表 List<String> (调用方从反射 receivers 抽 wxid 槽; 入参 seam)。
+//   sender     : doWarn 的操作人 wxid (自动来源, 线上 doWarn sender; 合并后= bot/系统身份, 调用方传)。
+//   packetMs   : 红包基准时刻 P (重试包=原始检测时刻 JOB_DETECTMS, 调用方透传; spec D3)。
+//   winMs      : 前看窗口 N (ms; 调用方按 per-group cfgFreeloaderWin 算)。
+//   exemptMs   : 新人豁免期 EXEMPT (ms)。
+//   excludeSet : 排除名单 Set<wxid> (调用方传 getExcludeList 结果转 Set; 命中者不判)。
+//   maxWarn    : 单包警告上限 (FREELOADER_MAX_WARN)。
+//   reason     : doWarn 理由串 (自动来源, 非空触发 doWarn 的 auto 分支; 线上 "{N}分钟内未发言")。
+// 返回: freeloaderJudge 的 summary Map (snapFail/verdicts/toWarn/judged/warned/active/exemptNew/skip/excluded/capped)。
+//   ★降级红线 (spec §4.1): snapshot==null / 无此人 / 拿不准 = SKIP, 绝不误警告。
+//   该语义在 freeloaderJudge 内已落地; 本编排不绕过 (snapFail 或 toWarn 为空 → 一个 doWarn 都不发)。
+// 闸门整包跳过的 summary (与 freeloaderJudge snapFail 路径同形, 便于下游/测试统一读): 零警告、全员计 skip。
+//   额外 "gate" 标该跳过原因 (no_reason / no_since_anchor / within_activation_grace), 供观测; 绝不调 doWarn。
+java.util.Map rpFreeloaderGateSkip(java.util.List receivers, String gate) {
+    java.util.Map res = new java.util.HashMap();
+    res.put("snapFail", Boolean.FALSE);
+    res.put("gate", gate);
+    res.put("verdicts", new java.util.HashMap());
+    res.put("toWarn", new java.util.ArrayList());
+    res.put("judged", new Integer(0));
+    res.put("warned", new Integer(0));
+    res.put("active", new Integer(0));
+    res.put("exemptNew", new Integer(0));
+    res.put("skip", new Integer(receivers == null ? 0 : receivers.size()));
+    res.put("excluded", new Integer(0));
+    res.put("capped", new Integer(0));
+    return res;
+}
+
+java.util.Map freeloaderRunForPacket(String grp, java.util.List receivers, String sender,
+                                     long packetMs, long winMs, long exemptMs,
+                                     java.util.Set excludeSet, int maxWarn, String reason) {
+    // ---- (a0) reason 守护 (MAJOR 2): auto 来源必须带非空理由才能走 doWarn 的 auto 分支。----
+    //   doWarn(grp,sender,w,reason) 内 auto = (reason!=null && !reason.trim().isEmpty()) (warning.bsh:67)。
+    //   若 reason 为 null / 空白 → auto=false → 不再静默豁免管理员/群主, 且 canActOn 不足时往群里发"❌ 权限不足"——
+    //   伸手党是自动来源, 绝不能落到手动语义。入口校验: reason 空 → 整批不发 (零 doWarn), 留 verdicts 供观测。
+    //   选"整批不发"而非"逐人跳过": reason 是整包级输入, 空即配置/调用方 bug, 宁可整包漏判不可误踢 (与降级红线同向)。
+    if (reason == null || reason.trim().isEmpty()) {
+        return rpFreeloaderGateSkip(receivers, "no_reason");
+    }
+
+    // ---- (a1) since 全局开关时刻宽限闸门 (MAJOR 1, spec §4 不变项 + 测试矩阵 #16)。----
+    //   逐字对齐线上 plugins/redpacket-stats/main.java:2761-2772 (v1.11.4 修复):
+    //     ① since<=0 (无锚点, 老用户升级缺口 → 键空) → lazy-init 补写 since=now 再整包跳过 (自愈, 下个包才生效)。
+    //     ② packetMs 在 since+winMs 内 (开关刚打开预热期) → 整包跳过 (全员豁免, 数据未预热完整防误警告全群)。
+    //     ③ 否则正常走 l3Flush→快照→judge→doWarn。
+    //   读/写键经 normGroupId(grp) (rpFreeloaderSince + 下方写点一致, 对齐线上 v1.11.4 Santa 修复)。
+    //   闸门触发整包跳过时绝不调 doWarn (降级红线同向: 宁可漏判不可误踢)。
+    long since = rpFreeloaderSince(grp);
+    if (since <= 0L) {
+        // ① 无锚点: lazy-init 补写 since=now (走 HOST 端口; 生产 CLOCK.now()=System.currentTimeMillis 同线上 @2768), 本轮跳过。
+        try { HOST.putString(K_FREELOADER_SINCE_PREFIX + normGroupId(grp), String.valueOf(CLOCK.now())); } catch (Throwable t) {}
+        return rpFreeloaderGateSkip(receivers, "no_since_anchor");
+    }
+    if (packetMs - since < winMs) {
+        // ② 预热期: packetMs 在 [since, since+winMs) 内 → 全员豁免整包跳过 (逐字对齐线上 @2772 fPacketMs - since < winMs)。
+        return rpFreeloaderGateSkip(receivers, "within_activation_grace");
+    }
+
+    // ---- (a) l3Flush: 把内存缓冲逼进表 (合并核心, 消除跨插件 flush 延迟, spec §1)。----
+    //   让随后的快照含红包前最后 ~30s 的发言 (病根 #3 解决)。整段保护性 try, flush 失败不阻断判定;
+    //   失败会让快照缺数据 → 至多某人走 SKIP (降级, 不误警告), 与 §4.1 一致。
+    try { l3Flush(); } catch (Throwable t) {}
+
+    // ---- (b) 拍单快照 (spec §3): 在"判定那一刻"冻结整群 last_speak/first_seen。----
+    //   ★降级: 快照拍失败 (SELECT 抛异常) → snapshot=null → freeloaderJudge 整批 SKIP, 零警告 (§4.1 #1)。
+    java.util.Map snapshot = null;
+    try { snapshot = speakSnapshotAll(grp); } catch (Throwable t) { snapshot = null; }
+
+    // ---- (c) 判定 (纯逻辑, 复用 freeloader.freeloaderJudge; 降级语义在其内, 本编排不绕过)。----
+    Object resObj = freeloaderJudge(snapshot, receivers, packetMs, winMs, exemptMs, excludeSet, maxWarn);
+    java.util.Map res = (java.util.Map) resObj;
+
+    // ---- (d) 对 toWarn 每人 in-process 直调 doWarn (auto 来源 + 理由, 复用 warning.doWarn)。----
+    //   合并后不再发跨插件命令, 直接调同插件 doWarn (spec §4 不变项 + §7 暴露面更小)。
+    //   doWarn 内部: 自动来源对管理员/群主/原生群主/白名单/保护静默跳过 (不再这里重复判, 单一权威)。
+    //   toWarn 已扣 capped (freeloaderJudge: warned > maxWarn 部分计 capped 不进 toWarn)。
+    //   snapFail / 无人达伸手党 → toWarn 空 → 一个 doWarn 都不发 (降级红线生效)。
+    java.util.List toWarn = (java.util.List) res.get("toWarn");
+    if (toWarn != null) {
+        for (int i = 0; i < toWarn.size(); i++) {
+            String w = (String) toWarn.get(i);
+            if (w == null || w.isEmpty()) continue;
+            doWarn(grp, sender, w, reason);   // auto 来源 (reason 非空) → 累计 wn_, 到 wk_ 上限触发踢 (跨多包累计)
+        }
+    }
+    return res;
+}

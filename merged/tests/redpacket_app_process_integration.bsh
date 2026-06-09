@@ -1,0 +1,120 @@
+// ============================================================
+// L2 集成 (P3-a): rpProcessReceivers 编排 — 均分跳过 → 达标+序列化 → 写库 → 分档+发送。
+//   sqlite-jdbc 真库 (rp_record 写入) + host_fake (档表/排除名单 config + sendQuote/sendText 捕获)。
+//   逐字对齐线上 hbDetailExtract 顺序 (main.java:2707-2814)。
+// 权威: docs spec §17 写库 + hbTierAndSend 发送; redpacket_qualify/store/tiers 已抽模块逐字保真。
+// 运行 cwd = merged/。
+// ============================================================
+import java.sql.*;
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");        // HOST(fake) + CLOCK ; sendQuote→FAKE_QUOTED, sendText→FAKE_SENT
+source("tests/fakes/storage_jdbc.bsh");
+source("src/domain/membership.bsh");        // normGroupId/parseCsv/joinCsv
+source("src/domain/redpacket_store.bsh");   // rpRecord/rpQueryToday/RP_CREATE_SQL
+source("src/domain/redpacket_tiers.bsh");   // getTiersByType/tierOf/renderTierRuleLine
+source("src/domain/redpacket_qualify.bsh"); // rpComputeQualified/rpIsEqualSplit/getExcludeList
+source("src/app/redpacket_app.bsh");        // rpProcessReceivers (被测)
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(RP_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+String DATE = "2026-06-09";
+long T = 1749470000000L;
+String GRP = "g1@chatroom";
+// 档表用全局默认三档 5/10/20 元 (rp_tiers_<gid> 未配 → getTiers 回退全局默认)。
+Object[] rcv(String nick, long cent, String wxid) { return new Object[]{ nick, new Long(cent), wxid }; }
+void reset() { FAKE_SENT.clear(); FAKE_QUOTED.clear(); }
+
+// ============================================================
+// 场景 1: 均分包 (≥2 人金额全等) → EQUAL_SPLIT, 不写库不发送。
+// ============================================================
+reset();
+java.util.List eq = new java.util.ArrayList();
+eq.add(rcv("a", 600L, "wa")); eq.add(rcv("b", 600L, "wb"));   // 金额全等
+int rc1 = rpProcessReceivers("k_eq", 111L, DATE, T, GRP, "群1", "ws", "发包人", "均分", false, "群规", eq);
+check("1 均分包 → RP_PROC_EQUAL_SPLIT", rc1 == RP_PROC_EQUAL_SPLIT);
+check("1 均分包不写库 → 当日 0 行", rpQueryToday(DATE).isEmpty());
+check("1 均分包不发引用条", FAKE_QUOTED.isEmpty());
+check("1 均分包不发@条", FAKE_SENT.isEmpty());
+
+// ============================================================
+// 场景 2: 拼手气达标 → 写库 + 发引用群规条 + @达标者。
+//   档 5/10/20; 金额 600分(6元>5,档1) / 1500分(15元>10,档2) / 300分(3元, 未达最低档不计)。
+// ============================================================
+reset();
+java.util.List hb = new java.util.ArrayList();
+hb.add(rcv("张三", 600L, "w1"));    // 6元 → 达标档1
+hb.add(rcv("李四", 1500L, "w2"));   // 15元 → 达标档2
+hb.add(rcv("王五", 300L, "w3"));    // 3元 → 未达标(不@/不计)
+int rc2 = rpProcessReceivers("k_hb", 222L, DATE, T + 10, GRP, "群1", "ws", "发包人", "恭喜发财", false, "本群红包群规", hb);
+check("2 拼手气达标 → RP_PROC_SENT", rc2 == RP_PROC_SENT);
+
+// 写库: 当日 1 行, qualified_count=2, qualifiers 逐字保真。
+java.util.List rows = rpQueryToday(DATE);
+check("2 写库 → 当日 1 行", rows.size() == 1);
+Object[] r0 = (Object[]) rows.get(0);
+check("2 qualified_count=2 (达标2人)", ((Long) r0[3]).longValue() == 2L);
+check("2 qualifiers 逐字: 张三|6|1;李四|15|2", "张三|6|1;李四|15|2".equals(r0[4]));
+check("2 title 保真", "恭喜发财".equals(r0[2]));
+
+// 发送: 引用条 1 条(带前缀+各档), @条 = 2 个达标者。
+check("2 引用条 1 条", FAKE_QUOTED.size() == 1);
+Object[] qline = (Object[]) FAKE_QUOTED.get(0);
+check("2 引用条 msgid 透传==222", ((Long) qline[1]).longValue() == 222L);
+check("2 引用条文本含前缀", ((String) qline[2]).indexOf("本群红包群规") >= 0);
+check("2 引用条文本含『过5元』", ((String) qline[2]).indexOf("过5元") >= 0);
+check("2 @条 = 2 个达标者", FAKE_SENT.size() == 2);
+boolean atW1 = false, atW2 = false, atW3 = false;
+for (int i = 0; i < FAKE_SENT.size(); i++) {
+    String m = ((Object[]) FAKE_SENT.get(i))[1].toString();
+    if (m.indexOf("[AtWx=w1]") >= 0) atW1 = true;
+    if (m.indexOf("[AtWx=w2]") >= 0) atW2 = true;
+    if (m.indexOf("[AtWx=w3]") >= 0) atW3 = true;
+}
+check("2 @了达标 w1", atW1);
+check("2 @了达标 w2", atW2);
+check("2 未@未达标 w3", !atW3);
+
+// ============================================================
+// 场景 3: 拼手气但无人达标 (全部 < 最低档) → NO_QUALIFY, 不写库不发送 (线上 qualified==0 not recorded)。
+// ============================================================
+reset();
+java.util.List low = new java.util.ArrayList();
+low.add(rcv("c", 100L, "wc")); low.add(rcv("d", 200L, "wd"));   // 1元/2元, 都 < 5元最低档
+int rc3 = rpProcessReceivers("k_low", 333L, DATE, T + 20, GRP, "群1", "ws", "发包人", "小包", false, "群规", low);
+check("3 无人达标 → RP_PROC_NO_QUALIFY", rc3 == RP_PROC_NO_QUALIFY);
+check("3 无人达标不写库 → 当日仍 1 行(只有场景2)", rpQueryToday(DATE).size() == 1);
+check("3 无人达标不发送", FAKE_QUOTED.isEmpty() && FAKE_SENT.isEmpty());
+
+// ============================================================
+// 场景 4: 排除名单成员不@/不计入达标 (复用 getExcludeList, 走 HOST config)。
+//   rp_exclude_<gid> = "w2" → w2 虽 15元达标也被剔除。
+// ============================================================
+reset();
+HOST.putString("rp_exclude_" + normGroupId(GRP), "w2");
+java.util.List hb4 = new java.util.ArrayList();
+hb4.add(rcv("张三", 600L, "w1"));    // 达标 档1
+hb4.add(rcv("李四", 1500L, "w2"));   // 达标但在排除名单 → 剔除
+int rc4 = rpProcessReceivers("k_ex", 444L, DATE, T + 30, GRP, "群1", "ws", "发包人", "排除测试", false, "群规", hb4);
+check("4 排除后仍达标≥1 → RP_PROC_SENT", rc4 == RP_PROC_SENT);
+java.util.List rows4 = rpQueryToday(DATE);
+Object[] rExc = null;
+// rpQueryToday 无 key 列, 按 title 唯一定位本场景写入行。
+for (int i = 0; i < rows4.size(); i++) { Object[] x = (Object[]) rows4.get(i); if ("排除测试".equals(x[2])) rExc = x; }
+check("4 排除测试行存在", rExc != null);
+check("4 排除后 qualified_count=1 (剔除 w2)", ((Long) rExc[3]).longValue() == 1L);
+check("4 qualifiers 只含 张三", "张三|6|1".equals(rExc[4]));
+// @条只@w1, 不@排除的w2。
+boolean s4w1 = false, s4w2 = false;
+for (int i = 0; i < FAKE_SENT.size(); i++) {
+    String m = ((Object[]) FAKE_SENT.get(i))[1].toString();
+    if (m.indexOf("[AtWx=w1]") >= 0) s4w1 = true;
+    if (m.indexOf("[AtWx=w2]") >= 0) s4w2 = true;
+}
+check("4 @了 w1", s4w1);
+check("4 未@排除的 w2", !s4w2);
+HOST.putString("rp_exclude_" + normGroupId(GRP), "");   // 清排除名单
+
+conn.close();
+done();

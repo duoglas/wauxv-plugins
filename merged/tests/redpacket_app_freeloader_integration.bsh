@@ -1,0 +1,263 @@
+// ============================================================
+// L2 全链路集成 (P3-a): recordSpeak + l3Flush → freeloaderRunForPacket → doWarn 直调。
+//   sqlite-jdbc 真库 (speak 表落库 + 快照) + host_fake (doWarn 的 sendText/踢人/config 捕获)。
+//   验合并核心收益: 发言经热路径缓冲 + l3Flush 落表 → 同插件拍快照 → 判定 → in-process doWarn。
+//
+// 权威: docs/superpowers/specs/2026-06-09-红包伸手党-合并后判定重设计.md §3/§4.1/§5「伸手党全链路」。
+//   覆盖测试矩阵边界: 红包前1s=活跃 / 红包后G内=活跃 / 红包后G外=伸手党 / 从未发言+老成员=伸手党 /
+//   从未发言+新人=豁免 / 排除名单豁免 / 无快照=零警告 / 踢人累计到 wk_ 阈值触发踢 (#25)。
+//
+// 跨域接线: STORAGE=jdbc (speak_store/speak_buffer 落库) ; HOST=fake (warning/doWarn 副作用) ; CLOCK=fake。
+//   速度: 发言时刻用 speakRecord(grp,wxid,ts) 直接落任意 ts (= 模拟"快照那一刻表里的行"),
+//   另用 recordSpeak+l3Flush 链路实测"热路径缓冲→落表→快照可见"(#12 病根已修)。
+// 运行 cwd = merged/，classpath 含 bsh + sqlite-jdbc。
+// ============================================================
+import java.sql.*;
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");        // HOST(fake) + CLOCK(fake)
+source("tests/fakes/storage_jdbc.bsh");     // makeJdbcStorage / jdbcMemoryConn
+source("src/domain/membership.bsh");        // canActOn/isAdminInGroup/parseCsv/joinCsv/normGroupId
+source("src/domain/warning.bsh");           // doWarn/getWarn/getWarnKick/...
+source("src/domain/speak_store.bsh");       // speakRecord/speakSnapshotAll/SPEAK_CREATE_SQL
+source("src/domain/freeloader.bsh");        // freeloaderJudge/FL_*
+source("src/app/speak_buffer.bsh");         // recordSpeak/l3Flush (热路径缓冲)
+source("src/app/redpacket_app.bsh");        // freeloaderRunForPacket (被测编排)
+
+// ---- 接线 ----
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(SPEAK_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+FAKE_LOGIN_WXID = "bot";
+
+long P  = 1749470000000L;             // packetMs
+long N  = 30L * 60L * 1000L;          // 窗口 30min(ms)
+long EX = 86400000L;                  // EXEMPT 1 天
+long G  = FREELOADER_GRACE_AFTER_MS;  // 3s
+String GRP = "g1@chatroom";
+Long oldFs = new Long(P - 10L * EX);        // 非新人(很旧 first_seen)
+Long newFs = new Long(P - 2L * 3600000L);   // 新人(P-2h, 在 EXEMPT 内)
+Long L(long v) { return new Long(v); }
+
+// since 闸门锚点 (MAJOR 1): per-group 键 rp_freeloader_since_<normGroupId(grp)> = 开关 OFF→ON 时刻。
+//   A/C/D 走正常判定路径 → 锚点须足够老 (packetMs - since >= winMs, 已过预热宽限期)。
+//   设 since = P - 2N (远早于 P-N), 故 packetMs(=P) - since = 2N >= N → 过闸门正常判。
+void setSince(String w, long ms) { HOST.putString("rp_freeloader_since_" + normGroupId(w), String.valueOf(ms)); }
+void clearSince(String w) { FAKE_KV.remove("rp_freeloader_since_" + normGroupId(w)); }
+setSince(GRP, P - 2L * N);   // 默认锚点(过预热期), 个别 since 闸门场景再覆盖
+
+// 直接落"快照那一刻表里的行"。speakRecord 走 STORAGE UPSERT(max/min coalesce), 单行插入即原值。
+void seedSpeak(String w, Long ls, Long fs) {
+    PreparedStatement ps = conn.prepareStatement(
+        "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,?,?)");
+    ps.setString(1, GRP); ps.setString(2, w);
+    if (ls == null) ps.setObject(3, null); else ps.setLong(3, ls.longValue());
+    if (fs == null) ps.setObject(4, null); else ps.setLong(4, fs.longValue());
+    ps.executeUpdate(); ps.close();
+}
+
+// grp-参数化版 (since 闸门/MAJOR 场景用不同群隔离锚点, 避免与 GRP 默认锚点串)。
+void seedSpeakG(String g, String w, Long ls, Long fs) {
+    PreparedStatement ps = conn.prepareStatement(
+        "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,?,?)");
+    ps.setString(1, g); ps.setString(2, w);
+    if (ls == null) ps.setObject(3, null); else ps.setLong(3, ls.longValue());
+    if (fs == null) ps.setObject(4, null); else ps.setLong(4, fs.longValue());
+    ps.executeUpdate(); ps.close();
+}
+
+void reset() { FAKE_SENT.clear(); FAKE_KICKED.clear(); }
+
+// ============================================================
+// 场景 A: 全链路单包 — 潜水者被 doWarn, 活跃者/新人/排除名单不被警告, 取 wxid 真值表。
+// ============================================================
+// 造表(= 快照那一刻):
+seedSpeak("u_before1s", L(P - 1000L), oldFs);          // 红包前1s发言 → 活跃
+seedSpeak("u_afterG_in", L(P + 2000L), oldFs);         // 红包后2s发言(<G=3s, 已落表) → 活跃
+seedSpeak("u_afterG_out", L(P - N - 5000L), oldFs);    // 红包后>G才发言=洗白(不落表), 表里旧值<thr → 伸手党
+seedSpeak("u_neverOld", null, oldFs);                  // 从未发言+老成员 → 伸手党
+seedSpeak("u_neverNew", null, newFs);                  // 从未发言+新人 → 豁免
+seedSpeak("u_excluded", null, oldFs);                  // 在排除集 → excluded 不判
+// u_norow: 不造行 → 快照无此人 → SKIP
+
+// 排除集
+java.util.Set exSet = new java.util.HashSet();
+exSet.add("u_excluded");
+
+java.util.List rcv = new java.util.ArrayList();
+rcv.add("u_before1s"); rcv.add("u_afterG_in"); rcv.add("u_afterG_out");
+rcv.add("u_neverOld"); rcv.add("u_neverNew"); rcv.add("u_excluded"); rcv.add("u_norow");
+
+reset();
+java.util.Map sumA = freeloaderRunForPacket(GRP, rcv, "bot", P, N, EX, exSet, FREELOADER_MAX_WARN, "30分钟内未发言");
+
+// 判定真值表
+java.util.Map vA = (java.util.Map) sumA.get("verdicts");
+check("A 红包前1s发言 → ACTIVE", ((Integer) vA.get("u_before1s")).intValue() == FL_ACTIVE);
+check("A 红包后G内发言(已落表) → ACTIVE", ((Integer) vA.get("u_afterG_in")).intValue() == FL_ACTIVE);
+check("A 红包后>G洗白(未落表) → WARN", ((Integer) vA.get("u_afterG_out")).intValue() == FL_WARN);
+check("A 从未发言+老成员 → WARN", ((Integer) vA.get("u_neverOld")).intValue() == FL_WARN);
+check("A 从未发言+新人 → EXEMPT_NEW(豁免)", ((Integer) vA.get("u_neverNew")).intValue() == FL_EXEMPT_NEW);
+check("A 快照无此人 → SKIP", ((Integer) vA.get("u_norow")).intValue() == FL_SKIP);
+
+// 警告人数: 仅 u_afterG_out + u_neverOld = 2 伸手党, 各 doWarn 一次 (首警告 → wn_=1)。
+check("A warned 计数==2", ((Integer) sumA.get("warned")).intValue() == 2);
+check("A toWarn==2", ((java.util.List) sumA.get("toWarn")).size() == 2);
+check("A 排除名单 excluded==1", ((Integer) sumA.get("excluded")).intValue() == 1);
+check("A 排除名单成员未被警告 getWarn==0", getWarn(GRP, "u_excluded") == 0);
+
+// in-process doWarn 真生效: 两个伸手党各 wn_=1 + 发了警告条; 活跃/豁免/SKIP 计数不动。
+check("A u_afterG_out doWarn → wn_=1", getWarn(GRP, "u_afterG_out") == 1);
+check("A u_neverOld   doWarn → wn_=1", getWarn(GRP, "u_neverOld") == 1);
+check("A u_before1s 活跃 → wn_=0",     getWarn(GRP, "u_before1s") == 0);
+check("A u_neverNew 豁免 → wn_=0",     getWarn(GRP, "u_neverNew") == 0);
+check("A u_norow SKIP → wn_=0",        getWarn(GRP, "u_norow") == 0);
+// 两个伸手党各发一条警告 → FAKE_SENT 含 2 条 (doWarn 首警告各发 1)
+check("A FAKE_SENT 恰 2 条警告", FAKE_SENT.size() == 2);
+check("A 未踢人(首警告)",        FAKE_KICKED.isEmpty());
+
+// ============================================================
+// 场景 B: 无快照 → 整批 SKIP, 零警告 (§4.1 #1 降级红线, 命根)。
+//   模拟 speakSnapshotAll 抛错: 关闭连接使 SELECT 失败 → snapshot=null → 零 doWarn。
+// ============================================================
+reset();
+Connection conn2 = jdbcMemoryConn();
+conn2.createStatement().execute(SPEAK_CREATE_SQL);
+conn2.close();   // 关连接 → 后续 SELECT 抛异常 → snapshot=null
+STORAGE = makeJdbcStorage(conn2);
+java.util.List rcvB = new java.util.ArrayList();
+rcvB.add("z_never1"); rcvB.add("z_never2");   // 本会 WARN 的人
+java.util.Map sumB = freeloaderRunForPacket(GRP, rcvB, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言");
+check("B 无快照 → snapFail==true", ((Boolean) sumB.get("snapFail")).booleanValue());
+check("B 无快照 → warned==0(零警告)", ((Integer) sumB.get("warned")).intValue() == 0);
+check("B 无快照 → toWarn 空", ((java.util.List) sumB.get("toWarn")).isEmpty());
+check("B 无快照 → 一个 doWarn 都没发 (FAKE_SENT 空)", FAKE_SENT.isEmpty());
+check("B 无快照 → z_never1 wn_=0", getWarn(GRP, "z_never1") == 0);
+STORAGE = makeJdbcStorage(conn);   // 恢复主连接
+
+// ============================================================
+// 场景 C: #12 病根已修 — 发言经热路径 recordSpeak 缓冲 + l3Flush 落表 → 快照可见 → 活跃。
+//   (freeloaderRunForPacket 内部先 l3Flush, 故即便发言只在缓冲, 判定前会被逼进表。)
+// ============================================================
+reset();
+// 该人先有 first_seen 老成员基线(否则 first_seen=flush 时刻可能被当新人)。
+seedSpeak("c_flushed", null, oldFs);
+// 热路径入队一条发言(CLOCK.now()=FAKE_NOW); 设 FAKE_NOW = P-1s 使 last_speak 落窗口内。
+FAKE_NOW = P - 1000L;
+recordSpeak(GRP, "c_flushed");   // 只入内存缓冲, 未落表
+// 直接查表此刻应无 last_speak(还在缓冲)
+check("C 缓冲未 flush 时表里 last_speak 仍 null", speakQueryLastSpeak(GRP, "c_flushed") == null);
+java.util.List rcvC = new java.util.ArrayList();
+rcvC.add("c_flushed");
+java.util.Map sumC = freeloaderRunForPacket(GRP, rcvC, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言");
+java.util.Map vC = (java.util.Map) sumC.get("verdicts");
+check("C l3Flush 把缓冲发言逼进表 → 快照可见 → ACTIVE", ((Integer) vC.get("c_flushed")).intValue() == FL_ACTIVE);
+check("C 病根已修: 缓冲发言不漏 → 未误警告 wn_=0", getWarn(GRP, "c_flushed") == 0);
+FAKE_NOW = 1000000L;   // 复位
+
+// ============================================================
+// 场景 D: #25 踢人累计跨多包 — 同一人连续多包被判伸手党, doWarn 累计到 wk_ 上限触发踢。
+//   wk_ 设 3 → 第 3 次伸手党 doWarn 触发 tryKickSilent(端到端验"累计踢人"真生效)。
+// ============================================================
+reset();
+setWarnKick(GRP, 3);                       // 本群上限设 3
+seedSpeak("d_repeat", null, oldFs);        // 从未发言+老成员 → 每包都 WARN
+java.util.List rcvD = new java.util.ArrayList();
+rcvD.add("d_repeat");
+// 连抢 3 个包(各自快照判定 → doWarn 累计)
+for (int k = 0; k < 3; k++) {
+    freeloaderRunForPacket(GRP, rcvD, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言");
+}
+check("D 累计到 wk_=3 → tryKickSilent 触发(踢 d_repeat)", FAKE_KICKED.contains("d_repeat"));
+check("D 踢成功后计数清零 wn_=0", getWarn(GRP, "d_repeat") == 0);
+
+// ============================================================
+// 场景 E: since 全局开关时刻宽限闸门 (MAJOR 1, spec §4 不变项 + 矩阵 #16)。
+//   逐字对齐线上 plugins/redpacket-stats/main.java:2761-2772 (v1.11.4):
+//     ① since<=0 (键空/老用户升级缺口) → lazy-init 补写 since=now 再整包跳过 (自愈, 下个包才生效)。
+//     ② packetMs 在 since+winMs 内 (预热期) → 整包跳过 (全员豁免)。
+//     ③ since 足够老 (已过预热) → 正常判定 (前面 A/C/D 已覆盖)。
+//   闸门触发整包跳过 = 绝不调 doWarn (降级红线: 宁可漏判不可误踢)。
+// ============================================================
+String GE = "ge@chatroom";
+
+// --- E1: since<=0 (无锚点) → lazy-init 补写 + 整包跳过, 零警告 ---
+reset();
+clearSince(GE);                                  // 确保无锚点 (键空)
+seedSpeakG(GE, "e_never", null, oldFs);          // 老成员从未发言: 若不跳过本会被 WARN
+FAKE_NOW = 555000L;                              // lazy-init 写的 since 应 = 此刻
+java.util.List rcvE1 = new java.util.ArrayList(); rcvE1.add("e_never");
+java.util.Map sumE1 = freeloaderRunForPacket(GE, rcvE1, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言");
+check("E1 since<=0 → 整包跳过 gate=no_since_anchor", "no_since_anchor".equals(sumE1.get("gate")));
+check("E1 since<=0 → warned==0(零警告)", ((Integer) sumE1.get("warned")).intValue() == 0);
+check("E1 since<=0 → toWarn 空", ((java.util.List) sumE1.get("toWarn")).isEmpty());
+check("E1 since<=0 → 一个 doWarn 都没发 (FAKE_SENT 空)", FAKE_SENT.isEmpty());
+check("E1 since<=0 → e_never wn_=0 (未误警告)", getWarn(GE, "e_never") == 0);
+check("E1 lazy-init 补写 since=now (自愈)", Long.parseLong(HOST.getString("rp_freeloader_since_" + normGroupId(GE), "0")) == 555000L);
+FAKE_NOW = 1000000L;
+
+// --- E2: packetMs 在 since+winMs 内 (预热期) → 整包跳过, 零警告 ---
+reset();
+setSince(GE, P - (N / 2L));                       // since = P - N/2 → packetMs(P) - since = N/2 < N → 预热期内
+java.util.List rcvE2 = new java.util.ArrayList(); rcvE2.add("e_never");   // 同一老成员从未发言
+java.util.Map sumE2 = freeloaderRunForPacket(GE, rcvE2, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言");
+check("E2 预热期 → 整包跳过 gate=within_activation_grace", "within_activation_grace".equals(sumE2.get("gate")));
+check("E2 预热期 → warned==0(零警告)", ((Integer) sumE2.get("warned")).intValue() == 0);
+check("E2 预热期 → 一个 doWarn 都没发", FAKE_SENT.isEmpty());
+check("E2 预热期 → e_never wn_=0 (全员豁免)", getWarn(GE, "e_never") == 0);
+
+// --- E3: since 足够老 (恰过预热期边界 packetMs-since==winMs) → 正常判定 → 老成员从未发言 WARN ---
+reset();
+setSince(GE, P - N);                              // packetMs - since == winMs → 不小于 → 过闸门正常判
+java.util.List rcvE3 = new java.util.ArrayList(); rcvE3.add("e_never");
+java.util.Map sumE3 = freeloaderRunForPacket(GE, rcvE3, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言");
+check("E3 过预热期(边界) → 非闸门跳过 gate==null", sumE3.get("gate") == null);
+check("E3 过预热期 → 老成员从未发言被 WARN (warned==1)", ((Integer) sumE3.get("warned")).intValue() == 1);
+check("E3 过预热期 → e_never doWarn → wn_=1", getWarn(GE, "e_never") == 1);
+
+// ============================================================
+// 场景 F: reason 空串/null 守护 (MAJOR 2)。
+//   reason 为 null / 空白 → 整批不发 (零 doWarn), gate=no_reason; 防落到 doWarn 的 auto=false 手动语义
+//   (会发"❌ 权限不足" + 不再静默豁免管理员/群主)。
+// ============================================================
+String GF = "gf@chatroom";
+setSince(GF, P - 2L * N);                         // 锚点过预热期, 排除 since 闸门干扰, 单测 reason 守护
+seedSpeakG(GF, "f_never", null, oldFs);           // 老成员从未发言: 若 reason 非空本会 WARN
+java.util.List rcvF = new java.util.ArrayList(); rcvF.add("f_never");
+
+reset();
+java.util.Map sumFnull = freeloaderRunForPacket(GF, rcvF, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, null);
+check("F reason=null → gate=no_reason 整批不发", "no_reason".equals(sumFnull.get("gate")));
+check("F reason=null → warned==0", ((Integer) sumFnull.get("warned")).intValue() == 0);
+check("F reason=null → 一个 doWarn 都没发 (FAKE_SENT 空, 无❌权限不足)", FAKE_SENT.isEmpty());
+check("F reason=null → f_never wn_=0 (未误警告)", getWarn(GF, "f_never") == 0);
+
+reset();
+java.util.Map sumFblank = freeloaderRunForPacket(GF, rcvF, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "   ");
+check("F reason=空白 → gate=no_reason 整批不发", "no_reason".equals(sumFblank.get("gate")));
+check("F reason=空白 → 一个 doWarn 都没发", FAKE_SENT.isEmpty());
+check("F reason=空白 → f_never wn_=0", getWarn(GF, "f_never") == 0);
+
+// ============================================================
+// 场景 G: last_speak IS NULL + 非新人 → WARN (spec §8d / §4.1 关键区分)。
+//   speak 表里【有行】但 last_speak IS NULL (从未发言) 且 first_seen 足够老 (非新人):
+//   不当"无此人"SKIP, 而是走 first_seen 维度 → WARN。app 全链路层补闭环。
+//   (与"快照无此人(无行)=SKIP"对照: present=true + snapLs=null → 判 WARN, 不是 FL_SKIP。)
+// ============================================================
+String GG = "gg@chatroom";
+setSince(GG, P - 2L * N);                          // 过预热期
+seedSpeakG(GG, "g_nullnew", null, newFs);          // 有行 + last_speak NULL + 新人 first_seen → 对照: EXEMPT
+seedSpeakG(GG, "g_nullold", null, oldFs);          // 有行 + last_speak NULL + 非新人 first_seen → WARN (#8d)
+// g_norow: 不造行 → 快照无此人 → SKIP (对照: 同 NULL 但走 SKIP 维度)
+reset();
+java.util.List rcvG = new java.util.ArrayList();
+rcvG.add("g_nullold"); rcvG.add("g_nullnew"); rcvG.add("g_norow");
+java.util.Map sumG = freeloaderRunForPacket(GG, rcvG, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言");
+java.util.Map vG = (java.util.Map) sumG.get("verdicts");
+check("G last_speak NULL + 非新人(有行) → WARN (不当 SKIP)", ((Integer) vG.get("g_nullold")).intValue() == FL_WARN);
+check("G last_speak NULL + 新人(有行) → EXEMPT_NEW (对照: 走 first_seen 豁免)", ((Integer) vG.get("g_nullnew")).intValue() == FL_EXEMPT_NEW);
+check("G 快照无此行 → SKIP (对照: 无行 ≠ 有行 NULL)", ((Integer) vG.get("g_norow")).intValue() == FL_SKIP);
+check("G last_speak NULL 非新人 doWarn → wn_=1 (闭环, 非 SKIP)", getWarn(GG, "g_nullold") == 1);
+check("G last_speak NULL 非新人 → 发了 1 条警告", FAKE_SENT.size() == 1);
+
+conn.close();
+done();

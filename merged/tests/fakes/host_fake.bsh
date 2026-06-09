@@ -7,6 +7,7 @@
 //   HOST.getLoginWxid()                       -> String   当前登录(机器人)wxid
 //   HOST.detectNativeOwner(String grp)        -> String|null  反射缝；测试可编程
 //   HOST.sendText(String grp, String msg)     -> void     捕获进 FAKE_SENT
+//   HOST.sendQuote(String grp, long msgid, String text) -> void  捕获进 FAKE_QUOTED (引用条占位)
 //   HOST.lookupName(String wxid, String grp)  -> String   fake 直接回 wxid
 //   HOST.tryKickSilent(String grp, String wxid) -> boolean  记入 FAKE_KICKED, 返回 FAKE_KICK_RESULT
 // CLOCK 端口契约:
@@ -15,6 +16,7 @@ FAKE_KV = new java.util.HashMap();          // key -> value (String)
 FAKE_LOGIN_WXID = "";                        // 可编程：当前登录 wxid
 FAKE_NATIVE = new java.util.HashMap();      // grp -> wxid，detectNativeOwner 查它
 FAKE_SENT = new java.util.ArrayList();      // 捕获 sendText: Object[]{grp,msg}
+FAKE_QUOTED = new java.util.ArrayList();     // 捕获 sendQuote: Object[]{grp, Long msgid, text}
 FAKE_KICKED = new java.util.ArrayList();    // 捕获 tryKickSilent 的 wxid
 FAKE_KICK_RESULT = true;                     // 可编程：tryKickSilent 返回值
 FAKE_NOW = 1000000L;                         // 可编程：CLOCK.now() 返回值
@@ -33,6 +35,9 @@ Object _mkFakeHost() {
     }
     void sendText(String grp, String msg) {
         FAKE_SENT.add(new Object[] { grp, msg });
+    }
+    void sendQuote(String grp, long msgid, String text) {
+        FAKE_QUOTED.add(new Object[] { grp, new Long(msgid), text });
     }
     String lookupName(String wxid, String grp) { return wxid; }
     boolean tryKickSilent(String grp, String wxid) {
