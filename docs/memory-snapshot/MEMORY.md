@@ -4,3 +4,4 @@
 - [BeanShell 解析比 javac 严](beanshell-parser-stricter-than-javac.md) — 部署前用 bsh-2.0b6 离线全文解析(去 final)验语法
 - [WAuxiliary getString 是 FUSE IO](waux-getstring-fuse-io-cache-hotpath.md) — 每次读盘 ~26ms，热路径上的配置读必须内存缓存
 - [SQLite UPSERT max/min 要 coalesce 兜底 NULL](sqlite-upsert-coalesce-null-guard.md) — max(NULL,x)=NULL 已咬两次(last_speak/first_seen)，旧列可能 NULL 必须 coalesce
+- [切换才写的配置键当闸门=升级缺口](config-key-written-on-transition-upgrade-gap.md) — 老用户升级时键空→功能静默失效；读侧 lazy-init 自愈
