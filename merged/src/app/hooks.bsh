@@ -1,0 +1,260 @@
+// ============================================================
+// app/hooks — 生命周期 hooks + 端口接线 (生产装配点) — P1-d3 收口片。
+// 线上 plugins/group-admin/main.java 的 WAuxiliary 插件入口逐字保真抽出 + 在入口处把
+// 前面几片 (speak_buffer 采集 / commands 路由 / core 适配器) 接起来。锚点:
+//   onHandleMsg 性能埋点包装层 @2086, onHandleMsgBody @2107, onLoad @1941, onUnload @1996,
+//   l3FlushLoop @382, DB 单例懒开 l3Db @175 (建表/索引/WAL), L3_DB_PATH @171。
+//
+// ★ 端口接线红线 (本片唯一的生产装配点):
+//   领域/app 模块本身绝不 new 适配器, 只用全局 STORAGE/HOST/CLOCK。生产装配只在 onLoad 这一处发生:
+//     STORAGE = makeAndroidStorage(db)   (core/storage_android.bsh, 入参 SQLiteDatabase)
+//     HOST    = makeAndroidHost()        (core/host_android.bsh)
+//     CLOCK   = makeAndroidClock()       (core/clock_android.bsh)
+//   onLoad 是个函数, 只有真机 WAuxiliary 调它时才执行接线 → 测试 source 本模块时不调 onLoad,
+//   故不覆盖测试侧已置的 fake STORAGE/HOST/CLOCK/LEAF (与 speak_buffer/commands 同机制)。
+//
+// ★ 热路径保真红线 (C-PERF-01/03):
+//   onHandleMsg 包装层 + onHandleMsgBody 的"采集"那一步必须 O(1) — 只调 recordSpeak 入队
+//   (内存脏增量, 见 speak_buffer.bsh), 绝不在热路径碰 getString/DB/全量读。
+//   命令路由低频: 先廉价判断 (isChatroom 闸门 → isText → 群启用闸门) 早退, 命中命令前缀才进重逻辑。
+//   性能埋点 (nanoTime 累加 + 阈值落盘) 是观察性缝 → 无副作用占位, P2 接宿主 perf.log, L4 真机验。
+//
+// ★ 反射输入提取缝 (留 P2 接 WAuxiliary 消息对象):
+//   线上 onHandleMsgBody 从 msg 对象反射取 isChatroom/isText/getContent/getTalker/getSendTalker/
+//   getAtUserList/getQuoteMsg。骨架把每个提取隔离成 _msgXxx 占位缝 (参照 host_android.bsh
+//   detectNativeOwner / speak_buffer.bsh _l3Log 的 TODO 写法), 每缝指向线上行号, 调用顺序真实可解析。
+//
+// 依赖 (本期不在本片定义, 由装配体其余模块 / P2 接线提供, 解析门只解析语法不要求其存在):
+//   speak_buffer.bsh: recordSpeak / l3Flush / l3FlushLoop(下方在本片补) / L3_FLUSH_MS / L3_flushStarted;
+//   commands.bsh:     routeCommand;
+//   speak_store.bsh:  SPEAK_CREATE_SQL;
+//   core 工厂:         makeAndroidStorage / makeAndroidHost / makeAndroidClock;
+//   宿主/领域 (P2):    delay / log / getEnabledGroups / getLoginWxid / l3MigrateCsvToDb /
+//                      initFirstSeenBaseline / isGroupEnabled / _logNativeRoleProbe / perfFlush。
+// ============================================================
+
+// ===== DB 落盘底座路径 (线上 @171 逐字) =====
+String L3_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdmin/groupadmin.db";
+
+// 索引/WAL: 线上 l3Db @187-190 在懒开时一并建。建表本身经 STORAGE.exec(SPEAK_CREATE_SQL) 走端口;
+// 索引/PRAGMA 属底层连接级设置, 在打开 SQLiteDatabase 句柄那一步直接做 (端口契约只暴露 exec/queryLong)。
+String SPEAK_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_speak_grp_last ON speak(grp,last_speak)";
+
+// ===== 生产 DB 句柄打开缝 (线上 l3Db @183-192 逐字: openOrCreateDatabase + 索引 + WAL/synchronous) =====
+// 仅 onLoad 装配时调用一次 (非热路径)。本地不可执行 (无 android 运行时); 仅解析门 + L4 真机验。
+// 返回 SQLiteDatabase 句柄供 makeAndroidStorage(db) 接线; 失败返回 null (onLoad 自行兜底)。
+android.database.sqlite.SQLiteDatabase _hooksOpenDb() {
+    android.database.sqlite.SQLiteDatabase db =
+        android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(
+            L3_DB_PATH, (android.database.sqlite.SQLiteDatabase.CursorFactory) null);
+    db.execSQL(SPEAK_INDEX_SQL);
+    // WAL 必须走 rawQuery: 该 PRAGMA 返回一行, execSQL 会拒绝并抛 (线上 @188-189 spike 已确认)。
+    try { android.database.Cursor c = db.rawQuery("PRAGMA journal_mode=WAL", (String[]) null); if (c != null) c.close(); } catch (Throwable t) {}
+    try { db.execSQL("PRAGMA synchronous=NORMAL"); } catch (Throwable t) {}
+    return db;
+}
+
+// ===== 后台 flush 循环 (speak_buffer.bsh 注释里的接线缺口在此补) — 线上 l3FlushLoop @382 逐字 =====
+// onLoad 启动; 自我重调度 delay 循环, 周期 L3_FLUSH_MS 调一次 l3Flush (内存脏增量 → SQLite UPSERT)。
+// delay()/log() 是 WAuxiliary 注入的宿主内置 (本地无, 解析门只解析语法); 整段 try/catch 不连坐消息处理。
+void l3FlushLoop() {
+    try {
+        l3Flush();
+    } catch (Throwable t) {
+        try { log("l3 flush loop err: " + t); } catch (Throwable t2) {}
+    } finally {
+        try {
+            delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
+        } catch (Throwable t) {
+            try { log("l3 flush reschedule fail: " + t); } catch (Throwable t2) {}
+        }
+    }
+}
+
+// ============================================================
+// onLoad — WAuxiliary 插件入口 (线上 @1941 逐字 + 端口接线)。
+//   (1) 端口接线 (生产装配点, 唯一): STORAGE/HOST/CLOCK = 各 core 工厂。
+//   (2) 建表: STORAGE.exec(SPEAK_CREATE_SQL) (speak 表; 索引/WAL 在 _hooksOpenDb 已建)。
+//   (3) 冷启动日志块 (C-PLUGIN-05: getLoginWxid 安全取值, 取不到用占位串, 整块 try/catch)。
+//   (4) 延迟基线调度块 (delay 5s → 一次性迁移 CSV→DB + 对所有已启用群补 first_seen 基线)。
+//   (5) 启动后台 L3 flush 循环 (防重复启动, 单独 try/catch 不被前面块连累)。
+// 各块独立 try/catch 互不连坐 (线上 C-PLUGIN-05 教训: 一块抛不阻断后续关键初始化)。
+// ============================================================
+void onLoad() {
+    // ---- (1)+(2) 端口接线 + 建表: 唯一生产装配点。单独 try/catch, 失败不连累后续块。----
+    // STORAGE 装配在最前 (后续建表 + 基线块 + flush 循环都依赖全局 STORAGE 已置)。
+    try {
+        android.database.sqlite.SQLiteDatabase db = _hooksOpenDb();
+        STORAGE = makeAndroidStorage(db);   // 端口接线: 生产 SQLite 适配器
+        HOST    = makeAndroidHost();         // 端口接线: WAuxiliary 宿主适配器
+        CLOCK   = makeAndroidClock();        // 端口接线: 墙钟适配器
+        // 建表走端口 (与测试 jdbc 适配器跑同一份 CREATE SQL)。索引/WAL 已在 _hooksOpenDb 建。
+        STORAGE.exec(SPEAK_CREATE_SQL, new Object[]{});
+    } catch (Throwable t) {
+        try { log("GroupAdmin onLoad 端口接线/建表失败: " + t); } catch (Throwable t2) {}
+    }
+
+    // ---- (3) 冷启动日志块 (线上 @1942-1952 逐字): getLoginWxid 安全取值, 仅 cosmetic, 整块 try/catch。----
+    try {
+        List enabled = getEnabledGroups();
+        String _owner;
+        try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
+        if (_owner == null) _owner = "(login pending)";
+        log("GroupAdmin onLoad, owner=" + _owner + ", enabled groups=" + enabled.size());
+    } catch (Throwable t) {
+        try { log("GroupAdmin onLoad log block err: " + t); } catch (Throwable t2) {}
+    }
+
+    // ---- (4) 延迟基线调度块 (线上 @1954-1978 逐字): 延迟 5s 等通讯录就绪, 迁移 CSV→DB + 补基线。----
+    try {
+        delay(5000, new Runnable() {
+            public void run() {
+                // 一次性迁移旧 CSV → SQLite (migrated 标志守卫只迁一次)。
+                try { l3MigrateCsvToDb(); } catch (Throwable t) { try { log("l3 migrate err: " + t); } catch (Throwable t2) {} }
+
+                List groups = getEnabledGroups();
+                int touched = 0;
+                int totalAdded = 0;
+                for (int i = 0; i < groups.size(); i++) {
+                    String g = (String) groups.get(i);
+                    // v1.20.0: 对所有已启用群补基线 (initFirstSeenBaseline 幂等, 只补缺失成员, 冲突取 min)。
+                    int added = initFirstSeenBaseline(g);
+                    if (added > 0) { touched++; totalAdded += added; }
+                }
+                log("GroupAdmin baseline check: 已启用群 " + groups.size() + ", 补基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+            }
+        });
+    } catch (Throwable t) {
+        try { log("l3 baseline schedule fail: " + t); } catch (Throwable t2) {}
+    }
+
+    // ---- (5) 启动后台 flush 循环 (线上 @1980-1994 逐字): 关键! 单独 try/catch, 防重复启动。----
+    try {
+        if (!L3_flushStarted) {
+            L3_flushStarted = true;
+            try {
+                delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
+            } catch (Throwable t) {
+                L3_flushStarted = false;
+                try { log("l3 flush loop start fail: " + t); } catch (Throwable t2) {}
+            }
+        }
+    } catch (Throwable t) {
+        try { log("l3 flush loop start block fail: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ============================================================
+// onUnload — 卸载/重载前收尾 (线上 @1996 逐字)。
+//   本片抽的"剩余生命周期 hook"。说明: 线上 GroupAdmin 无 onActivityResume(已 grep 确认, 仅 onLoad/
+//   onUnload/onHandleMsg/onMemberChange), onUnload 正是任务所指"刷新/flush-before-read 之类"的真实对应 —
+//   卸载前 flush 内存脏增量进 DB 防丢 (RISK-4) + 关 DB 句柄。保真抽出, 不臆造不存在的 hook。
+//   close DB 句柄改走端口语义: 端口契约不暴露 close, 故经 _hooksCloseDb 缝 (P2 接真实句柄关闭, L4 验)。
+// ============================================================
+// DB 关闭缝 (线上 onUnload @2002 close L3_DB; 端口契约无 close → 隔离到缝, P2 接, L4 验)。
+void _hooksCloseDb() { }
+
+void onUnload() {
+    // 卸载前把内存脏增量同步落库, 防丢 (线上 @1998 逐字)。
+    try { l3Flush(); } catch (Throwable t) { try { log("onUnload l3Flush fail: " + t); } catch (Throwable t2) {} }
+    // 关 DB 句柄 (观察性/资源缝, P2 接真实句柄)。
+    try { _hooksCloseDb(); } catch (Throwable t) { try { log("onUnload db close fail: " + t); } catch (Throwable t2) {} }
+    L3_flushStarted = false;
+}
+
+// ============================================================
+// 反射输入提取缝 (TODO P2: 接 WAuxiliary 消息对象反射; 本期占位, 每缝指向线上行号)。
+// 线上 onHandleMsgBody 从 msg 对象反射取这些字段; 骨架把"从 msg 取 X"隔离成缝, 让 hooks 的
+// 提取→采集→路由调用顺序真实可解析。占位返回值仅为解析门通过 + 调用骨架成立, 非真实语义。
+// ============================================================
+boolean _msgIsChatroom(Object msg)    { return false; }   // @2115 msg.isChatroom() — 群聊闸门(最廉价先判)
+boolean _msgIsText(Object msg)        { return false; }   // @2121 msg.isText()
+String  _msgGetContent(Object msg)    { return null; }    // @2124/@2126 msg.getContent()
+String  _msgGetTalker(Object msg)     { return null; }    // @2148/@2135 msg.getTalker() — groupId
+String  _msgGetSendTalker(Object msg) { return null; }    // @2149/@2136 msg.getSendTalker() — sender
+List    _msgGetAtUserList(Object msg) { return null; }    // @2150 msg.getAtUserList()
+// 引用回复 (W2): 线上 @2430-2461 getQuoteMsg().getSendTalker() + appmsg <title>。
+//   反射/XML 解析留 P2 (仅 !isText 动作分支才调, 见 C-PERF-01: 普通文本不付此成本)。
+String  _msgGetQuoteTarget(Object msg) { return null; }   // @2460 getQuoteMsg().getSendTalker()
+String  _msgGetQuoteTitle(Object msg)  { return null; }   // @2438-2455 引用 appmsg <title> 文本
+
+// 性能埋点缝 (观察性, 无副作用): 线上 @2095-2101 nanoTime 累加进窗口 + 阈值落盘。
+//   骨架置无副作用占位 (P2 接宿主 perf 计数/落盘, L4 真机验); 热路径不付任何文件 IO 成本。
+void _perfRecordOhm(long durNs) { }
+
+// ============================================================
+// onHandleMsg — 性能埋点包装层 (线上 @2086 逐字, T1 / C-PERF-04)。
+// 包装层只测本次 onHandleMsg 总耗时 (观察性缝), 把消息处理委托给 onHandleMsgBody。
+// 埋点全程 try/catch, 任何异常都不影响消息处理 (热路径优先)。
+// ============================================================
+void onHandleMsg(Object msg) {
+    long _perfStart = 0;
+    boolean _perfOn = false;
+    try { _perfStart = System.nanoTime(); _perfOn = true; } catch (Throwable t) { _perfOn = false; }
+    try {
+        onHandleMsgBody(msg);
+    } finally {
+        if (_perfOn) {
+            try {
+                long dur = System.nanoTime() - _perfStart;
+                _perfRecordOhm(dur);   // 观察性缝: 累加窗口计数 + 阈值落盘 (P2 接, 热路径零文件 IO)
+            } catch (Throwable t) { /* 埋点出错绝不影响消息 */ }
+        }
+    }
+}
+
+// ============================================================
+// onHandleMsgBody — 采集 + 提取 + 路由 (线上 @2107 逐字结构)。
+// 调用顺序 (与线上一致, 保真红线):
+//   1. 群聊闸门 (最廉价): 非群聊早退 (@2115)。
+//   2. isText 二分取 content: 文本直接取; 非文本且无可读文本 → 先采集(recordSpeak)再早退 (@2117-2143)。
+//      ★ 采集在路由前 (线上如此): 非文本早退点的 recordSpeak (@2138) 与主路径的 recordSpeak (@2217) 互斥。
+//   3. 提取 groupId/sender/atList (@2148-2150) — 经反射缝 _msgGetXxx。
+//   4. 路由: 把提取出的字段交给 commands.routeCommand 分发 (@2158-2469 那段逐字已在 commands.bsh)。
+//      ★ 注意: 主路径"潜水追踪"那次采集 recordSpeak(@2217, 在 isGroupEnabled 闸门之后、命令分发之前)
+//        已在 commands.bsh::routeCommand 内 (@2222-2224 占位真调), 故此处不重复调, 由 routeCommand 承载,
+//        保持线上"采集在 isGroupEnabled 闸门后、命令重逻辑前"的相对位置不变。
+// 热路径 O(1): 采集只调 recordSpeak (内存入队); routeCommand 先廉价判断早退, 命中前缀才进重逻辑。
+// ============================================================
+void onHandleMsgBody(Object msg) {
+    // 1. 群聊闸门最廉价, 先判 (非群聊一律不处理) (@2115)。
+    if (!_msgIsChatroom(msg)) return;
+
+    // 2. isText 二分取 content (@2117-2143)。普通文本零额外成本; 非文本才回看 getContent 判空。
+    boolean isTextMsg = _msgIsText(msg);
+    String content;
+    if (isTextMsg) {
+        content = _msgGetContent(msg);
+    } else {
+        content = _msgGetContent(msg);
+        if (content == null || content.trim().isEmpty()) {
+            // 非文本且无可读文本 (图片/表情/语音/红包/文件等): 在早退前先采集一次发言活动 (@2128-2141),
+            // 否则只发非文本消息的人 last_speak 永空被 #潜水 误判。热路径红线: 只调 _msgGetTalker/
+            // _msgGetSendTalker/isGroupEnabled(缓存)/recordSpeak(O(1) 内存写), 绝不解析 XML; 整段 try/catch。
+            try {
+                String _aGid = _msgGetTalker(msg);
+                String _aSnd = _msgGetSendTalker(msg);
+                if (_aSnd != null && !_aSnd.isEmpty() && isGroupEnabled(_aGid)) {
+                    recordSpeak(_aGid, _aSnd);
+                }
+            } catch (Throwable _aErr) {}
+            return;   // 非文本且无可读文本 → 采集后不再处理
+        }
+    }
+    if (content == null) return;
+    content = content.trim();
+    if (content.isEmpty()) return;
+
+    // 3. 提取群消息字段 (@2148-2150) — 经反射缝。
+    String groupId = _msgGetTalker(msg);
+    String sender  = _msgGetSendTalker(msg);
+    List   atList  = _msgGetAtUserList(msg);
+    // 引用回复字段 (W2): 仅 !isText 动作分支会用, routeCommand 内按 isTextMsg 二分决定是否消费。
+    String quoteTarget = _msgGetQuoteTarget(msg);
+    String quoteTitle  = _msgGetQuoteTitle(msg);
+
+    // 4. 路由 (@2158-2469 那段逐字已在 commands.bsh)。routeCommand 内含:
+    //    群管开关命令 → isGroupEnabled 闸门 → 潜水追踪采集 recordSpeak(@2217) → 命令前置授权 → 各命令分发。
+    //    返回 true=已消费; false=非命令普通文本 (线上落到普通消息出口, 此处无后续处理)。
+    routeCommand(groupId, sender, content, isTextMsg, atList, quoteTarget, quoteTitle);
+}

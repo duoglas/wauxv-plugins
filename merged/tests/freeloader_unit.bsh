@@ -1,0 +1,70 @@
+// L1 纯判定单测：freeloaderDecide(无 IO)。
+// 覆盖设计 §5.1 全部边界 + 四个返回码 -1/0/1/2 都打到。
+// 权威: docs/superpowers/specs/2026-06-09-红包伸手党-合并后判定重设计.md §3/§2.1/§4.1。
+source("tests/_harness.bsh");
+source("src/domain/freeloader.bsh");
+
+long P   = 1749470000000L;       // packetMs
+long N   = 30L * 60L * 1000L;    // 窗口 30min
+long EX  = 86400000L;            // EXEMPT 1 天
+long thr = P - N;                // 前看窗口下界
+
+// 便捷构造 Long
+Long L(long v) { return new Long(v); }
+
+// ---- §5.1 阈值边界：thr−1(判) / thr(不判,含边界) / thr+1(不判) ----
+// snapFs 设很旧(非新人) 以隔离发言维度
+Long oldFs = L(P - 10L * EX);
+check("thr-1: snapLs<thr 非新人 → WARN(1)",
+    freeloaderDecide(true, L(thr - 1), oldFs, P, N, EX) == FL_WARN);
+check("thr  : snapLs==thr(边界含) → ACTIVE(0)",
+    freeloaderDecide(true, L(thr), oldFs, P, N, EX) == FL_ACTIVE);
+check("thr+1: snapLs>thr → ACTIVE(0)",
+    freeloaderDecide(true, L(thr + 1), oldFs, P, N, EX) == FL_ACTIVE);
+
+// ---- spokeInWindow: 红包后发言(snapLs > packetMs) 也算活跃 ----
+check("snapLs=P (红包同时) → ACTIVE",
+    freeloaderDecide(true, L(P), oldFs, P, N, EX) == FL_ACTIVE);
+check("snapLs=P+1s (红包后 G 内发言, snapLs>packetMs) → ACTIVE",
+    freeloaderDecide(true, L(P + 1000L), oldFs, P, N, EX) == FL_ACTIVE);
+check("snapLs=P-1s (红包前 1s) → ACTIVE",
+    freeloaderDecide(true, L(P - 1000L), oldFs, P, N, EX) == FL_ACTIVE);
+
+// ---- 新人豁免维度：snapLs<thr(窗口内没发言) 时看 first_seen ----
+// snapFs 在 EXEMPT 内(P-2h) → 新人 → EXEMPT_NEW
+check("snapLs<thr + snapFs 在 EXEMPT 内(新人) → EXEMPT_NEW(2)",
+    freeloaderDecide(true, L(thr - 1), L(P - 2L * 3600000L), P, N, EX) == FL_EXEMPT_NEW);
+// snapFs 超 EXEMPT(P-10天) → 非新人 → WARN
+check("snapLs<thr + snapFs 超 EXEMPT(非新人) → WARN(1)",
+    freeloaderDecide(true, L(thr - 1), L(P - 10L * EX), P, N, EX) == FL_WARN);
+// 新人边界：snapFs == P-EXEMPT(恰好) → isNewMember 用 > 严格 → 不算新人 → WARN
+check("snapFs==P-EXEMPT(边界,用>严格) → 非新人 → WARN",
+    freeloaderDecide(true, L(thr - 1), L(P - EX), P, N, EX) == FL_WARN);
+check("snapFs==P-EXEMPT+1(刚进新人期) → 新人 → EXEMPT_NEW",
+    freeloaderDecide(true, L(thr - 1), L(P - EX + 1), P, N, EX) == FL_EXEMPT_NEW);
+
+// ---- 空值语义(§4.1 / 测 8d 区分 present vs snapLs==null) ----
+// present=false → SKIP(快照压根没这人)，不论其它参数
+check("!present → SKIP(-1)",
+    freeloaderDecide(false, null, null, P, N, EX) == FL_SKIP);
+check("!present 即便传了 snapLs/snapFs 也 SKIP",
+    freeloaderDecide(false, L(thr - 1), oldFs, P, N, EX) == FL_SKIP);
+// present=true + snapLs==null(有行从未发言) + 非新人 → WARN(走 first_seen 维度，非 SKIP)
+check("present + snapLs==null + 非新人 → WARN(不是 SKIP, 8d)",
+    freeloaderDecide(true, null, oldFs, P, N, EX) == FL_WARN);
+// present=true + snapLs==null + 新人 → EXEMPT_NEW
+check("present + snapLs==null + 新人 → EXEMPT_NEW(8b 风格)",
+    freeloaderDecide(true, null, L(P - 2L * 3600000L), P, N, EX) == FL_EXEMPT_NEW);
+// present=true + snapLs==null + snapFs==null(无 first_seen) → 非新人 → WARN
+check("present + snapLs==null + snapFs==null → WARN(无 first_seen 不豁免)",
+    freeloaderDecide(true, null, null, P, N, EX) == FL_WARN);
+
+// ---- 略超窗口(§5.2 #6) ----
+check("snapLs=thr-1(略超窗) 非新人 → WARN",
+    freeloaderDecide(true, L(thr - 1), oldFs, P, N, EX) == FL_WARN);
+
+// ---- 确认四码都被打到(自检) ----
+check("四码覆盖: SKIP/ACTIVE/WARN/EXEMPT_NEW 常量值正确",
+    FL_SKIP == -1 && FL_ACTIVE == 0 && FL_WARN == 1 && FL_EXEMPT_NEW == 2);
+
+done();

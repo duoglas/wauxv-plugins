@@ -1,0 +1,154 @@
+// L1 单测：commands 路由 vs fake HostPort/ClockPort（routeCommand 分派真值表，无 DB/反射/真机）。
+// 喂命令字符串 + 编程 host_fake (sender 是 admin/owner、目标 wxid、群启用键)，
+// 断言路由到正确领域动作 (FAKE_SENT 文案 / warning 计数 / 占位缝命中 / recordSpeak 调用)。
+// 运行 cwd = merged/ 。
+//
+// 依赖加载顺序对齐 manifest: host_fake(HOST/CLOCK) → membership → warning → commands。
+// recordSpeak 是 d1 的 L3 采集 (app/speak_buffer)，本路由只占位真调一行 → 用可编程 stub 捕获,
+// 既满足符号解析、又能断言"路由确实调了采集"。动作叶子 _cmd* 占位缝可被测试覆盖以观察分派命中。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");
+source("src/domain/membership.bsh");
+source("src/domain/warning.bsh");
+
+// ---- recordSpeak 采集 stub (d1 L3 占位真调; 捕获 groupId 验证路由调用) ----
+FAKE_RECORDED = new java.util.ArrayList();   // Object[]{groupId, wxid}
+void recordSpeak(String groupId, String wxid) { FAKE_RECORDED.add(new Object[]{ groupId, wxid }); }
+
+source("src/app/commands.bsh");
+
+// ---- 动作叶子端口 LEAF: 换入 recording fake (与 host_fake 换 HOST 同模式; 对象字段调用时解析) ----
+// 只实现本测断言用到的几个动作; 其余动作不命中 → 默认 noop LEAF 已被整体替换, 故未实现的方法不会被调。
+// (每条测试只触发已实现的动作; 用 leafHit 断言路由分派命中。)
+FAKE_LEAF = new java.util.ArrayList();   // Object[]{name, arg1, arg2...}
+Object _mkRecLeaf() {
+    void showInactive(String groupId, String content) { FAKE_LEAF.add(new Object[]{ "showInactive", groupId, content }); }
+    void kick(String groupId, String sender, String target) { FAKE_LEAF.add(new Object[]{ "kick", groupId, target }); }
+    void addAdmin(String groupId, String target, int days) { FAKE_LEAF.add(new Object[]{ "addAdmin", target, new Integer(days) }); }
+    void enableGroup(String groupId, String sender) { FAKE_LEAF.add(new Object[]{ "enable", groupId }); }
+    return this;
+}
+LEAF = _mkRecLeaf();
+
+// ---- setup ----
+FAKE_LOGIN_WXID = "bot";
+HOST.putString("super_owners", "owner1");
+HOST.putString("admins_g@chatroom", "admin1");   // normGroupId 一致
+HOST.putString("ge_g@chatroom", "1");             // 本群已启用 (路由 _cmdGroupEnabled 闸门)
+String gid = "g@chatroom";
+
+void reset() {
+    FAKE_SENT.clear();
+    FAKE_KICKED.clear();
+    FAKE_RECORDED.clear();
+    FAKE_LEAF.clear();
+}
+String lastSent() {
+    if (FAKE_SENT.isEmpty()) return "";
+    return ((Object[]) FAKE_SENT.get(FAKE_SENT.size() - 1))[1].toString();
+}
+boolean leafHit(String name) {
+    for (int i = 0; i < FAKE_LEAF.size(); i++) {
+        if (((Object[]) FAKE_LEAF.get(i))[0].equals(name)) return true;
+    }
+    return false;
+}
+List noAt = new java.util.ArrayList();
+List atTarget(String w) { List l = new java.util.ArrayList(); l.add(w); return l; }
+
+// ============================================================
+// 1. @TA 警告 → 真调 domain doWarn (admin 操作普通人 u1, 计数 +1)
+// ============================================================
+reset(); HOST.putString("wn_g@chatroom_u1", "0");
+boolean r1 = routeCommand(gid, "admin1", "@张三 警告", true, atTarget("u1"), null, null);
+check("1 @警告 路由消费",            r1 == true);
+check("1 @警告 真调 doWarn 计数+1",  getWarn(gid, "u1") == 1);
+check("1 @警告 发了警告回执",        lastSent().indexOf("警告") >= 0);
+check("1 @警告 也采集 recordSpeak",  !FAKE_RECORDED.isEmpty());
+
+// ============================================================
+// 2. @TA 清零 → 真调 domain doWarnClear (先垫计数, 清零后归 0 + ✅ 回执)
+// ============================================================
+reset(); setWarn(gid, "u2", 5); HOST.putString("wl_g@chatroom", "u2");
+boolean r2 = routeCommand(gid, "owner1", "@李四 清零", true, atTarget("u2"), null, null);
+check("2 @清零 路由消费",            r2 == true);
+check("2 @清零 计数归 0",            getWarn(gid, "u2") == 0);
+check("2 @清零 发 ✅ 回执",          lastSent().indexOf("✅") >= 0);
+
+// ============================================================
+// 3. #潜水 → 路由命中 _cmdShowInactive 占位缝 (透传 content)
+// ============================================================
+reset();
+boolean r3 = routeCommand(gid, "admin1", "#潜水 7", true, noAt, null, null);
+check("3 #潜水 路由消费",            r3 == true);
+check("3 #潜水 命中 showInactive 缝", leafHit("showInactive"));
+
+// ============================================================
+// 4. 非命令普通文本 → 不触发任何动作 (返回 false=未消费), 但仍采集发言
+// ============================================================
+reset();
+boolean r4 = routeCommand(gid, "admin1", "今天天气不错", true, noAt, null, null);
+check("4 普通文本 未消费",           r4 == false);
+check("4 普通文本 无动作叶子",        FAKE_LEAF.isEmpty());
+check("4 普通文本 无回执",           FAKE_SENT.isEmpty());
+check("4 普通文本 仍采集发言",        !FAKE_RECORDED.isEmpty());
+
+// ============================================================
+// 5. 非管理员发命令 → 静默消费, 无回执无动作 (isCmd && !authorized)
+// ============================================================
+reset();
+boolean r5 = routeCommand(gid, "normalX", "黑名单", true, noAt, null, null);
+check("5 非管理员命令 静默消费",      r5 == true);
+check("5 非管理员命令 无回执",        FAKE_SENT.isEmpty());
+
+// ============================================================
+// 6. 未启用群 → 启停命令外的命令一律放行(未消费)；本例切到未启用群
+// ============================================================
+reset(); HOST.putString("ge_g2@chatroom", "0");
+boolean r6 = routeCommand("g2@chatroom", "admin1", "黑名单", true, noAt, null, null);
+check("6 未启用群 命令未消费",        r6 == false);
+
+// ============================================================
+// 7. 开启群管(非 owner) → 消费但不执行 (isOwner 闸门), owner 才命中 enable 缝
+// ============================================================
+reset();
+boolean r7a = routeCommand(gid, "admin1", "开启群管", true, noAt, null, null);
+check("7 开启群管 非owner 消费",      r7a == true);
+check("7 开启群管 非owner 不命中缝",  !leafHit("enable"));
+reset();
+boolean r7b = routeCommand(gid, "owner1", "开启群管", true, noAt, null, null);
+check("7 开启群管 owner 命中 enable 缝", leafHit("enable"));
+
+// ============================================================
+// 8. @所有人 踢 → 拒绝回执 ❌, 不命中 kick 缝
+// ============================================================
+reset();
+List atAll = atTarget("notify@all");
+boolean r8 = routeCommand(gid, "owner1", "@所有人 踢", true, atAll, null, null);
+check("8 @所有人踢 消费",            r8 == true);
+check("8 @所有人踢 发 ❌ 拒绝",       lastSent().indexOf("❌") >= 0);
+check("8 @所有人踢 不命中 kick 缝",   !leafHit("kick"));
+
+// ============================================================
+// 9. @TA 管理员 7 → 尾随天数解析, 命中 addAdmin 缝且 days=7 (owner 专属)
+// ============================================================
+reset();
+boolean r9 = routeCommand(gid, "owner1", "@王五 管理员 7", true, atTarget("u9"), null, null);
+check("9 @管理员7 消费",             r9 == true);
+boolean addAdminDays7 = false;
+for (int i = 0; i < FAKE_LEAF.size(); i++) {
+    Object[] e = (Object[]) FAKE_LEAF.get(i);
+    if (e[0].equals("addAdmin") && ((Integer) e[2]).intValue() == 7) addAdminDays7 = true;
+}
+check("9 @管理员7 命中 addAdmin days=7", addAdminDays7);
+
+// ============================================================
+// 10. 引用回复路径: <title> 末 token = 踢, 被引用者 = qt1 → 命中 kick 缝
+//     (isTextMsg=false 模拟 appmsg; quoteTarget/quoteTitle 入参代替反射)
+// ============================================================
+reset();
+boolean r10 = routeCommand(gid, "owner1", "<appmsg>...<title>踢</title>...</appmsg>", false, noAt, "qt1", "踢");
+check("10 引用踢 消费",              r10 == true);
+check("10 引用踢 命中 kick 缝",       leafHit("kick"));
+
+done();

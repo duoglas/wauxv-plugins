@@ -26,6 +26,27 @@ Object makeJdbcStorage(Connection conn) {
         rs.close(); ps.close();
         return out;
     }
+    // 查多行：返回 List<Object[]>，每行各列按 SELECT 顺序。
+    // INTEGER 列(getObject==Number)→Long(null 保 null)；其余→toString()。
+    java.util.List queryRows(String sql, Object[] binds) {
+        PreparedStatement ps = conn.prepareStatement(sql);
+        _bind(ps, binds);
+        ResultSet rs = ps.executeQuery();
+        int n = rs.getMetaData().getColumnCount();
+        java.util.List out = new java.util.ArrayList();
+        while (rs.next()) {
+            Object[] row = new Object[n];
+            for (int i = 0; i < n; i++) {
+                Object v = rs.getObject(i + 1);
+                if (v == null) row[i] = null;
+                else if (v instanceof Number) row[i] = new Long(((Number) v).longValue());
+                else row[i] = v.toString();
+            }
+            out.add(row);
+        }
+        rs.close(); ps.close();
+        return out;
+    }
     return this;
 }
 

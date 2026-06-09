@@ -26,5 +26,29 @@ Object makeAndroidStorage(android.database.sqlite.SQLiteDatabase db) {
         } finally { if (c != null) c.close(); }
         return out;
     }
+    // 查多行：返回 List<Object[]>，每行各列按 SELECT 顺序。
+    // INTEGER 列→Long(NULL 保 null)；其余列→String。与 jdbc 适配器同契约。
+    java.util.List queryRows(String sql, Object[] binds) {
+        String[] args = new String[binds.length];
+        for (int i = 0; i < binds.length; i++) args[i] = (binds[i] == null) ? null : binds[i].toString();
+        android.database.Cursor c = db.rawQuery(sql, args);
+        java.util.List out = new java.util.ArrayList();
+        try {
+            if (c != null) {
+                int n = c.getColumnCount();
+                while (c.moveToNext()) {
+                    Object[] row = new Object[n];
+                    for (int i = 0; i < n; i++) {
+                        if (c.isNull(i)) row[i] = null;
+                        else if (c.getType(i) == android.database.Cursor.FIELD_TYPE_INTEGER)
+                            row[i] = new Long(c.getLong(i));
+                        else row[i] = c.getString(i);
+                    }
+                    out.add(row);
+                }
+            }
+        } finally { if (c != null) c.close(); }
+        return out;
+    }
     return this;
 }

@@ -1,0 +1,47 @@
+// L1 单测：speakSnapshotAll 吃内存 fake(storage_fake / FAKE_ROWS_RET) 的形状契约 +
+//   NULL 二义解析。固化 fake.queryRows 返回 List<Object[]{wxid,last_speak,first_seen}> 的形状，
+//   以及 "key 存在但 ls=null=有行从未发言" vs "key 不存在=无行=SKIP 语义来源" 的区分。
+// 运行 cwd = merged/ 。无 DB/反射。
+source("tests/_harness.bsh");
+source("src/domain/speak_store.bsh");
+source("tests/fakes/storage_fake.bsh");
+
+// ---- 造三类行(形状 = Object[]{ wxid, last_speak, first_seen }) ----
+//   ① 正常: 都非空
+//   ② 有行但 last_speak=null(有行从未发言 → 走 first_seen 维度)
+//   ③ first_seen=null(可选: 有 last_speak 但无 first_seen)
+FAKE_ROWS_RET = new java.util.ArrayList();
+FAKE_ROWS_RET.add(new Object[]{ "wxid_a", new Long(1000L), new Long(500L) });   // ①
+FAKE_ROWS_RET.add(new Object[]{ "wxid_b", null,            new Long(700L) });   // ②
+FAKE_ROWS_RET.add(new Object[]{ "wxid_c", new Long(2000L), null            });  // ③
+
+java.util.Map snap = speakSnapshotAll("g1");
+
+// ---- ① 正常行: present + 类型 + 值 ----
+check("a containsKey", snap.containsKey("wxid_a") == true);
+Object[] va = (Object[]) snap.get("wxid_a");
+check("a[0] 是 Long", va[0] instanceof Long);
+check("a[1] 是 Long", va[1] instanceof Long);
+check("a[0]=last_speak 1000", ((Long) va[0]).longValue() == 1000L);
+check("a[1]=first_seen 500", ((Long) va[1]).longValue() == 500L);
+
+// ---- ② 有行但 last_speak=null: present 真 且 [0]==null(区分"有行从未发言" vs "无行") ----
+check("b containsKey(有行)", snap.containsKey("wxid_b") == true);
+Object[] vb = (Object[]) snap.get("wxid_b");
+check("b[0]==null(从未发言)", vb[0] == null);
+check("b[1]=first_seen 700", (vb[1] instanceof Long) && ((Long) vb[1]).longValue() == 700L);
+
+// ---- ③ first_seen=null: present 真 且 [1]==null，[0] 仍解析 ----
+check("c containsKey", snap.containsKey("wxid_c") == true);
+Object[] vc = (Object[]) snap.get("wxid_c");
+check("c[0]=last_speak 2000", (vc[0] instanceof Long) && ((Long) vc[0]).longValue() == 2000L);
+check("c[1]==null(无 first_seen)", vc[1] == null);
+
+// ---- 不在 FAKE_ROWS_RET 的 wxid: containsKey 为假(=无行=SKIP 语义来源) ----
+check("无此人 containsKey=false", snap.containsKey("wxid_zzz") == false);
+check("snap.size()==3", snap.size() == 3);
+
+// 用完清掉可编程返回，避免污染同进程后续(本 runner 每测独立进程，稳妥起见)。
+FAKE_ROWS_RET = null;
+
+done();

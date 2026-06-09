@@ -1,0 +1,135 @@
+// L1 单测：app/speak_buffer 的 L3 缓冲/flush/降级 **纯状态转移**。
+//
+// 边界(诚实标注): 本测仅覆盖状态机(dirtyCount 计数、缓冲上界降级、失败连击降级、
+//   换出清零、恢复条件、换出经 STORAGE 落库)。**并发正确性(双锁、换出原子性、
+//   消息线程 vs flush 线程的竞态)本地单线程测不了，留 L4 真机验证。**
+//
+// 落库走 STORAGE 端口 + speak_store(speakRecord/speakUpsertFirstSeen); 时刻走 CLOCK。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("src/domain/speak_store.bsh");
+source("src/app/speak_buffer.bsh");
+
+// ---- 可编程 StoragePort fake: 记录 exec 调用; FAKE_FAIL 真则 exec 抛异常(驱动失败连击) ----
+FAKE_EXEC_CALLS = new java.util.ArrayList();   // 每项 = Object[]{ sql, binds }
+FAKE_FAIL = false;                              // 真 → exec 抛 → l3Flush 视为本轮失败
+Object _mkFakeStorage() {
+    void exec(String sql, Object[] binds) {
+        if (FAKE_FAIL) throw new RuntimeException("injected exec fail");
+        FAKE_EXEC_CALLS.add(new Object[]{ sql, binds });
+    }
+    Long queryLong(String sql, Object[] binds) { return null; }
+    return this;
+}
+STORAGE = _mkFakeStorage();
+
+// ---- 可编程 ClockPort fake ----
+FAKE_NOW = 1000000L;
+Object _mkFakeClock() { long now() { return FAKE_NOW; } return this; }
+CLOCK = _mkFakeClock();
+
+// 每例前把 L3 状态机复位到初值(模块 source 时已是初值, 多例间手动重置)。
+void resetL3() {
+    L3_dirtyLs = new HashMap();
+    L3_dirtySeen = new HashMap();
+    L3_dirtyCount = 0;
+    L3_flushFailStreak = 0;
+    L3_DEGRADED = false;
+    FAKE_EXEC_CALLS.clear();
+    FAKE_FAIL = false;
+}
+
+// ============================================================
+// 1. 热路径入队计数: 新 (grp,wxid) 记 2 条增量(last_speak + first_seen 候选)。
+// ============================================================
+resetL3();
+recordSpeak("g1", "wA");
+check("1 新人 dirtyCount==2 (ls+fs)",          L3_dirtyCount == 2);
+check("1 dirtyLs 有 g1->wA",                   ((Map) L3_dirtyLs.get("g1")).containsKey("wA"));
+check("1 dirtySeen 有 g1->wA",                 ((Map) L3_dirtySeen.get("g1")).containsKey("wA"));
+// 同人再发: last_speak 覆盖(不增条), first_seen 已存在不增 → 计数不变。
+recordSpeak("g1", "wA");
+check("1 重复同人 dirtyCount 仍 2",            L3_dirtyCount == 2);
+// 新人: 再 +2。
+recordSpeak("g1", "wB");
+check("1 第二人 dirtyCount==4",                L3_dirtyCount == 4);
+// 入队期间绝不落库(热路径 O(1), 零 STORAGE.exec)。
+check("1 热路径零落库 (exec 未被调用)",        FAKE_EXEC_CALLS.size() == 0);
+
+// ============================================================
+// 2. 缓冲条数到上界 → L3_DEGRADED 置真, 后续 recordSpeak 丢弃(dirty 不再增)。
+//    把 CAP 调小(2)便于本地触发, 不改红线语义(阈值比较逻辑不变)。
+// ============================================================
+resetL3();
+L3_BUFFER_CAP = 2;   // 缩小阈值仅为本地可触发; 比较逻辑 dirtyCount>=CAP 与线上一致
+recordSpeak("g2", "wX");   // 一次新人即 +2 → 达 CAP=2
+check("2 达上界后 L3_DEGRADED==true",          L3_DEGRADED == true);
+long dcAtDegrade = L3_dirtyCount;
+recordSpeak("g2", "wY");   // 降级期: 入口直接 return, 丢弃
+check("2 降级期 recordSpeak 丢弃 (dirty 不增)", L3_dirtyCount == dcAtDegrade);
+check("2 降级期 dirtyLs 未新增 wY",            !((Map) L3_dirtyLs.get("g2")).containsKey("wY"));
+L3_BUFFER_CAP = 5000;   // 复位默认
+
+// ============================================================
+// 3. l3Flush 换出: dirtyCount 归零, 换出的增量经 STORAGE 落库 (断言 exec 行)。
+// ============================================================
+resetL3();
+recordSpeak("g3", "wP");   // +2
+recordSpeak("g3", "wQ");   // +2 → dirtyCount=4
+check("3 flush 前 dirtyCount==4",              L3_dirtyCount == 4);
+l3Flush();
+check("3 flush 后 dirtyCount 归零",            L3_dirtyCount == 0);
+check("3 flush 后 dirtyLs 已换出排空",         L3_dirtyLs.isEmpty());
+check("3 flush 后 dirtySeen 已换出排空",       L3_dirtySeen.isEmpty());
+// 2 人 → 2 次 speakRecord(last_speak UPSERT) + 2 次 speakUpsertFirstSeen(first_seen UPSERT) = 4 次 exec。
+check("3 换出落库 exec 共 4 次 (2人×ls+fs)",   FAKE_EXEC_CALLS.size() == 4);
+// 验落库用对的 SQL: 含 last_speak UPSERT(max) 与 first_seen UPSERT(min)。
+boolean sawLastSpeakSql = false;
+boolean sawFirstSeenSql = false;
+for (int i = 0; i < FAKE_EXEC_CALLS.size(); i++) {
+    String sql = (String) ((Object[]) FAKE_EXEC_CALLS.get(i))[0];
+    if (sql.equals(SPEAK_UPSERT_LASTSEEN_SQL)) sawLastSpeakSql = true;
+    if (sql.equals(SPEAK_UPSERT_FIRSTSEEN_SQL)) sawFirstSeenSql = true;
+}
+check("3 落库含 last_speak UPSERT SQL",        sawLastSpeakSql);
+check("3 落库含 first_seen UPSERT SQL",        sawFirstSeenSql);
+// 落库带正确 ts (= CLOCK.now() 快照)。
+boolean tsOk = false;
+for (int i = 0; i < FAKE_EXEC_CALLS.size(); i++) {
+    Object[] binds = (Object[]) ((Object[]) FAKE_EXEC_CALLS.get(i))[1];
+    if (binds[2] instanceof Long && ((Long) binds[2]).longValue() == FAKE_NOW) tsOk = true;
+}
+check("3 落库 ts == CLOCK.now() 快照",         tsOk);
+
+// ============================================================
+// 4. 失败连击触发降级: FAKE_FAIL 真 → 每轮 flush 失败, streak 累计到 L3_FAIL_CAP → 降级。
+// ============================================================
+resetL3();
+recordSpeak("g4", "wZ");   // 有脏增量, flush 才会进落库路径
+FAKE_FAIL = true;
+for (int i = 0; i < L3_FAIL_CAP; i++) {
+    recordSpeak("g4", "wZ");   // 维持有脏增量(同人覆盖, 不增条但保 dirtyLs 非空)... 但 flush 会换出清空
+    l3Flush();
+}
+check("4 连续失败到顶 streak>=FAIL_CAP",        L3_flushFailStreak >= L3_FAIL_CAP);
+check("4 失败连击触发 L3_DEGRADED==true",       L3_DEGRADED == true);
+
+// ============================================================
+// 5. 恢复条件: flush 成功一轮(streak 归零) 且换出后缓冲已排空到低水位(<CAP/2) → 解除降级。
+//    续 4 的降级态。注意线上语义: 降级期 recordSpeak 丢弃, 不能再入队 → 恢复只能由
+//    "降级边界前已缓冲、尚未 flush 的残留增量" 在 DB 恢复后被成功 flush 驱动。
+//    本测直接向脏 Map 注入一条残留增量(模拟该残留), 关掉故障注入, 跑一轮成功 flush。
+// ============================================================
+FAKE_FAIL = false;
+// 此刻 dirty 已被前面 flush 换出, dirtyCount==0; L3_DEGRADED 仍为 true。
+check("5 恢复前仍降级 (前置条件)",             L3_DEGRADED == true);
+// 注入残留脏增量(模拟降级边界前已缓冲、未 flush 的一条), 使 flush 走 ls!=null 成功分支。
+Map _resid = new HashMap(); _resid.put("wR", Long.valueOf(FAKE_NOW));
+L3_dirtyLs.put("g5", _resid);
+synchronized (L3_LOCK) { L3_dirtyCount = 1; }   // < CAP/2, 满足低水位
+l3Flush();   // 残留被换出落库成功 → anyFail=false → streak=0 + maybeRecover
+check("5 成功一轮后 streak 归零",              L3_flushFailStreak == 0);
+check("5 换出后缓冲排空到低水位(<CAP/2)",      L3_dirtyCount == 0);
+check("5 缓冲排空到低水位 → 解除降级",         L3_DEGRADED == false);
+
+done();

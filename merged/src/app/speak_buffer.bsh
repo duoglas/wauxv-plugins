@@ -1,0 +1,175 @@
+// ============================================================
+// app/speak_buffer — L3 潜水采集异步缓冲/flush/降级 infra。
+// 线上 plugins/group-admin/main.java 的 recordSpeak + l3Flush + 降级状态机逐字保真抽出
+// (锚点 @146-166 状态/双锁声明、@403-514 flush+降级触发/恢复、@710 recordSpeak 热路径)。
+//
+// 端口/适配器:
+//   落库走 StoragePort(全局 STORAGE) + domain/speak_store 已有函数(speakRecord/speakUpsertFirstSeen)，
+//   本模块不直接持 SQLiteDatabase / jdbc 句柄。换出逻辑(L3_LOCK 内 swap 脏 Map、清零 dirtyCount、
+//   出 L3_LOCK 后逐条经 STORAGE 落库)结构与线上一致，只把"写 DB 那一句"替换为端口调用。
+//   时刻取值走 ClockPort(全局 CLOCK)，对齐 warning.bsh 的 CLOCK.now() 约定(可在单测编程)。
+//
+// 保真红线(违反即失败):
+//   - 热路径 O(1): recordSpeak 只往内存脏增量 Map 写，绝不碰 getString/putString/DB/磁盘 (C-PERF-01/03)。
+//   - 锁序恒定: FLUSH_LOCK 外、L3_LOCK 内; recordSpeak 只持 L3_LOCK，绝不持 FLUSH_LOCK、
+//     绝不在 L3_LOCK 内做 DB IO → 无环无死锁。
+//   - 降级隔离: L3_DEGRADED 只影响 recordSpeak 采集入口(真则直接 return 丢弃增量);
+//     L1/L2 命令、flush-before-read、DB 查询永不读 L3_DEGRADED。
+//
+// 依赖: src/domain/speak_store.bsh (speakRecord/speakUpsertFirstSeen) 已加载; 全局 STORAGE/CLOCK 已接线。
+// 后台 delay() 自我重调度循环(l3FlushLoop)与 onLoad/onUnload 接线属 android 运行时, 留 app/hooks(本期不抽)。
+// 并发正确性靠真机 L4 验证, 本模块只承载状态机。
+// ============================================================
+
+// ===== L3 状态与双锁 (线上 @146-166 逐字) =====
+int    L3_FLUSH_MS   = 30000;          // 后台 flush 周期 (ms)
+Object L3_LOCK       = new Object();   // 保护 L3_dirtyLs / L3_dirtySeen 的内存锁 (热路径 recordSpeak 只用这把)
+// 串行化整段 flush (换出脏 Map + 落库) 的独立锁。与 L3_LOCK 分开。
+// 热路径 recordSpeak 绝不获取 FLUSH_LOCK、绝不碰落库 (普通消息永不阻塞磁盘锁, 保 C-PERF-03)。
+// 锁序恒为 FLUSH_LOCK 外、L3_LOCK 内 (仅 l3Flush 在 FLUSH_LOCK 内做一小段 L3_LOCK 换出);
+// recordSpeak 只持 L3_LOCK → 无环 → 无死锁。
+Object FLUSH_LOCK    = new Object();   // 串行化 l3Flush (后台 flush + 命令路径 flush-before-read)
+Map    L3_dirtyLs    = new HashMap();  // groupId -> (Map wxid->ts) 待落盘的 last_speak 增量
+Map    L3_dirtySeen  = new HashMap();  // groupId -> (Map wxid->ts) 待落盘的 first_seen 候选
+boolean L3_flushStarted = false;       // 后台 flush 循环是否已启动 (防重复调度)
+// ===== T4: L3 降级 =====
+// 两个稳健触发器: (1) 内存缓冲条数上界 (2) flush 连续失败。满足任一 → L3_DEGRADED, recordSpeak 丢弃新增量。
+// 红线: 降级只影响 recordSpeak 采集入口; L1/L2 命令/flush-before-read/DB 查询永不读 L3_DEGRADED。
+long   L3_flushFailStreak = 0;          // 连续 flush 失败次数 (落库写不进; flush 成功一轮归零)
+long   L3_dirtyCount      = 0;          // O(1) running counter: 脏增量总条数 (L3_LOCK 内 ++/清零, 热路径不求 size)
+int    L3_BUFFER_CAP      = 5000;       // 脏增量条数上界: ≥ 此值进入降级 (保护内存)
+int    L3_FAIL_CAP        = 5;          // flush 连续失败阈值: ≥ 此值进入降级 (落库持续不可用)
+boolean L3_DEGRADED       = false;      // 降级标志: 真则 recordSpeak 直接 return (廉价布尔读)
+
+// 降级留痕缝: 线上 perfDegrade 往 perf.log 追加一行 (绝不含 wxid/群名/内容)。
+// 骨架里观察性落盘属 app/hooks 关注点 → 此处置无副作用占位, 状态机不依赖其返回。
+// (P2 集成时接到真实 perf.log writer, L4 真机验证; 本期保状态转移即可。)
+void _l3PerfDegrade(boolean enter, String reason, long dirty, long failStreak) { }
+
+// 日志缝: 线上 l3Flush 落库失败时调 WAuxiliary 内置 log(...)。骨架/本地无该内置 →
+// 置无副作用占位, 与 host_android.bsh 的转发缝同思路 (P2 接宿主 log, L4 验)。
+void _l3Log(String msg) { }
+
+// ===== 热路径入口: recordSpeak (线上 @709-733 逐字, O(1) 内存入队) =====
+// 热路径只入内存脏增量 (O(1)), 绝不碰磁盘/落库。落盘由后台 l3Flush / flush-before-read / onUnload 完成。
+void recordSpeak(String groupId, String wxid) {
+    if (groupId == null || wxid == null || groupId.isEmpty() || wxid.isEmpty()) return;
+    // T4 降级: 入口廉价判断 (一个布尔读 + 判断, O(1))。降级期丢弃 L3 采集, 保收发, 不影响 L1/L2。
+    if (L3_DEGRADED) return;
+    Long now = Long.valueOf(CLOCK.now());
+    synchronized (L3_LOCK) {
+        Map ls = (Map) L3_dirtyLs.get(groupId);
+        if (ls == null) { ls = new HashMap(); L3_dirtyLs.put(groupId, ls); }
+        // T4: 只在新 key 时 +1 running counter (覆盖已有 key 不增条数), 与 flush 换出清零对称。
+        if (!ls.containsKey(wxid)) L3_dirtyCount++;
+        ls.put(wxid, now);   // last_speak: 同周期内多次发言取最后一次 (覆盖即可, flush 再与磁盘取较新)
+
+        Map fs = (Map) L3_dirtySeen.get(groupId);
+        if (fs == null) { fs = new HashMap(); L3_dirtySeen.put(groupId, fs); }
+        // first_seen 候选: 只在本周期首次见到时记一次, 不覆盖 (flush 落盘时再保证不覆盖磁盘上更早的)
+        if (!fs.containsKey(wxid)) { L3_dirtyCount++; fs.put(wxid, now); }
+
+        // T4 触发器(1) 缓冲上界: O(1) 计数到顶 → 进入降级 (留痕含原因/条数), 后续 recordSpeak 直接丢弃。
+        if (!L3_DEGRADED && L3_dirtyCount >= L3_BUFFER_CAP) {
+            L3_DEGRADED = true;
+            _l3PerfDegrade(true, "buffer_cap", L3_dirtyCount, L3_flushFailStreak);
+        }
+    }
+}
+
+// ===== 同步换出+落库: l3Flush (线上 @396-501) =====
+// 把内存脏增量批量落库。可被后台循环、flush-before-read、onUnload 复用。
+// 原子换出脏 Map 后慢慢处理, L3_LOCK 只在换出瞬间持有, 不阻塞消息线程做落库 IO。
+void l3Flush() {
+    // 整段 (换出脏 Map → 逐条落库 → 提交) 串行到 FLUSH_LOCK 下。
+    // flush-before-read 的正确性不靠 "FLUSH_LOCK 串行化保证读到已提交" (随后的 query 在 FLUSH_LOCK 外),
+    // 而靠 UPSERT 的单调语义: last_speak=max(...)、first_seen=min(...) — 任何并发顺序都只会更新更不误踢, 不丢已提交较新发言。
+    // 锁序固定: FLUSH_LOCK 外、L3_LOCK 内 (换出脏 Map 那一小段)。recordSpeak 只持 L3_LOCK, 永不持 FLUSH_LOCK → 无死锁。
+    synchronized (FLUSH_LOCK) {
+        Map ls = null;
+        Map fs = null;
+        // L3_LOCK 只在原子换出脏 Map 的瞬间持有 (嵌套在 FLUSH_LOCK 内, 锁序固定),
+        // 绝不在 L3_LOCK 内做落库 IO, 否则会让消息线程的 recordSpeak (同一把内存锁) 等待写库。
+        synchronized (L3_LOCK) {
+            if (!L3_dirtyLs.isEmpty() || !L3_dirtySeen.isEmpty()) {
+                ls = L3_dirtyLs; L3_dirtyLs = new HashMap();
+                fs = L3_dirtySeen; L3_dirtySeen = new HashMap();
+            }
+            L3_dirtyCount = 0;   // T4: 换出即清零 running counter (与 recordSpeak ++ 对称, 都在 L3_LOCK 内)
+        }
+        if (ls == null) {
+            // 无脏增量: 直接返回 (线上此处仅驱动 perfFlush; 观察性落盘留 app/hooks)。
+            return;
+        }
+        boolean anyFail = false;
+        // 翻译: 线上在此 beginTransaction + compileStatement(upLs/upFs) 逐条 bind/execute。
+        //   骨架里"写 DB 那一句"替换为 STORAGE 端口 + speak_store 已有函数:
+        //     last_speak 增量 → speakRecord (UPSERT last_speak=max / first_seen=min 初值)
+        //     first_seen 候选 → speakUpsertFirstSeen (UPSERT first_seen=min, 不动 last_speak)
+        //   整段经 STORAGE.exec 落库; 任一异常视为本轮失败(对齐线上 catch(Throwable)→anyFail),
+        //   累计失败到 L3_FAIL_CAP 触发降级 (线上 db==null 的"打不开算一次失败"也归并到此失败路径)。
+        try {
+            Iterator git = ls.entrySet().iterator();
+            while (git.hasNext()) {
+                Map.Entry ge = (Map.Entry) git.next();
+                String g = (String) ge.getKey();
+                Map inc = (Map) ge.getValue();
+                if (inc == null) continue;
+                Iterator it = inc.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry e = (Map.Entry) it.next();
+                    String w = (String) e.getKey();
+                    Long ts = (Long) e.getValue();
+                    if (w == null || ts == null) continue;
+                    speakRecord(g, w, ts.longValue());   // last_speak=max, first_seen=min 初值
+                }
+            }
+            Iterator fgit = fs.entrySet().iterator();
+            while (fgit.hasNext()) {
+                Map.Entry ge = (Map.Entry) fgit.next();
+                String g = (String) ge.getKey();
+                Map fcand = (Map) ge.getValue();
+                if (fcand == null) continue;
+                Iterator it = fcand.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry e = (Map.Entry) it.next();
+                    String w = (String) e.getKey();
+                    Long ts = (Long) e.getValue();
+                    if (w == null || ts == null) continue;
+                    speakUpsertFirstSeen(g, w, ts.longValue());   // first_seen=min, 不动 last_speak
+                }
+            }
+        } catch (Throwable t) {
+            anyFail = true;
+            try { _l3Log("l3 flush db upsert fail: " + t); } catch (Throwable t2) {}
+        }
+        if (anyFail) {
+            L3_flushFailStreak++;
+            l3MaybeDegradeOnFail();   // T4 触发器(2): 连续失败到顶 → 降级
+        } else {
+            L3_flushFailStreak = 0;
+            l3MaybeRecover();         // T4 恢复: 成功一轮 + 缓冲已排空到低水位 → 解除降级
+        }
+    }
+}
+
+// ========== T4 降级触发/恢复 (仅 FLUSH_LOCK 内 l3Flush 调用; 非热路径) (线上 @503-522) ==========
+// 触发器(2): flush 连续失败到阈值 → 进入降级。读 dirtyCount 时短取 L3_LOCK 保一致 (锁序 FLUSH_LOCK 外, L3_LOCK 内, 不破坏现有序)。
+void l3MaybeDegradeOnFail() {
+    if (L3_DEGRADED) return;
+    if (L3_flushFailStreak >= L3_FAIL_CAP) {
+        long dc; synchronized (L3_LOCK) { dc = L3_dirtyCount; }
+        L3_DEGRADED = true;
+        _l3PerfDegrade(true, "fail_streak", dc, L3_flushFailStreak);
+    }
+}
+
+// 恢复: flush 成功一轮 (streak 已归零) 且换出后缓冲已排空到低水位 (< CAP/2) → 解除降级, recordSpeak 恢复采集。
+void l3MaybeRecover() {
+    if (!L3_DEGRADED) return;
+    long dc; synchronized (L3_LOCK) { dc = L3_dirtyCount; }
+    if (L3_flushFailStreak == 0 && dc < (L3_BUFFER_CAP / 2)) {
+        L3_DEGRADED = false;
+        _l3PerfDegrade(false, null, dc, L3_flushFailStreak);
+    }
+}

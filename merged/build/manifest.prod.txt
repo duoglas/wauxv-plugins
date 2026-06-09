@@ -6,6 +6,11 @@ src/core/storage_android.bsh
 src/core/host_android.bsh
 src/core/clock_android.bsh
 src/domain/speak_store.bsh
+src/domain/freeloader.bsh
 src/domain/speak.bsh
 src/domain/membership.bsh
 src/domain/warning.bsh
+src/app/speak_buffer.bsh
+src/app/commands.bsh
+src/app/dialogs.bsh
+src/app/hooks.bsh

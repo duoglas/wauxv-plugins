@@ -1,0 +1,980 @@
+// ============================================================
+// app/dialogs — GroupAdmin 设置对话框 UI (onClick handler + AlertDialog 构建)。
+// 线上 plugins/group-admin/main.java 的设置 GUI 逐字保真抽出:
+//   @2935-3797 触发/UI helper/主 Dialog + 管理员/群主/黑名单/保护/警告/潜水控制 子 Dialog
+//   @3952-4022 白名单子 Dialog
+// (中间 @3799-3951 是文本命令 dispatcher doWhitelist/doStrictMode 等, 非对话框 UI, 不在本片范围。)
+//
+// 端口/适配器:
+//   设置项的配置键读写一律走 HostPort(全局 HOST): HOST.getString/HOST.putString,
+//   不直接调 WAuxiliary 注入的 getString/putString 内置(对齐 host_android.bsh 契约缝)。
+//   名片/登录账号查询同走 HOST.lookupName / HOST.getLoginWxid (HostPort 契约方法)。
+//   本片直接读写的配置键(键名/默认值/钳制范围逐字保真):
+//     default_inactive_days  读 def "7" / 写(setDefaultInactiveDays 钳制 1~365)
+//     bl_<group>             读 def ""   (黑名单 CSV)
+//     wl_<group>             读 def "" / 写(警告名单 CSV)
+//     super_owners           写(全局群主 CSV)
+//     protected_<group>      写(保护名单 CSV)
+//     bp_<group>             写 "unknown" (重置 bot 权限缓存)
+//   其余配置(管理员/警告上限 wk_/白名单/时效等)经领域函数(getAdmins/setWarnKick/
+//   getWarnList/getWhitelist…)间接读写 — 那些函数属 domain 层, 本片不重复抽取, 仅引用。
+//
+// 保真红线(违反即失败):
+//   - 所有设置项配置键名 + 读写默认值 + 钳制范围与线上逐字一致 (键名错则线上行为变)。
+//   - 不增删设置项、不改 UI 语义 (YAGNI + 保真); 触发词/文案/颜色/布局结构原样保留。
+//
+// 解析门(check.sh 第 2 步, 去 final 全文 bsh-2.0b6 解析)说明:
+//   本片大量引用 android.* / Activity / AlertDialog 类型与匿名内部类 OnClickListener,
+//   但解析门只做语法解析、不加载/不解析 android 类型, 故只要语法合法即 EXIT=0。
+//   实测: 原始块 (去 final 后) bsh-2.0b6 解析 EXIT=0, 无需任何语法等价改写,
+//   匿名内部类写法被 bsh-2.0b6 接受。本片相对线上仅做了"配置读写改走 HOST 端口"
+//   这一处语义等价替换(键名/默认值不变), 未改任何控制流/UI 结构。
+//
+// 依赖(本期不在本片定义, 由装配体其余模块/P2 接线提供, 解析门不要求其存在):
+//   UI 颜色/圆角 helper _gaC/_gaRound (线上 @2009-2015, 属 UI 基建, 留 app/hooks 或后续片);
+//   宿主交互 toast/getTopActivity/getTargetTalker/_logNativeRoleProbe;
+//   领域函数 isGroupEnabled/getAdmins/setAdmins/getOwners/getProtected/getWhitelist/
+//     setWhitelist/getWarn/setWarn/getWarnList/getWarnKick/setWarnKick/doUnban/
+//     botPrivState/disableGroup/enableGroupWithBaseline/adminExpiryLabel/setAdminExpiry/
+//     clearAdminExpiry/purgeExpiredAdmins/_isPosIntTok/parseCsv/joinCsv;
+//   L3 落库缝 l3Flush/l3CountFirstSeen/l3ClearFirstSeen/initFirstSeenBaseline;
+//   常量 WARN_AUTO_KICK。接线属 app/hooks, 本片只承载 UI 与设置项读写语义。
+// ============================================================
+int getDefaultInactiveDays() {
+    try { return Integer.parseInt(HOST.getString("default_inactive_days", "7")); }
+    catch (Exception e) { return 7; }
+}
+
+void setDefaultInactiveDays(int n) {
+    if (n < 1) n = 1; if (n > 365) n = 365;
+    HOST.putString("default_inactive_days", String.valueOf(n));
+}
+
+int rebuildBaselineForce(String groupId) {
+    // T2′: 清空该群 first_seen (UPDATE SET first_seen=NULL, 保留 last_speak 行) → 再按当前成员重建。
+    // l3ClearFirstSeen 与 l3UpsertFirstSeen 各自持 FLUSH_LOCK, 与后台 flush 互斥; 二者之间若有后台 flush
+    // 插入, 至多补回个别 first_seen=该消息ts (取 min), 不影响"按当前成员重建为 now"的语义 (新 now 必更晚, min 留旧)。
+    l3ClearFirstSeen(groupId);
+    return initFirstSeenBaseline(groupId);
+}
+
+// ---- onClickSendBtn: bot 输入框触发 ----
+boolean onClickSendBtn(String text) {
+    if (text == null) return false;
+    // v1.12: 加 `群管` / `#群管` 两个短触发词
+    if (text.equals("群管") || text.equals("#群管") ||
+        text.equals("群管设置") || text.equals("群管配置") ||
+        text.equals("#群管设置") || text.equals("#群管配置")) {
+        String talker = getTargetTalker();
+        if (talker == null || !talker.contains("@chatroom")) {
+            toast("此命令需在群聊中使用");
+            return true;
+        }
+        _logNativeRoleProbe(talker);
+        showGroupConfigDialog(talker);
+        return true;
+    }
+    return false;
+}
+
+// ---- 通用 UI helper ----
+android.widget.Button _gaBtn(Activity ctx, String text, String fillColor) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.Button b = new android.widget.Button(ctx);
+    b.setText(text);
+    b.setTextColor(_gaC("#E8E9EC"));
+    b.setBackground(_gaRound(fillColor, 24));
+    b.setAllCaps(false);
+    b.setTextSize(14);
+    b.setPadding(20 * dp, 12 * dp, 20 * dp, 12 * dp);
+    android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+    b.setLayoutParams(lp);
+    return b;
+}
+
+android.widget.LinearLayout _gaRow(Activity ctx, String name, String sub, String actText, String actFill) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+    row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+    row.setPadding(12 * dp, 10 * dp, 10 * dp, 10 * dp);
+    row.setBackground(_gaRound("#1A1D24", 12));
+    row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+
+    android.widget.LinearLayout left = new android.widget.LinearLayout(ctx);
+    left.setOrientation(android.widget.LinearLayout.VERTICAL);
+    left.setLayoutParams(new android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+    android.widget.TextView tvName = new android.widget.TextView(ctx);
+    tvName.setText(name);
+    tvName.setTextColor(_gaC("#E8E9EC"));
+    tvName.setTextSize(14);
+    left.addView(tvName);
+
+    if (sub != null && !sub.isEmpty()) {
+        android.widget.TextView tvSub = new android.widget.TextView(ctx);
+        tvSub.setText(sub);
+        tvSub.setTextColor(_gaC("#7C828E"));
+        tvSub.setTextSize(11);
+        left.addView(tvSub);
+    }
+    row.addView(left);
+
+    android.widget.Button act = new android.widget.Button(ctx);
+    act.setText(actText);
+    act.setTextColor(_gaC("#0F1115"));
+    act.setBackground(_gaRound(actFill, 16));
+    act.setAllCaps(false);
+    act.setTextSize(12);
+    act.setPadding(14 * dp, 6 * dp, 14 * dp, 6 * dp);
+    row.addView(act);
+    return row;
+}
+
+void _gaSpacer(android.widget.LinearLayout root, Activity ctx, int h) {
+    android.view.View v = new android.view.View(ctx);
+    v.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, h));
+    root.addView(v);
+}
+
+// ---- 主 Dialog ----
+void showGroupConfigDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+
+    boolean enabled = isGroupEnabled(groupId);
+    String botPriv = botPrivState(groupId);
+    int adminCount = getAdmins(groupId).size();
+    int banCount = parseCsv(HOST.getString("bl_" + groupId, "")).size();
+    int wlCount = parseCsv(HOST.getString("wl_" + groupId, "")).size();
+    int pCount = getProtected(groupId).size();
+    // T2′ (Reviewer B): flush-before-read — first_seen 可能仍在内存脏增量未落盘,
+    // 启用群后 30s 内直接查 DB 会误显「基线未建立」诱导误重建。读前先 flush 提交进 DB。
+    try { l3Flush(); } catch (Throwable t) {}
+    boolean baselineExists = l3CountFirstSeen(groupId) > 0;
+    int defDays = getDefaultInactiveDays();
+
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("⚙️ 本群 GroupAdmin 配置");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(18);
+    title.setPadding(0, 0, 0, 4 * dp);
+    root.addView(title);
+
+    android.widget.TextView gIdView = new android.widget.TextView(ctx);
+    gIdView.setText(groupId);
+    gIdView.setTextColor(_gaC("#7C828E"));
+    gIdView.setTextSize(11);
+    gIdView.setPadding(0, 0, 0, 12 * dp);
+    root.addView(gIdView);
+
+    // 状态 card
+    android.widget.LinearLayout statusCard = new android.widget.LinearLayout(ctx);
+    statusCard.setOrientation(android.widget.LinearLayout.VERTICAL);
+    statusCard.setPadding(12 * dp, 12 * dp, 12 * dp, 12 * dp);
+    statusCard.setBackground(_gaRound("#1A1D24", 12));
+
+    StringBuilder st = new StringBuilder();
+    st.append("启用状态: ").append(enabled ? "✅ 已启用" : "🔴 未启用").append("\n");
+    st.append("bot 权限: ");
+    if (botPriv.equals("admin")) st.append("✅ 群管理员");
+    else if (botPriv.equals("none")) st.append("❌ 非管理员 (踢人会失败)");
+    else st.append("❓ 未检测 (踢一次会自动检测)");
+    st.append("\n");
+    st.append("潜水基线: ").append(baselineExists ? "✅ 已建立" : "🔴 未建立").append("\n");
+    st.append("默认潜水天数: ").append(defDays).append(" 天\n");
+    st.append("警告自动踢上限: ").append(getWarnKick(groupId)).append(" 次\n");
+    st.append("本群管理员: ").append(adminCount).append(" 人\n");
+    st.append("全局群主: ").append(getOwners().size()).append(" 人\n");
+    st.append("黑 ").append(banCount).append("  ·  警告 ").append(wlCount).append("  ·  保护 ").append(pCount);
+
+    android.widget.TextView statusText = new android.widget.TextView(ctx);
+    statusText.setText(st.toString());
+    statusText.setTextColor(_gaC("#E8E9EC"));
+    statusText.setTextSize(13);
+    statusText.setLineSpacing(0, 1.4f);
+    statusCard.addView(statusText);
+    root.addView(statusCard);
+
+    _gaSpacer(root, ctx, 12 * dp);
+
+    final String fGroupId = groupId;
+    final boolean fEnabled = enabled;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    android.widget.Button toggleBtn = _gaBtn(ctx, enabled ? "🔕 禁用本群群管" : "✅ 启用本群群管", enabled ? "#FF6B6B" : "#5CB6FF");
+    toggleBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (fEnabled) {
+                disableGroup(fGroupId);
+                toast("已禁用本群群管");
+            } else {
+                int n = enableGroupWithBaseline(fGroupId);
+                toast("已启用 (基线 " + n + " 人)");
+            }
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(toggleBtn);
+
+    _gaSpacer(root, ctx, 8 * dp);
+
+    android.widget.Button adminBtn = _gaBtn(ctx, "🛡 本群管理员 (" + adminCount + ")", "#252934");
+    adminBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showAdminListDialog(fGroupId);
+        }
+    });
+    root.addView(adminBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button ownerBtn = _gaBtn(ctx, "👑 全局群主 (" + getOwners().size() + ")", "#252934");
+    ownerBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showOwnerListDialog(fGroupId);
+        }
+    });
+    root.addView(ownerBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button banBtn = _gaBtn(ctx, "🦶 黑名单 (" + banCount + ")", "#252934");
+    banBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showBanListDialog(fGroupId);
+        }
+    });
+    root.addView(banBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button protBtn = _gaBtn(ctx, "🛡 保护名单 (" + pCount + ")", "#252934");
+    protBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showProtectedListDialog(fGroupId);
+        }
+    });
+    root.addView(protBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    // v1.12: 白名单按钮
+    int wtCount = getWhitelist(groupId).size();
+    android.widget.Button wtBtn = _gaBtn(ctx, "✅ 白名单 (" + wtCount + ")", "#252934");
+    wtBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showWhitelistDialog(fGroupId);
+        }
+    });
+    root.addView(wtBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button warnBtn = _gaBtn(ctx, "⚠️ 警告名单 (" + wlCount + ")", "#252934");
+    warnBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showWarnedListDialog(fGroupId);
+        }
+    });
+    root.addView(warnBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    // W1: 本群警告自动踢上限 数字输入控件 (仿默认潜水天数控件) → 写 wk_<group>
+    android.widget.TextView wkLabel = new android.widget.TextView(ctx);
+    wkLabel.setText("⚠️ 警告自动踢上限 (1~99, 默认 " + WARN_AUTO_KICK + ")");
+    wkLabel.setTextColor(_gaC("#E8E9EC"));
+    wkLabel.setTextSize(13);
+    wkLabel.setPadding(0, 0, 0, 6 * dp);
+    root.addView(wkLabel);
+
+    final android.widget.EditText wkInp = new android.widget.EditText(ctx);
+    wkInp.setText(String.valueOf(getWarnKick(groupId)));
+    wkInp.setTextColor(_gaC("#E8E9EC"));
+    wkInp.setHintTextColor(_gaC("#7C828E"));
+    wkInp.setBackground(_gaRound("#252934", 12));
+    wkInp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    wkInp.setTextSize(14);
+    wkInp.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+    wkInp.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+    root.addView(wkInp);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    final String fWkGroupId = groupId;
+    android.widget.Button wkSaveBtn = _gaBtn(ctx, "💾 保存警告上限", "#5CB6FF");
+    wkSaveBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            try {
+                int n = Integer.parseInt(wkInp.getText().toString().trim());
+                int actual = setWarnKick(fWkGroupId, n);   // 夹取 1~99
+                wkInp.setText(String.valueOf(actual));
+                toast(actual != n ? ("已保存: " + actual + " (已夹取到 1~99)") : ("已保存: " + actual + " 次自动踢"));
+            } catch (Exception e) { toast("请输入有效数字 (1~99)"); }
+        }
+    });
+    root.addView(wkSaveBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button inactBtn = _gaBtn(ctx, "💤 潜水/权限 控制", "#252934");
+    inactBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showInactiveControlDialog(fGroupId);
+        }
+    });
+    root.addView(inactBtn);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+
+    dh[0] = new AlertDialog.Builder(ctx)
+        .setView(sv)
+        .setNegativeButton("关闭", null)
+        .create();
+    dh[0].show();
+}
+
+android.widget.LinearLayout _adminRow(Activity ctx, String groupId, String wxid, AlertDialog[] dh) {
+    final String fGroupId = groupId;
+    final String fWxid = wxid;
+    final AlertDialog[] fDh = dh;
+    // v1.17.0: 副标题显示 失效日期/永久 (替代原来只显示 wxid; wxid 仍拼在前)
+    String sub = fWxid + " · " + adminExpiryLabel(fGroupId, fWxid);
+    android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(fWxid, fGroupId), sub, "移除", "#FF6B6B");
+    android.view.View act = row.getChildAt(1);
+    act.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            List l = getAdmins(fGroupId);
+            l.remove(fWxid);
+            setAdmins(fGroupId, l);
+            clearAdminExpiry(fGroupId, fWxid);   // v1.17.0: 清理残留时效
+            toast("已移除本群管理员");
+            if (fDh[0] != null) fDh[0].dismiss();
+            showAdminListDialog(fGroupId);
+        }
+    });
+    return row;
+}
+
+android.widget.LinearLayout _ownerRow(Activity ctx, String returnGroupId, String wxid, AlertDialog[] dh) {
+    final String fReturnGroupId = returnGroupId;
+    final String fWxid = wxid;
+    final AlertDialog[] fDh = dh;
+    android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(fWxid, fReturnGroupId), fWxid, "移除", "#FF6B6B");
+    android.view.View act = row.getChildAt(1);
+    act.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            List l = getOwners();
+            l.remove(fWxid);
+            HOST.putString("super_owners", joinCsv(l));
+            toast("已移除全局群主");
+            if (fDh[0] != null) fDh[0].dismiss();
+            showOwnerListDialog(fReturnGroupId);
+        }
+    });
+    return row;
+}
+
+// ---- 本群管理员子 Dialog ----
+void showAdminListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    try { purgeExpiredAdmins(groupId); } catch (Throwable t) {}   // v1.17.0 惰性到期清除 (Dialog 路径, 低频)
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List admins = getAdmins(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("🛡 本群管理员 (" + admins.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 6 * dp);
+    root.addView(title);
+
+    android.widget.TextView hint = new android.widget.TextView(ctx);
+    hint.setText("管理员权限仅对本群生效；群主请到全局群主管理里维护。");
+    hint.setTextColor(_gaC("#7C828E"));
+    hint.setTextSize(11);
+    hint.setPadding(0, 0, 0, 12 * dp);
+    root.addView(hint);
+
+    final android.widget.EditText inp = new android.widget.EditText(ctx);
+    inp.setHint("输入 wxid_... 后添加为本群管理员");
+    inp.setTextColor(_gaC("#E8E9EC"));
+    inp.setHintTextColor(_gaC("#7C828E"));
+    inp.setBackground(_gaRound("#252934", 12));
+    inp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    inp.setTextSize(14);
+    root.addView(inp);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    // v1.17.0: 天数输入 (空=永久)
+    final android.widget.EditText dayInp = new android.widget.EditText(ctx);
+    dayInp.setHint("天数(空=永久)");
+    dayInp.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+    dayInp.setTextColor(_gaC("#E8E9EC"));
+    dayInp.setHintTextColor(_gaC("#7C828E"));
+    dayInp.setBackground(_gaRound("#252934", 12));
+    dayInp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    dayInp.setTextSize(14);
+    root.addView(dayInp);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button addBtn = _gaBtn(ctx, "➕ 添加本群管理员", "#5CB6FF");
+    addBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            String w = inp.getText().toString().trim();
+            if (w.isEmpty()) { toast("请输入 wxid"); return; }
+            // v1.17.0: 解析天数 (空/非正整数 = 永久), Dialog 路径保持静默 (只 toast, 不发群)
+            int days = 0;
+            try {
+                String ds = dayInp.getText().toString().trim();
+                if (!ds.isEmpty() && _isPosIntTok(ds)) { int n = Integer.parseInt(ds); if (n > 0) days = n; }
+            } catch (Throwable t) { days = 0; }
+            List l = getAdmins(fGroupId);
+            if (!l.contains(w)) { l.add(w); setAdmins(fGroupId, l); }
+            if (days > 0) setAdminExpiry(fGroupId, w, System.currentTimeMillis() + (long) days * 86400000L);
+            else clearAdminExpiry(fGroupId, w);
+            toast(days > 0 ? ("已添加本群管理员 (" + days + "天)") : "已添加本群管理员 (永久)");
+            if (dh[0] != null) dh[0].dismiss();
+            showAdminListDialog(fGroupId);
+        }
+    });
+    root.addView(addBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    if (admins.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群暂无管理员");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < admins.size(); i++) {
+            root.addView(_adminRow(ctx, fGroupId, (String) admins.get(i), dh));
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 全局群主子 Dialog ----
+void showOwnerListDialog(String returnGroupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fReturnGroupId = returnGroupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List owners = getOwners();
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("👑 全局群主 (" + owners.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 6 * dp);
+    root.addView(title);
+
+    android.widget.TextView hint = new android.widget.TextView(ctx);
+    hint.setText("全局群主可管理所有启用群；机器人账号默认永远是群主，不在此列表中。");
+    hint.setTextColor(_gaC("#7C828E"));
+    hint.setTextSize(11);
+    hint.setPadding(0, 0, 0, 12 * dp);
+    root.addView(hint);
+
+    final android.widget.EditText inp = new android.widget.EditText(ctx);
+    inp.setHint("输入 wxid_... 后添加为全局群主");
+    inp.setTextColor(_gaC("#E8E9EC"));
+    inp.setHintTextColor(_gaC("#7C828E"));
+    inp.setBackground(_gaRound("#252934", 12));
+    inp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    inp.setTextSize(14);
+    root.addView(inp);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button addBtn = _gaBtn(ctx, "➕ 添加全局群主", "#5CB6FF");
+    addBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            String w = inp.getText().toString().trim();
+            if (w.isEmpty()) { toast("请输入 wxid"); return; }
+            if (w.equals(HOST.getLoginWxid())) { toast("机器人账号默认已经是群主"); return; }
+            List l = getOwners();
+            if (!l.contains(w)) { l.add(w); HOST.putString("super_owners", joinCsv(l)); }
+            toast("已添加全局群主");
+            if (dh[0] != null) dh[0].dismiss();
+            showOwnerListDialog(fReturnGroupId);
+        }
+    });
+    root.addView(addBtn);
+    _gaSpacer(root, ctx, 12 * dp);
+
+    if (owners.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("暂无额外全局群主");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < owners.size(); i++) {
+            root.addView(_ownerRow(ctx, fReturnGroupId, (String) owners.get(i), dh));
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fReturnGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 黑名单子 Dialog ----
+void showBanListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List bl = parseCsv(HOST.getString("bl_" + groupId, ""));
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("🦶 黑名单 (" + bl.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    if (bl.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无黑名单");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < bl.size(); i++) {
+            final String wxid = (String) bl.get(i);
+            android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(wxid, fGroupId), wxid, "解黑", "#FF6B6B");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    doUnban(fGroupId, wxid);
+                    toast("已解黑");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showBanListDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 保护名单子 Dialog ----
+void showProtectedListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List pl = getProtected(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("🛡 保护名单 (" + pl.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    if (pl.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无保护名单");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < pl.size(); i++) {
+            final String wxid = (String) pl.get(i);
+            android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(wxid, fGroupId), wxid, "取消保护", "#FFD166");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    List p = getProtected(fGroupId);
+                    p.remove(wxid);
+                    HOST.putString("protected_" + fGroupId, joinCsv(p));
+                    toast("已取消保护");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showProtectedListDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 警告名单子 Dialog ----
+void showWarnedListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List wl = getWarnList(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("⚠️ 警告名单 (" + wl.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    if (wl.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无警告记录");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < wl.size(); i++) {
+            final String wxid = (String) wl.get(i);
+            int n = getWarn(groupId, wxid);
+            android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(wxid, fGroupId), "警告 " + n + "/" + getWarnKick(fGroupId), "清零", "#FFD166");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    setWarn(fGroupId, wxid, 0);
+                    List l = getWarnList(fGroupId);
+                    l.remove(wxid);
+                    HOST.putString("wl_" + fGroupId, joinCsv(l));
+                    toast("已清零");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showWarnedListDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ---- 潜水/权限 控制 子 Dialog ----
+void showInactiveControlDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    String botPriv = botPrivState(groupId);
+    // T2′ (Reviewer B): flush-before-read — 同上, 避免 30s 窗口内误显「基线未建立」。
+    try { l3Flush(); } catch (Throwable t) {}
+    boolean baselineExists = l3CountFirstSeen(groupId) > 0;
+    int defDays = getDefaultInactiveDays();
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("💤 潜水 / bot 权限 控制");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    // bot 权限段
+    String pTxt;
+    if (botPriv.equals("admin")) pTxt = "bot 权限: ✅ 群管理员";
+    else if (botPriv.equals("none")) pTxt = "bot 权限: ❌ 非管理员 (踢人会失败)";
+    else pTxt = "bot 权限: ❓ 未检测";
+    android.widget.TextView pv = new android.widget.TextView(ctx);
+    pv.setText(pTxt);
+    pv.setTextColor(_gaC("#E8E9EC"));
+    pv.setTextSize(13);
+    pv.setPadding(0, 0, 0, 6 * dp);
+    root.addView(pv);
+
+    android.widget.Button resetPrivBtn = _gaBtn(ctx, "🔄 重置 bot 权限缓存", "#252934");
+    resetPrivBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            HOST.putString("bp_" + fGroupId, "unknown");
+            toast("已重置, 下次踢人重新检测");
+            if (dh[0] != null) dh[0].dismiss();
+            showInactiveControlDialog(fGroupId);
+        }
+    });
+    root.addView(resetPrivBtn);
+
+    _gaSpacer(root, ctx, 16 * dp);
+
+    // 潜水基线段
+    android.widget.TextView bv = new android.widget.TextView(ctx);
+    bv.setText("潜水基线: " + (baselineExists ? "✅ 已建立" : "🔴 未建立"));
+    bv.setTextColor(_gaC("#E8E9EC"));
+    bv.setTextSize(13);
+    bv.setPadding(0, 0, 0, 6 * dp);
+    root.addView(bv);
+
+    android.widget.Button rebuildBtn = _gaBtn(ctx, "🔁 强制重建潜水基线 (覆盖现有)", "#FFD166");
+    rebuildBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            int n = rebuildBaselineForce(fGroupId);
+            toast("重建完成: " + n + " 人");
+            if (dh[0] != null) dh[0].dismiss();
+            showInactiveControlDialog(fGroupId);
+        }
+    });
+    root.addView(rebuildBtn);
+
+    _gaSpacer(root, ctx, 16 * dp);
+
+    // 默认天数段
+    android.widget.TextView dv = new android.widget.TextView(ctx);
+    dv.setText("默认潜水天数 (当前 " + defDays + ", v1.11 仅记录, 命令仍需 #潜水 N)");
+    dv.setTextColor(_gaC("#E8E9EC"));
+    dv.setTextSize(13);
+    dv.setPadding(0, 0, 0, 6 * dp);
+    root.addView(dv);
+
+    final android.widget.EditText inp = new android.widget.EditText(ctx);
+    inp.setText(String.valueOf(defDays));
+    inp.setTextColor(_gaC("#E8E9EC"));
+    inp.setHintTextColor(_gaC("#7C828E"));
+    inp.setBackground(_gaRound("#252934", 12));
+    inp.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    inp.setTextSize(14);
+    inp.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+    inp.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+    root.addView(inp);
+
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button saveBtn = _gaBtn(ctx, "💾 保存默认天数", "#5CB6FF");
+    saveBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            try {
+                int n = Integer.parseInt(inp.getText().toString().trim());
+                setDefaultInactiveDays(n);
+                toast("已保存: " + n + " 天");
+            } catch (Exception e) { toast("请输入有效数字"); }
+        }
+    });
+    root.addView(saveBtn);
+
+    _gaSpacer(root, ctx, 16 * dp);
+
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
+// ============================================================
+// ==== v1.12: 白名单 GUI 子 Dialog (线上 @3952-4022 逐字) ====
+// ============================================================
+void showWhitelistDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    List wt = getWhitelist(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("✅ 白名单 (" + wt.size() + " 人)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(16);
+    title.setPadding(0, 0, 0, 6 * dp);
+    root.addView(title);
+
+    android.widget.TextView hint = new android.widget.TextView(ctx);
+    hint.setText("白名单成员免警告 + 免进群黑名单检测");
+    hint.setTextColor(_gaC("#7C828E"));
+    hint.setTextSize(11);
+    hint.setPadding(0, 0, 0, 12 * dp);
+    root.addView(hint);
+
+    if (wt.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("本群无白名单");
+        empty.setTextColor(_gaC("#7C828E"));
+        empty.setTextSize(13);
+        empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < wt.size(); i++) {
+            final String wxid = (String) wt.get(i);
+            android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(wxid, fGroupId), wxid, "移除", "#7C828E");
+            android.view.View act = row.getChildAt(1);
+            act.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    List l = getWhitelist(fGroupId);
+                    l.remove(wxid);
+                    setWhitelist(fGroupId, l);
+                    toast("已移除");
+                    if (dh[0] != null) dh[0].dismiss();
+                    showWhitelistDialog(fGroupId);
+                }
+            });
+            root.addView(row);
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    _gaSpacer(root, ctx, 8 * dp);
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fGroupId);
+        }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}

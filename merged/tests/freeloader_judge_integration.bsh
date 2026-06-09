@@ -1,0 +1,174 @@
+// L2 集成：speakSnapshotAll + freeloaderJudge，sqlite-jdbc 真库。
+// 核心理解：快照 = speak 表在 T_snap=P+G 的冻结态。所以造数据时：
+//   "红包后 G 内发言" → 插一行 last_speak=P+Xs(X<=G/算在快照前)；
+//   "抢后 >G 洗白发言" → 不插那行(因为快照拍在它之前，表里还没有它)。
+// 逐条覆盖设计 §5.2 能本地测的条目(#1~#26)。
+// 权威: docs/superpowers/specs/2026-06-09-红包伸手党-合并后判定重设计.md §3/§4.1/§5.2。
+import java.sql.*;
+source("tests/_harness.bsh");
+source("src/domain/speak_store.bsh");
+source("src/domain/freeloader.bsh");
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(SPEAK_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+long P  = 1749470000000L;        // packetMs
+long N  = 30L * 60L * 1000L;     // 窗口 30min(ms)
+long EX = 86400000L;             // EXEMPT 1 天
+long G  = FREELOADER_GRACE_AFTER_MS;  // 3s
+String GRP = "g1";
+
+// 直接造"快照那一刻表里的行"：last_speak / first_seen 任意(可 null)。
+void putRow(String grp, String wxid, Long ls, Long fs) {
+    PreparedStatement ps = conn.prepareStatement(
+        "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,?,?)");
+    ps.setString(1, grp); ps.setString(2, wxid);
+    if (ls == null) ps.setObject(3, null); else ps.setLong(3, ls.longValue());
+    if (fs == null) ps.setObject(4, null); else ps.setLong(4, fs.longValue());
+    ps.executeUpdate(); ps.close();
+}
+Long L(long v) { return new Long(v); }
+
+Long oldFs = L(P - 10L * EX);            // 非新人(很旧 first_seen)
+Long newFs = L(P - 2L * 3600000L);       // 新人(P-2h, 在 EXEMPT 内)
+
+// ---- 造每条用例对应的"快照表状态" ----
+// #1 红包前 1s 发言 → 活跃
+putRow(GRP, "w1_before1s", L(P - 1000L), oldFs);
+// #2 红包后 1s 发言(<G) → 活跃(快照含此发言)
+putRow(GRP, "w2_after1s", L(P + 1000L), oldFs);
+// #2b 红包前1s + 红包后2s 都发言 → 快照 last_speak=P+2s → 活跃
+putRow(GRP, "w2b_after2s", L(P + 2000L), oldFs);
+// #3 红包同时发言 → 活跃
+putRow(GRP, "w3_same", L(P), oldFs);
+// #4 窗口内(前10min) → 活跃
+putRow(GRP, "w4_in10m", L(P - 10L * 60000L), oldFs);
+// #5 窗口边界(前30min整) → 活跃(含边界)
+putRow(GRP, "w5_edge30m", L(P - N), oldFs);
+// #6 略超窗口(前30min+1s) → 伸手党
+putRow(GRP, "w6_over", L(P - N - 1000L), oldFs);
+// #7 窗口内沉默 + 抢后很久(>G)洗白 → 快照不含洗白发言, ls 旧 → 伸手党
+//    "抢后 >G 发言"发生在 T_snap 之后 → 不插那行；表里只有旧 ls。
+putRow(GRP, "w7_lateWash", L(P - N - 5000L), oldFs);
+// #8 从未发言 + 非新人 → 伸手党(有行, ls=NULL, fs 旧)
+putRow(GRP, "w8_neverOld", null, oldFs);
+// #8b 从未发言 + 新人 → 豁免(有行, ls=NULL, fs 新)
+putRow(GRP, "w8b_neverNew", null, newFs);
+// #8c 发过言但超窗 + 新人 → 豁免(新人维度独立于发言)
+putRow(GRP, "w8c_oldSpeakNew", L(P - 40L * 60000L), newFs);
+// #8d last_speak IS NULL(有行无发言) + 非新人 → 伸手党(走 first_seen 维度, 非 SKIP)
+putRow(GRP, "w8d_nullLsOld", null, oldFs);
+// #9 窗口内发言(P-5min) + 抢后很久又发(>G, 快照前没发生) → 快照 ls=P-5min → 活跃
+putRow(GRP, "w9_inThenLate", L(P - 5L * 60000L), oldFs);
+// #10 后宽限边界发言(ls=P+G 整) → 活跃
+putRow(GRP, "w10_graceEdge", L(P + G), oldFs);
+// #11 刚过后宽限发言(仅 P+G+1s)：快照拍在 P+G → 不含此发言 → 表里只剩旧值 → 伸手党
+putRow(GRP, "w11_pastGrace", L(P - N - 2000L), oldFs);
+// #13 窗口内只发过命令消息(GA 命令早退不记 ls)→ ls 停在更早(< thr) → 伸手党(暴露 GA 漏记)
+putRow(GRP, "w13_cmdOnly", L(P - N - 10000L), oldFs);
+// #19 多条窗口内发言, 快照取最晚(P-2min) → 活跃
+putRow(GRP, "w19_multi", L(P - 2L * 60000L), oldFs);
+// #14 排除名单成员(放表里也无所谓, 走 excludeSet) → excluded
+putRow(GRP, "w14_excluded", null, oldFs);
+// #12 flush 间隙：前1s发言"已 flush 进快照表" → ls=P-1s → 活跃(病根已修, 端口取值无延迟)
+putRow(GRP, "w12_flushed", L(P - 1000L), oldFs);
+// #22 快照无此领取者 → 不 putRow，receivers 里有 w22_norow → 该人 SKIP
+
+// ---- 取整群快照(模拟 T_snap 冻结) ----
+java.util.Map snap = speakSnapshotAll(GRP);
+
+// 单人判定断言便捷：用单人列表跑 judge，取 verdict。
+int verdictOf(java.util.Map snapshot, String w, long packetMs) {
+    java.util.List rs = new java.util.ArrayList();
+    rs.add(w);
+    Object res = freeloaderJudge(snapshot, rs, packetMs, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN);
+    java.util.Map verdicts = (java.util.Map) ((java.util.Map) res).get("verdicts");
+    return ((Integer) verdicts.get(w)).intValue();
+}
+
+check("#1  红包前1s发言 → ACTIVE",  verdictOf(snap, "w1_before1s", P) == FL_ACTIVE);
+check("#2  红包后1s发言(<G) → ACTIVE", verdictOf(snap, "w2_after1s", P) == FL_ACTIVE);
+check("#2b 前1s+后2s发言 → ACTIVE", verdictOf(snap, "w2b_after2s", P) == FL_ACTIVE);
+check("#3  红包同时发言 → ACTIVE",  verdictOf(snap, "w3_same", P) == FL_ACTIVE);
+check("#4  窗口内前10min → ACTIVE", verdictOf(snap, "w4_in10m", P) == FL_ACTIVE);
+check("#5  窗口边界前30min整 → ACTIVE(含边界)", verdictOf(snap, "w5_edge30m", P) == FL_ACTIVE);
+check("#6  略超窗口 → WARN",        verdictOf(snap, "w6_over", P) == FL_WARN);
+check("#7  窗口内沉默+抢后>G洗白 → WARN(洗白被挡)", verdictOf(snap, "w7_lateWash", P) == FL_WARN);
+check("#8  从未发言+非新人 → WARN",  verdictOf(snap, "w8_neverOld", P) == FL_WARN);
+check("#8b 从未发言+新人 → EXEMPT_NEW(豁免)", verdictOf(snap, "w8b_neverNew", P) == FL_EXEMPT_NEW);
+check("#8c 发过言超窗+新人 → EXEMPT_NEW(豁免)", verdictOf(snap, "w8c_oldSpeakNew", P) == FL_EXEMPT_NEW);
+check("#8d last_speak IS NULL+非新人 → WARN(走 first_seen, 非 SKIP)", verdictOf(snap, "w8d_nullLsOld", P) == FL_WARN);
+check("#9  窗口内发言+抢后又发(快照前没发生) → ACTIVE", verdictOf(snap, "w9_inThenLate", P) == FL_ACTIVE);
+check("#10 后宽限边界发言(P+G整) → ACTIVE", verdictOf(snap, "w10_graceEdge", P) == FL_ACTIVE);
+check("#11 刚过后宽限发言 → WARN",  verdictOf(snap, "w11_pastGrace", P) == FL_WARN);
+check("#12 flush间隙前1s发言已落表 → ACTIVE(病根已修)", verdictOf(snap, "w12_flushed", P) == FL_ACTIVE);
+check("#13 窗口内只发命令消息(GA漏记) → WARN(暴露漏记)", verdictOf(snap, "w13_cmdOnly", P) == FL_WARN);
+check("#19 多条窗口内发言取最晚 → ACTIVE", verdictOf(snap, "w19_multi", P) == FL_ACTIVE);
+
+// ---- #22 ★快照无此领取者 → SKIP(skip_norow)，不当伸手党(§4.1 #2 降级锚) ----
+check("#22 快照无此领取者 → SKIP(不当伸手党)", verdictOf(snap, "w22_norow", P) == FL_SKIP);
+
+// ---- #14 排除名单 → excluded(不进判定) ----
+java.util.Set exSet = new java.util.HashSet();
+exSet.add("w14_excluded");
+java.util.List rs14 = new java.util.ArrayList();
+rs14.add("w14_excluded"); rs14.add("w6_over");
+Object r14 = freeloaderJudge(snap, rs14, P, N, EX, exSet, FREELOADER_MAX_WARN);
+java.util.Map m14 = (java.util.Map) r14;
+check("#14 排除名单 excluded 计数==1", ((Integer) m14.get("excluded")).intValue() == 1);
+check("#14 排除名单成员 judged 不含它(judged==1)", ((Integer) m14.get("judged")).intValue() == 1);
+check("#14 同批 w6_over 仍 WARN", ((java.util.List) m14.get("toWarn")).contains("w6_over"));
+
+// ---- #21 ★整包快照缺失/拍照失败 → 整批 SKIP，零警告(§4.1 #1 降级倒挂回归锚) ----
+java.util.List rsFail = new java.util.ArrayList();
+rsFail.add("w6_over"); rsFail.add("w8_neverOld");  // 这俩本会 WARN
+Object rFail = freeloaderJudge(null, rsFail, P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN);
+java.util.Map mFail = (java.util.Map) rFail;
+check("#21 snap==null → snapFail==true", ((Boolean) mFail.get("snapFail")).booleanValue());
+check("#21 snap==null → warned==0(零警告)", ((Integer) mFail.get("warned")).intValue() == 0);
+check("#21 snap==null → toWarn 空", ((java.util.List) mFail.get("toWarn")).isEmpty());
+check("#21 snap==null → skip 计入全员", ((Integer) mFail.get("skip")).intValue() == 2);
+
+// ---- #23 多包时间重叠：两包不同 jobKey/不同基准 P，各自独立判定，互不污染 ----
+// 同一人 w_overlap，快照 ls=P-40min。对包 A(基准 P): 超窗 → WARN;
+// 对包 B(基准 P-50min, 即 ls 在其窗口内) → ACTIVE。同快照、不同 packetMs 各自正确。
+putRow(GRP, "w_overlap", L(P - 40L * 60000L), oldFs);
+java.util.Map snap2 = speakSnapshotAll(GRP);
+long P_A = P;
+long P_B = P - 50L * 60000L;   // 基准更早, 使 ls=P-40min 落在 [P_B-30min, ...] 内
+// 对 B: thr_B = P_B - 30min = P-80min; ls=P-40min >= thr_B → ACTIVE
+check("#23 包A(基准P) w_overlap 超窗 → WARN", verdictOf(snap2, "w_overlap", P_A) == FL_WARN);
+check("#23 包B(基准更早) 同人同快照 → ACTIVE(各包独立)", verdictOf(snap2, "w_overlap", P_B) == FL_ACTIVE);
+
+// ---- #18 11 个伸手党 → 10 warned 进 toWarn + 1 capped ----
+java.util.List rs18 = new java.util.ArrayList();
+for (int i = 0; i < 11; i++) {
+    String w = "wcap_" + i;
+    putRow(GRP, w, L(P - N - 1000L), oldFs);   // 全部超窗 → WARN
+    rs18.add(w);
+}
+java.util.Map snap18 = speakSnapshotAll(GRP);
+Object r18 = freeloaderJudge(snap18, rs18, P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN);
+java.util.Map m18 = (java.util.Map) r18;
+check("#18 11伸手党: warned 计数==11", ((Integer) m18.get("warned")).intValue() == 11);
+check("#18 11伸手党: toWarn(实际发) 只 10", ((java.util.List) m18.get("toWarn")).size() == 10);
+check("#18 11伸手党: capped==1(留痕不发)", ((Integer) m18.get("capped")).intValue() == 1);
+
+// ---- 汇总计数自检(混合批) ----
+java.util.List rsMix = new java.util.ArrayList();
+rsMix.add("w1_before1s");   // ACTIVE
+rsMix.add("w6_over");       // WARN
+rsMix.add("w8b_neverNew");  // EXEMPT_NEW
+rsMix.add("w22_norow");     // SKIP
+Object rMix = freeloaderJudge(snap18, rsMix, P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN);
+java.util.Map mMix = (java.util.Map) rMix;
+check("汇总 judged==4", ((Integer) mMix.get("judged")).intValue() == 4);
+check("汇总 active==1", ((Integer) mMix.get("active")).intValue() == 1);
+check("汇总 warned==1", ((Integer) mMix.get("warned")).intValue() == 1);
+check("汇总 exemptNew==1", ((Integer) mMix.get("exemptNew")).intValue() == 1);
+check("汇总 skip==1", ((Integer) mMix.get("skip")).intValue() == 1);
+
+conn.close();
+done();

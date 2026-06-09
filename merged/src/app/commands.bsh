@@ -1,0 +1,412 @@
+// ============================================================
+// app/commands — 文本命令路由/分发 (线上 plugins/group-admin/main.java onHandleMsgBody @2107-2469 的
+//   "群消息文本 → 领域函数调用" 那段逐字保真抽出)。
+//
+// 本片 = 路由器 (router)。职责: 解析群消息文本 → 命中命令 token → 解析参数 → 分派到领域函数/动作。
+//   命令前缀字符串、参数解析(@取 wxid / 数字边界 / substring 偏移)、权限校验位置(isAuthorized 闸门 +
+//   各 do* 内 canActOn)、各命令成功/失败回执文案 —— 全与线上一致, 不臆造/不删/不改语义 (YAGNI + 保真)。
+//
+// 端口/适配器: 所有副作用走端口 —— HOST.sendText(回执)/HOST.getLoginWxid(取机器人 wxid) +
+//   领域函数(doWarn/doWarnClear/doWarnDec 已在 domain/warning.bsh) + 动作叶子占位缝(见下)。
+//   绝不直接碰 WAuxiliary 内置或 jdbc。
+//
+// 输入抽象 (反射缝): 线上 onHandleMsgBody 从 msg 对象反射取 isText()/getContent()/getAtUserList()/
+//   getQuoteMsg() 等; 这些是 WAuxiliary 运行时反射, 留 app/hooks (P2 接线 + L4 真机验)。
+//   本路由把"从消息对象取 X"抽象成入参 (groupId/sender/content/isTextMsg/atList/quoteTarget/quoteTitle),
+//   路由分派逻辑本身真实可测。锚点: 取 content/isText @2121-2146, atList @2150, quote @2430-2461。
+//
+// 动作叶子占位缝: 线上各 do* 实现 (doKick/doBan/showHelp/doShowInactive/doStrictMode/doSetWarnKick/
+//   doAddAdmin… 见 main.java @1450~@3960) 不属"路由"职责 → 本期未抽; 路由命中后调下方 _cmd* 占位缝
+//   (参照 host_android.bsh detectNativeOwner / speak_buffer.bsh _l3Log 的 TODO 占位写法),
+//   每缝注释指向线上锚点, 留 P2 移植。已抽到 domain 的 (doWarn/doWarnClear/doWarnDec) 直接真调。
+//   恒定真调的端口/领域: HOST.sendText、doWarn/doWarnClear/doWarnDec、recordSpeak(d1 已抽, 占位一行)。
+//
+// 保真红线: 命令集与分派语义逐字保真。dispatchAction 的 token→动作映射表、isActionTok/isOwnerOnlyTok
+//   关键词集、@ 路径取 target(第一个非自己的 @)、引用路径取 <title> 末 token / 被引用者、
+//   "管理员 N"尾随天数 与 "警告 <理由>" 改写, 都照搬线上。
+// ============================================================
+
+// ---- 动作关键词集 (与 @ / 引用路径共用) (线上 @2490) ----
+boolean isActionTok(String lastTok) {
+    return lastTok.equals("踢") || lastTok.equals("请") ||
+           lastTok.equals("拉黑") || lastTok.equals("黑名单") ||
+           lastTok.equals("警告") || lastTok.equals("清零") ||
+           lastTok.equals("警告-1") || lastTok.equals("警告减1") ||
+           lastTok.equals("警告详情") ||
+           lastTok.equals("管理员") || lastTok.equals("移除管理") ||
+           lastTok.equals("群主") || lastTok.equals("移除群主") ||
+           lastTok.equals("保护") || lastTok.equals("取消保护") ||
+           lastTok.equals("白名单") || lastTok.equals("移除白名单") ||
+           lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
+}
+
+// ---- ownerOnly 关键词集 (线上 @2504) ----
+boolean isOwnerOnlyTok(String lastTok) {
+    return lastTok.equals("管理员") || lastTok.equals("移除管理") ||
+           lastTok.equals("群主")   || lastTok.equals("移除群主") ||
+           lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
+}
+
+// ---- 判 token 是否纯正整数 ("管理员"尾随天数解析) (线上 @2472) ----
+boolean _isPosIntTok(String s) {
+    if (s == null || s.isEmpty()) return false;
+    for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+// ---- 判 @列表项是否为 @所有人 (线上 @2482) ----
+boolean _isAtAll(String w) {
+    if (w == null) return false;
+    String s = w.trim();
+    if (s.isEmpty()) return false;
+    return s.equals("notify@all") || s.indexOf("@all") >= 0 || s.indexOf("所有人") >= 0;
+}
+
+// ============================================================
+// 动作叶子端口 LEAF (TODO P2: app/hooks 接真实 do* 实现 + L4 真机验)。
+// 路由命中后调 LEAF.xxx(...), 把"未抽的 do* 实现"隔离到一个可换出端口 (与 HOST/CLOCK/STORAGE
+// 同思路: 领域只依赖端口, 生产 app/hooks 换入真实实现, 测试换入 recording fake)。
+// 用对象端口而非自由函数, 是因 bsh 方法绑定按定义时锁定 → 测试无法靠"重定义自由函数"换出;
+// 而对象字段 LEAF 在调用时解析, 测试可整体 swap (与 host_fake 换 HOST 同模式)。
+// 每方法标注线上锚点。已抽到 domain 的 doWarn/doWarnClear/doWarnDec 不走 LEAF, 路由直接真调。
+// 默认 LEAF = 无副作用占位; 生产 app/hooks 接线时 LEAF = makeAndroidLeaf() 桥到各 do*。
+// ============================================================
+Object _mkNoopLeaf() {
+    void enableGroup(String groupId, String sender)        { }   // @2164 开启群管/启用群管 → enableGroupWithBaseline
+    void disableGroup(String groupId, String sender)       { }   // @2177 关闭群管/禁用群管 → disableGroup
+    void groupStatus(String groupId, String sender)        { }   // @2187 群管状态
+    void groupList(String groupId, String sender)          { }   // @2198 群管群列表 → logEnabledGroupNames
+    void nativeRoleProbe(String groupId)                   { }   // @2159 群管设置/配置(bot 自发) → _logNativeRoleProbe
+    void showHelp(String groupId)                          { }   // @2262 群管帮助/帮助 群管 → showHelp
+    void showBlacklist(String groupId)                     { }   // @2263 黑名单 → showBlacklist
+    void showAdmins(String groupId)                        { }   // @2264 管理员 → showAdmins
+    void showWarnList(String groupId)                      { }   // @2265 警告名单 → showWarnList
+    void showProtected(String groupId)                     { }   // @2266 保护名单 → showProtected
+    void showWhitelist(String groupId)                     { }   // @2268 白名单 → showWhitelist
+    void showGlobalBlacklist(String groupId)               { }   // @2269 全局黑名单 → showGlobalBlacklist
+    void showGlobalWhitelist(String groupId)               { }   // @2270 全局白名单 → showGlobalWhitelist
+    void warnClearAll(String groupId, String sender)       { }   // @2272 清除警告名单 → doWarnClearAll
+    void strictMode(String groupId, String sender, String content) { }   // @2273 严格模式… → doStrictMode
+    void setWarnKick(String groupId, String content)       { }   // @2275 警告上限… → doSetWarnKick
+    void showInactive(String groupId, String content)      { }   // @2278 #潜水/潜水 → doShowInactive
+    void kickInactive(String groupId, String sender, String content) { }   // @2281 #踢潜水/踢潜水 → doKickInactive
+    void checkBotPriv(String groupId, String sender)       { }   // @2284 #群权限自检/群权限自检 → doCheckBotPriv
+    void addBlacklistByAt(String groupId, String sender, List atList) { }   // @2290 添加黑名单 @XX → doAddBlacklistByAt
+    void removeBlacklist(String groupId, String sender, String content, List atList) { }   // @2296 去除黑名单 → doRemoveBlacklist
+    void whitelist(String groupId, String sender, String w)   { }   // @2310 addwt <wxid> → doWhitelist
+    void unwhitelist(String groupId, String sender, String w) { }   // @2316 delwt <wxid> → doUnwhitelist
+    void addGlobalBlacklist(String groupId, String w)         { }   // @2322 addgb <wxid> → doAddGlobalBlacklist
+    void delGlobalBlacklist(String groupId, String w)         { }   // @2328 delgb <wxid> → doDelGlobalBlacklist
+    void addGlobalWhitelist(String groupId, String w)         { }   // @2334 addgw <wxid> → doAddGlobalWhitelist
+    void delGlobalWhitelist(String groupId, String w)         { }   // @2340 delgw <wxid> → doDelGlobalWhitelist
+    // dispatchAction 动作叶子 (除 doWarn/doWarnClear/doWarnDec 真调外) (线上 @2517 表) ——
+    void kick(String groupId, String sender, String target)   { }   // @2523 踢/请 → doKick
+    void banHint(String groupId)                              { }   // @2525 拉黑/黑名单 → 引导显式命令提示
+    void warnDetail(String groupId, String target)            { }   // @2531 警告详情 → doWarnDetail
+    void addAdmin(String groupId, String target, int days)    { }   // @2532 管理员 [N天] → doAddAdmin
+    void delAdmin(String groupId, String target)              { }   // @2533 移除管理 → doDelAdmin
+    void protect(String groupId, String sender, String target)   { }   // @2534 保护 → doProtect
+    void unprotect(String groupId, String sender, String target) { }   // @2535 取消保护 → doUnprotect
+    void addOwner(String groupId, String target)              { }   // @2538 群主 → doAddOwner
+    void delOwner(String groupId, String target)              { }   // @2539 移除群主 → doDelOwner
+    void registerNativeOwner(String groupId, String target)   { }   // @2541 微信群主 → doRegisterNativeOwner
+    void removeNativeOwner(String groupId, String target)     { }   // @2542 移除微信群主 → doRemoveNativeOwner
+    return this;
+}
+LEAF = _mkNoopLeaf();   // 默认无副作用占位; 测试/生产可整体 swap (字段调用时解析)。
+
+// 群启用闸门缝 (线上 isGroupEnabled @1681; 反射/配置读取留 app/hooks)。
+// 测试可经键 ge_<gid> 编程 (host_fake KV); 占位实现读该键, 与线上"按群配置"语义对齐, P2 接真实实现。
+boolean _cmdGroupEnabled(String groupId) {
+    return "1".equals(HOST.getString("ge_" + groupId, "0"));
+}
+
+// 严格模式闸门缝 (线上 isStrictMode @776)。
+boolean _cmdStrictModeOn() { return "1".equals(HOST.getString("strict_mode", "0")); }
+
+// 授权闸门 (线上 isAuthorized @1839): 严格模式→仅 owner; 否则群内管理员+。
+// 线上还含 purgeExpiredAdmins 惰性清(反射时效记录), 那是 app/hooks 关注点 → 占位缝不含, 留 P2。
+boolean _cmdAuthorized(String groupId, String wxid) {
+    if (_cmdStrictModeOn()) return isOwner(wxid);
+    return isAdminInGroup(groupId, wxid);
+}
+
+// ============================================================
+// 统一动作分发 (目标可来自 @ 或 引用回复) (线上 dispatchAction @2517 逐字)。
+// 调用前提: caller 已过 isAuthorized 闸门。各 do* 内部仍各自 canActOn(保护名单/原生群主/层级)校验。
+// days 仅对"管理员"动作有意义 (永久=0 / N天), 其它动作忽略。
+// ============================================================
+void dispatchAction(String groupId, String sender, String target, String lastTok, int days) {
+    // 群主专属命令: 与 @ 路径一致的 ownerOnly 校验。
+    if (isOwnerOnlyTok(lastTok) && !isOwner(sender)) {
+        HOST.sendText(groupId, "❌ 此命令仅群主可用");
+        return;
+    }
+    if (lastTok.equals("踢") || lastTok.equals("请"))           { LEAF.kick(groupId, sender, target); }
+    // v1.16: @TA 拉黑 / @TA 黑名单 过于简单易误触, 已改为引导到显式命令 (不再直接拉黑)
+    else if (lastTok.equals("拉黑") || lastTok.equals("黑名单")) { LEAF.banHint(groupId); }
+    else if (lastTok.equals("警告"))                            { doWarn(groupId, sender, target); }
+    else if (lastTok.equals("清零"))                            { doWarnClear(groupId, sender, target); }
+    else if (lastTok.equals("警告-1") || lastTok.equals("警告减1")) { doWarnDec(groupId, sender, target); }
+    else if (lastTok.equals("警告详情"))                        { LEAF.warnDetail(groupId, target); }
+    else if (lastTok.equals("管理员"))                          { LEAF.addAdmin(groupId, target, days); }
+    else if (lastTok.equals("移除管理"))                        { LEAF.delAdmin(groupId, target); }
+    else if (lastTok.equals("保护"))                            { LEAF.protect(groupId, sender, target); }
+    else if (lastTok.equals("取消保护"))                        { LEAF.unprotect(groupId, sender, target); }
+    else if (lastTok.equals("白名单"))                          { LEAF.whitelist(groupId, sender, target); }
+    else if (lastTok.equals("移除白名单"))                      { LEAF.unwhitelist(groupId, sender, target); }
+    else if (lastTok.equals("群主"))                            { LEAF.addOwner(groupId, target); }
+    else if (lastTok.equals("移除群主"))                        { LEAF.delOwner(groupId, target); }
+    // v1.13: 微信原生角色登记
+    else if (lastTok.equals("微信群主"))                        { LEAF.registerNativeOwner(groupId, target); }
+    else if (lastTok.equals("移除微信群主"))                    { LEAF.removeNativeOwner(groupId, target); }
+}
+void dispatchAction(String groupId, String sender, String target, String lastTok) {
+    dispatchAction(groupId, sender, target, lastTok, 0);
+}
+
+// ============================================================
+// 路由入口: routeCommand —— 线上 onHandleMsgBody @2148-2469 的文本命令分发段逐字保真。
+// 入参 = 线上从 msg 反射取出的字段 (反射缝抽象成入参, P2 在 app/hooks 接线):
+//   groupId      = msg.getTalker()                                   (@2148)
+//   sender       = msg.getSendTalker()                              (@2149)
+//   content      = msg.getContent().trim() (已去空, 非空)            (@2123-2146)
+//   isTextMsg    = msg.isText()                                     (@2121)
+//   atList       = msg.getAtUserList() (List<String> wxid, 可空)     (@2150)
+//   quoteTarget  = msg.getQuoteMsg().getSendTalker() (引用回复被引用者, 无则 null) (@2460)
+//   quoteTitle   = 引用回复 appmsg <title> 文本 (无则 null) (@2438-2455)
+// 返回 true=已消费(命令命中, 线上对应 return); false=非命令文本未触发 (线上落到普通消息出口)。
+// 线上 onHandleMsgBody 里的分段计时(_seg*)/perf 计数(PERF_*) 是 app/hooks 观察性, 不属路由 → 不抽。
+// 热路径 L3 采集(recordSpeak) 已在 d1; 路由里穿插的那次只保留一行占位真调 (函数已存在)。
+// ============================================================
+boolean routeCommand(String groupId, String sender, String content,
+                     boolean isTextMsg, List atList, String quoteTarget, String quoteTitle) {
+    // v1.14.0: 机器人自发的设置命令兜底触发非敏感探测 (@2158)。
+    if ((content.equals("群管设置") || content.equals("群管配置") || content.equals("#群管设置") || content.equals("#群管配置"))
+            && sender != null && sender.equals(HOST.getLoginWxid())) {
+        LEAF.nativeRoleProbe(groupId);
+        return true;
+    }
+
+    // ---- 启用/关闭/状态 (不受 enabled 限制, owner 可随时操作) (@2163) ----
+    if (content.equals("开启群管") || content.equals("启用群管")) {
+        if (!isOwner(sender)) return true;
+        LEAF.enableGroup(groupId, sender);
+        return true;
+    }
+    if (content.equals("关闭群管") || content.equals("禁用群管")) {
+        if (!isOwner(sender)) return true;
+        LEAF.disableGroup(groupId, sender);
+        return true;
+    }
+    if (content.equals("群管状态")) {
+        LEAF.nativeRoleProbe(groupId);
+        if (!isAdminInGroup(groupId, sender)) return true;
+        LEAF.groupStatus(groupId, sender);
+        return true;
+    }
+    if (content.equals("群管群列表")) {
+        if (!isOwner(sender)) return true;
+        LEAF.groupList(groupId, sender);
+        return true;
+    }
+
+    // ---- 没启用就静默忽略其他所有命令 (@2206) ----
+    if (!_cmdGroupEnabled(groupId)) return false;
+
+    // ---- 潜水追踪: 每条群消息记录发言时间 + first_seen (@2211) ----
+    // 热路径 L3 采集已在 d1 (app/speak_buffer.recordSpeak); 路由只保留这一行占位真调, 不重复抽 infra。
+    if (sender != null && !sender.isEmpty()) {
+        recordSpeak(groupId, sender);
+    }
+
+    // ---- 群管命令统一前置: 非管理员一律静默忽略 (@2233) ----
+    boolean isCmd = content.equals("群管帮助") || content.equals("帮助 群管") ||
+                    content.equals("黑名单") || content.equals("管理员") ||
+                    content.equals("警告名单") || content.equals("保护名单") ||
+                    content.equals("白名单") || content.equals("清除警告名单") ||
+                    content.equals("全局黑名单") || content.equals("全局白名单") ||
+                    content.startsWith("严格模式") || content.startsWith("警告上限") ||
+                    content.startsWith("#潜水") || content.equals("潜水") ||
+                    content.startsWith("#踢潜水") || content.startsWith("踢潜水") ||
+                    content.equals("#群权限自检") || content.equals("群权限自检") ||
+                    content.startsWith("添加黑名单") || content.startsWith("去除黑名单") ||
+                    content.startsWith("addsb ") || content.startsWith("delbk ") ||
+                    content.startsWith("addwt ") || content.startsWith("delwt ") ||
+                    content.startsWith("addgb ") || content.startsWith("delgb ") ||
+                    content.startsWith("addgw ") || content.startsWith("delgw ");
+    if (isCmd && !_cmdAuthorized(groupId, sender)) {
+        return true;
+    }
+
+    // ---- 查询命令 (@2261) ----
+    if (content.equals("群管帮助") || content.equals("帮助 群管")) { LEAF.showHelp(groupId); return true; }
+    if (content.equals("黑名单")) { LEAF.showBlacklist(groupId); return true; }
+    if (content.equals("管理员")) { LEAF.showAdmins(groupId); return true; }
+    if (content.equals("警告名单")) { LEAF.showWarnList(groupId); return true; }
+    if (content.equals("保护名单")) { LEAF.showProtected(groupId); return true; }
+    // v1.12 查询
+    if (content.equals("白名单")) { LEAF.showWhitelist(groupId); return true; }
+    if (content.equals("全局黑名单")) { LEAF.showGlobalBlacklist(groupId); return true; }
+    if (content.equals("全局白名单")) { LEAF.showGlobalWhitelist(groupId); return true; }
+    // v1.12 控制
+    if (content.equals("清除警告名单")) { LEAF.warnClearAll(groupId, sender); return true; }
+    if (content.startsWith("严格模式")) { LEAF.strictMode(groupId, sender, content); return true; }
+    // W1: 文字命令设本群警告上限 (admin+, 已过 isAuthorized 闸门)
+    if (content.startsWith("警告上限")) { LEAF.setWarnKick(groupId, content); return true; }
+
+    // ---- 潜水管理 (@2277) ----
+    if (content.startsWith("#潜水") || content.equals("潜水")) {
+        LEAF.showInactive(groupId, content); return true;
+    }
+    if (content.startsWith("#踢潜水") || content.startsWith("踢潜水")) {
+        LEAF.kickInactive(groupId, sender, content); return true;
+    }
+    if (content.equals("#群权限自检") || content.equals("群权限自检")) {
+        LEAF.checkBotPriv(groupId, sender); return true;
+    }
+
+    // ---- 黑名单显式命令 (@2288) ----
+    if (content.startsWith("添加黑名单")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        LEAF.addBlacklistByAt(groupId, sender, atList);
+        return true;
+    }
+    if (content.startsWith("去除黑名单")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        LEAF.removeBlacklist(groupId, sender, content, atList);
+        return true;
+    }
+
+    // ---- by-wxid 命令 (纯文本, 无 @) (@2302) ----
+    // v1.16: addsb / delbk 已停用 → 引导到显式命令 (仍仅管理员可见此提示)
+    if (content.startsWith("addsb ") || content.startsWith("delbk ")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        HOST.sendText(groupId, "ℹ️ 该命令已停用\n请用: 添加黑名单 @XX / 去除黑名单 @XX / 去除黑名单【序号】");
+        return true;
+    }
+    // v1.12 by-wxid: 白名单 / 全局黑 / 全局白
+    if (content.startsWith("addwt ")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) LEAF.whitelist(groupId, sender, w);
+        return true;
+    }
+    if (content.startsWith("delwt ")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) LEAF.unwhitelist(groupId, sender, w);
+        return true;
+    }
+    if (content.startsWith("addgb ")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) LEAF.addGlobalBlacklist(groupId, w);
+        return true;
+    }
+    if (content.startsWith("delgb ")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) LEAF.delGlobalBlacklist(groupId, w);
+        return true;
+    }
+    if (content.startsWith("addgw ")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) LEAF.addGlobalWhitelist(groupId, w);
+        return true;
+    }
+    if (content.startsWith("delgw ")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        String w = content.substring(6).trim();
+        if (!w.isEmpty()) LEAF.delGlobalWhitelist(groupId, w);
+        return true;
+    }
+
+    // ---- 动作命令: 目标来自 @ (原路径) 或 引用回复 (W2) (@2347) ----
+    // 取最后一个 token (动作关键字)。用 regex 拆分, 覆盖 ASCII space + U+2005 (微信 @ 全角空格) + U+00A0。
+    String[] tokens = content.split("[\\s\\u2005\\u00A0]+");
+    String lastTok = tokens.length > 0 ? tokens[tokens.length - 1].trim() : "";
+
+    // v1.17.0: 仅对"管理员"动作识别尾随天数; v1.19.0: 识别"警告 <理由>"。
+    int actDays = 0;
+    String warnReason = null;
+    if (!isActionTok(lastTok) && tokens.length >= 2) {
+        String prev = tokens[tokens.length - 2].trim();
+        if (prev.equals("管理员") && _isPosIntTok(lastTok)) {
+            try { actDays = Integer.parseInt(lastTok); } catch (Throwable t) { actDays = 0; }
+            if (actDays > 0) lastTok = "管理员";   // 改写动作词为"管理员", 带 days
+        } else if (prev.equals("警告")) {
+            warnReason = lastTok; lastTok = "警告";   // 改写动作词为"警告", 带 reason
+        }
+    }
+    boolean isAction = isActionTok(lastTok);
+
+    boolean hasAt = atList != null && atList.size() > 0;
+
+    if (hasAt) {
+        // ===== @ 路径 (@2372) =====
+        if (!isAction) return false;
+        if (!_cmdAuthorized(groupId, sender)) return true;       // 非管理员/群主静默
+
+        // v1.17.2: 踢人若 @所有人 则拒绝 (@2381)。
+        if (lastTok.equals("踢") || lastTok.equals("请")) {
+            boolean atAll = false;
+            for (int i = 0; i < atList.size(); i++) { if (_isAtAll((String) atList.get(i))) { atAll = true; break; } }
+            if (atAll) { HOST.sendText(groupId, "❌ 不能对 @所有人 执行踢人"); return true; }
+        }
+
+        // 取第一个非自己的 @ 作为 target (@2387)。
+        String me = HOST.getLoginWxid();
+        String target = null;
+        for (int i = 0; i < atList.size(); i++) {
+            String w = (String) atList.get(i);
+            if (!w.equals(me)) { target = w; break; }
+        }
+        if (target == null) {
+            HOST.sendText(groupId, "❌ 请 @ 你要操作的对象");
+            return true;
+        }
+        // v1.19.0: 带理由的警告直接走带 reason 的 doWarn (静默豁免对象); 无理由"警告"仍走 dispatchAction。
+        if (lastTok.equals("警告") && warnReason != null) { doWarn(groupId, sender, target, warnReason); return true; }
+        dispatchAction(groupId, sender, target, lastTok, actDays);
+        return true;
+    }
+
+    // ===== 无 @ 分支: 按 isText 二分 (W2) (@2404) =====
+    if (isTextMsg) {
+        // 普通文本消息: 无 @ 无引用 → 末尾动作词无 target, 维持原行为直接 return (非命令未触发)。
+        return false;
+    }
+
+    // 非文本 appmsg (含引用回复) (@2428): 真正回复文本/动作词在 <title> 里, 被引用者 = quoteTarget。
+    // (反射: 线上 getQuoteMsg/解析 XML 留 app/hooks; 本路由收 quoteTitle/quoteTarget 入参。)
+    if (quoteTarget == null) return false;   // 非引用其它 appmsg (链接/文件/图片) → 忽略
+
+    // 从 <title> 取末尾 token 作动作词 (与 @ 路径同一套 split) (@2434)。
+    String actionTok = "";
+    int qDays = 0;
+    if (quoteTitle != null) {
+        String[] tt = quoteTitle.trim().split("[\\s\\u2005\\u00A0]+");
+        if (tt.length > 0) actionTok = tt[tt.length - 1].trim();
+        // 仅"管理员"动作识别尾随天数; 其它动作不变。
+        if (!isActionTok(actionTok) && tt.length >= 2) {
+            String prev = tt[tt.length - 2].trim();
+            if (prev.equals("管理员") && _isPosIntTok(actionTok)) {
+                try { qDays = Integer.parseInt(actionTok); } catch (Throwable t2) { qDays = 0; }
+                if (qDays > 0) actionTok = "管理员";
+            }
+        }
+    }
+    if (!isActionTok(actionTok)) return false;   // 回复词不是动作 → 忽略
+
+    if (quoteTarget.isEmpty()) return false;
+
+    // 权限/保护与 @ 路径完全相同: 先 isAuthorized 静默闸门, 再走 dispatchAction (内含 ownerOnly + canActOn)。
+    if (!_cmdAuthorized(groupId, sender)) return true;       // 非授权者引用发动作 → 静默拒绝
+    dispatchAction(groupId, sender, quoteTarget, actionTok, qDays);
+    return true;
+}

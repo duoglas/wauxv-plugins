@@ -2,10 +2,14 @@
 // 不碰任何 SQL/DB —— 单测验证领域是否用正确 SQL+binds 调端口(契约/交互测试)。
 FAKE_EXEC_CALLS = new java.util.ArrayList();   // 每项 = Object[]{ sql, binds }
 FAKE_QUERY_RET = null;                          // 可编程返回(queryLong)
+FAKE_ROWS_RET = null;                           // 可编程返回(queryRows: List<Object[]>)
 
 Object _mkFakeStorage() {
     void exec(String sql, Object[] binds) { FAKE_EXEC_CALLS.add(new Object[]{ sql, binds }); }
     Long queryLong(String sql, Object[] binds) { return FAKE_QUERY_RET; }
+    java.util.List queryRows(String sql, Object[] binds) {
+        return (FAKE_ROWS_RET == null) ? new java.util.ArrayList() : FAKE_ROWS_RET;
+    }
     return this;
 }
 STORAGE = _mkFakeStorage();
