@@ -1,4 +1,5 @@
-// GroupAdmin v1.18.0 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.19.0 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+//   - v1.19.0: 警告带理由 — `@TA 警告 <理由>` 解析并透传; doWarn 通知末尾拼 " · 理由"; 自动来源(理由非空)对豁免对象(权限不足/白名单)静默跳过, 不发报错 (手动警告行为不变) (SPEC 警告系统)
 //   - v1.18.0: 活动判定=任意消息类型 — 非文本消息(图片/表情/语音/红包/文件等)也计入发言活动, 修复只发非文本消息者被 #潜水 误判潜水 (SPEC §3/§6.10 活动采集前置)
 //   - v1.17.2: 踢人安全 — @所有人(notify@all)不能踢 (@路径踢/请动作前置守卫 _isAtAll)
 //   - v1.17.1: 管理员时效标签文案 "失效 X" → "有效期至 X"(列表/群消息同源 adminExpiryLabel)
@@ -1934,7 +1935,7 @@ void onLoad() {
         String _owner;
         try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
         if (_owner == null) _owner = "(login pending)";
-        log("GroupAdmin v1.18.0 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
+        log("GroupAdmin v1.19.0 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
     } catch (Throwable t) {
         try { log("GroupAdmin v1.17.0 onLoad log block err: " + t); } catch (Throwable t2) {}
     }
@@ -1956,7 +1957,7 @@ void onLoad() {
                     int added = initFirstSeenBaseline(g);
                     if (added > 0) { touched++; totalAdded += added; }
                 }
-                log("GroupAdmin v1.18.0 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+                log("GroupAdmin v1.19.0 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
                 // _probeGroupInfoAPI();
             }
         });
@@ -2341,11 +2342,15 @@ void onHandleMsgBody(Object msg) {
     // v1.17.0: 仅对"管理员"动作识别尾随天数 (`@TA 管理员 7` → 动作="管理员" days=7)。
     // 纯字符串/内存判定, 仅在末尾命中"管理员"时才解析整数; 其它动作完全不变 (C-PERF-01: 不进普通消息热路径)。
     int actDays = 0;
+    // v1.19.0: 识别 "@TA 警告 <理由>" → 动作="警告" 透传 warnReason (走带理由 doWarn, 静默豁免对象)。
+    String warnReason = null;
     if (!isActionTok(lastTok) && tokens.length >= 2) {
         String prev = tokens[tokens.length - 2].trim();
         if (prev.equals("管理员") && _isPosIntTok(lastTok)) {
             try { actDays = Integer.parseInt(lastTok); } catch (Throwable t) { actDays = 0; }
             if (actDays > 0) lastTok = "管理员";   // 改写动作词为"管理员", 带 days
+        } else if (prev.equals("警告")) {
+            warnReason = lastTok; lastTok = "警告";   // 改写动作词为"警告", 带 reason
         }
     }
     boolean isAction = isActionTok(lastTok);
@@ -2378,6 +2383,8 @@ void onHandleMsgBody(Object msg) {
             sendText(groupId, "❌ 请 @ 你要操作的对象");
             return;
         }
+        // v1.19.0: 带理由的警告直接走带 reason 的 doWarn (静默豁免对象); 无理由"警告"仍走 dispatchAction 原路径。
+        if (lastTok.equals("警告") && warnReason != null) { doWarn(groupId, sender, target, warnReason); return; }
         dispatchAction(groupId, sender, target, lastTok, actDays);
         return;
     }
@@ -2688,11 +2695,14 @@ List parseBlacklistIndexes(String content) {
     return out;
 }
 
-void doWarn(String groupId, String sender, String target) {
-    if (!canActOn(groupId, sender, target)) { sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
+void doWarn(String groupId, String sender, String target) { doWarn(groupId, sender, target, null); }
+// v1.19.0: reason 非空 = 自动来源(带理由) → 对豁免对象(权限/白名单)静默跳过, 不发报错; 通知文案末尾拼 " · 理由"
+void doWarn(String groupId, String sender, String target, String reason) {
+    boolean auto = (reason != null && !reason.trim().isEmpty());
+    if (!canActOn(groupId, sender, target)) { if (!auto) sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
     // v1.12: 白名单(本群+全局)免警告
     if (isWhitelistAny(groupId, target)) {
-        sendText(groupId, "🛡 " + lookupName(target, groupId) + " 在白名单, 不警告");
+        if (!auto) sendText(groupId, "🛡 " + lookupName(target, groupId) + " 在白名单, 不警告");
         return;
     }
     int n = getWarn(groupId, target) + 1;
@@ -2706,12 +2716,13 @@ void doWarn(String groupId, String sender, String target) {
     String byName = lookupName(sender, groupId);
     int kick = getWarnKick(groupId);   // W1: 本群上限 (默认 10, 可经 wk_<group> 覆盖)
     int remain = kick - n;
+    String why = auto ? (" · " + reason.trim()) : "";
 
     StringBuilder sb = new StringBuilder();
     sb.append("[AtWx=").append(target).append("]\n");   // @ 受罚者, 让 TA 收到通知
 
     if (n >= kick) {
-        sb.append("🚨 ").append(name).append(" 累计 ").append(n).append("/").append(kick).append(" 自动移除");
+        sb.append("🚨 ").append(name).append(" 累计 ").append(n).append("/").append(kick).append(" 自动移除").append(why);
         sendText(groupId, sb.toString());
         if (botPrivState(groupId).equals("none")) {
             sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");   // 无权限: 不清零, 保留计数等下次
@@ -2729,10 +2740,10 @@ void doWarn(String groupId, String sender, String target) {
             }
         }
     } else if (n == 1) {
-        sb.append("⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 还剩 ").append(remain).append(" 次");
+        sb.append("⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 还剩 ").append(remain).append(" 次").append(why);
         sendText(groupId, sb.toString());
     } else {
-        sb.append("⚠️⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 仅剩 ").append(remain).append(" 次, 下次自动踢");
+        sb.append("⚠️⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 仅剩 ").append(remain).append(" 次, 下次自动踢").append(why);
         sendText(groupId, sb.toString());
     }
 }
