@@ -7,7 +7,11 @@ metadata:
   originSessionId: 3cbb9098-fbe3-4e37-8615-e1be36f085db
 ---
 
-**截至 2026-06-07。换机器/新 session 先看这条接上工作。**
+**截至 2026-06-09。换机器/新 session 先看这条接上工作。**
+
+## 待用户确认的后续(伸手党收尾时浮现, 本轮 out-of-scope)
+1. **#潜水 新成员豁免改固定 1 天**?(用户提"潜水豁免1天、伸手党豁免30分钟"区分两者; #潜水 现在豁免=活跃判定同用 `days` 参数, 改成固定 1 天是 GroupAdmin 改动)——**待用户确认再做**。
+2. **GroupAdmin 主动为全体成员补 first_seen 基线**(关闭"入群从不发言者无 speak 行 → 伸手党 rpQueryLastSpeak 返 -1 跳过 → 漏检"的窄缺口); onLoad 现只对无任何基线的群补, 已重置的群不补新成员——**增强项, 安全网偏漏判可接受, 非急**。
 
 ## 工作目录已迁 Dropbox
 工作目录 = `~/Dropbox/ops-work/android-ops`（多 Mac 经 Dropbox 同步）。新 session 先 `bash scripts/bootstrap.sh`（自识别机器/adb/scrcpy/手机/root/版本 + 本机记忆为空时从 `docs/memory-snapshot/` 自动 seed）。详见 `docs/ONBOARDING.md`。**写了新记忆后要 `cp ~/.claude/.../memory/*.md docs/memory-snapshot/` 同步回快照**，否则别的机器接不到。
@@ -23,14 +27,14 @@ metadata:
   - **v1.19.1 自动来源豁免管理员(Santa 修复)**:`canActOn(owner→admin)=true` 会让自动警告误踢潜水管理员; doWarn auto 分支前置 `if(auto&&(isAdminInGroup||isOwner||isNativeOwner))return;`。
   - **v1.19.2 [严重] recordSpeak last_speak 永卡 NULL(2026-06-09)**:l3Flush 的 UPSERT `last_speak=max(last_speak,excluded)`,**SQLite 标量 `max(NULL,x)=NULL`** → 先被建基线(last_speak=NULL)再发言的成员永远卡 NULL。**影响发言统计/#潜水(活跃者误判从未发言)/伸手党 全失真**(该群 491 人里 404 NULL,很多其实在发言)。修:`max(coalesce(last_speak,excluded),excluded)`(对齐 first_seen 那行本就有的 coalesce)。真机验证:长期 NULL 的活跃成员部署后再发言 last_speak 立即更新。**教训:SQLite UPSERT 里凡 max/min 旧列可能为 NULL,必须 coalesce 兜底**。注:此前 06-08 全群基线重置(first_seen=now)放大了此 bug(全员有 NULL 行)。修复后大家发言逐步自愈。
   - GroupAdmin 重启即加载。
-- **RedPacketStats v1.11.2**：v1.6.4 基础上累积 包类型(§22)/设置页拆分(§23)/转发对象按群(§24)/重试3(§4)/伸手党治理(§25)。
+- **RedPacketStats v1.11.3**：v1.6.4 基础上累积 包类型(§22)/设置页拆分(§23)/转发对象按群(§24)/重试3(§4)/伸手党治理(§25, v1.11.3 收尾)。
   - 包类型 普通/定制(v1.7.x):定制开关(仅 Dialog)+关键字(**包含匹配**)+定制档表;worker 判定零热路径;定制第一条用定制前缀、第二条「【查包】定制包」。
   - 设置页(v1.8.x):主菜单 + 二级子页(showPageBasic/NormalTiers/Custom/Delay/Exclude/**Forward**);menuHolder 修关闭堆叠;排除名单显示「昵称（…尾4）」。
   - **转发对象按群**(v1.9.x §24):`rp_export_target_<gid>`/name(未设回退全局默认);后台 `getFriendList()`/`getGroupList()` + Handler 主线程单选弹框(防 ANR);设置后向目标发通知(只讲当前群);发送按群路由(rpBuildGroupedMsgs 带 grp);**每日定时开关+推送时间(全局)迁入「📮 转发对象」子页**,基础页只留本群启用。真机验收过(含选好友 getFriendList)。
   - **重试3(v1.10.0 §4)**:红包重试阶梯加末档 `rp_retry3_sec`(默认3600s=1小时), afterCoverNoDetail attempt≥2→≥3, 三段阶梯; cfgRetry3 仅 worker 读。延迟子页/命令(4参)/状态增列重试3。
   - **伸手党治理(v1.11.x §25, 2026-06-09, 默认关 `rp_freeloader_on_<gid>`)**:抢红包者在**红包检测时刻**前 N 分(默认30 `rp_freeloader_win_<gid>`)未在群发言 → 后台 fire-and-forget 线程发 `[AtWx=wxid] 警告 {N}分钟内未发言` 命令, 交群管 v1.19.1 原警告流程执行(同一计数到 wk_ 上限踢)。只读查 groupadmin.db speak.last_speak(rpQueryLastSpeak: -1无行/DB不可用跳过、0从未发言判、>0毫秒)。Santa 修复: 后台线程不占单飞锁/不撞30s看门狗 + 上限 FREELOADER_MAX_WARN=10(超出留痕) + flush 容差60s。安全网宁可漏判; 豁免靠群管 doWarn。只拼手气包、只领完的包。命令 `伸手党 开/关`、`伸手党窗口 N`; Dialog 子页🖐伸手党治理。**⚠️ 端到端启用实测(开开关+已知活跃/潜水各抢一次+管理员豁免)还没做, 用户暂未开启。**
   - **教训:红包领取者反射模型(LuckyMoneyNewReceiveUI 详情)无 per-person 领取时刻字段**(`g` 取不到、无任何时间戳数值字段; 真机 GPROBE 探测确认)。本想用每人领取时刻判定, 退用红包检测时刻(Job 加 JOB_DETECTMS 第10槽承载)。要按人领取时刻得另挖(UI 文本/字符串字段, 更脆弱)。
-  - **⚠️ 伸手党 v1.11.2 在仓里是 default-off,但真机当前是临时调试态(DRY-RUN 只记不发 + GFDBG/昵称诊断, main.java 未提交)**。排查"活跃者被误警告"时确认:红包反射 wxid 与聊天 sender wxid **一致(无错配)**,误判根因就是上面 v1.19.2 的 last_speak NULL bug(已修)。**伸手党剩余待办(建议新 session 做)**:① 删 GFDBG、恢复真发送;② **复用红包排除名单 getExcludeList 豁免**(用户要求, 已在 DRY-RUN 里并入 wouldWarn);③ **按用户洞见加 first_seen 基线豁免(仿 #潜水)**:刚修复后/刚重置基线后大量人仍 NULL, 直接判会误杀, 应跳过 first_seen 太新(数据没攒够)的人, 只判老成员 last_speak NULL/旧的; ④ 重新真机端到端验收。仓里 committed 版本(05f0fb5 之前的 08120dc)是会真发的 v1.11.2, 启用前务必先做①②③。
+  - **伸手党 v1.11.3 收尾完成(2026-06-09, commit b747a58, 默认关)**:撤 DRY-RUN/GFDBG 恢复真发送。**豁免模型(用户最终拍板)= 全局开关时刻宽限, 不是每人 first_seen**:新增 per-group 键 `rp_freeloader_since_<gid>`(命令『伸手党 开』/Dialog OFF→ON 写当前 ms, 已 ON 不重置); 判定段闸门 `since<=0`(安全网跳过) 或 红包检测时刻 `packetMs` 在 `since+winMs` 内 → 整包跳过(全员豁免=刚开开关数据预热期); 宽限后**所有领取者(含新进群)按 last_speak 判, 不用 first_seen**(与 #潜水 刻意区分:进群就抢、抢前没发言即判)。复用红包排除名单 `getExcludeList` 豁免领取者。排查确认红包 wxid 与聊天 wxid **一致(无错配)**, 误判根因就是 GA v1.19.2 的 last_speak NULL bug(已修)。验证:bsh 解析 EXIT=0 + 真机干净加载无 eval/parse 异常 + Santa 双独立 Reviewer(逻辑+规格)均 PASS。**⚠️ 真红包行为实测(T1-T5)adb 模拟不了, 需手动 scrcpy(用户在场+单测试群+临时『伸手党 开』); 且 last_speak 仍自愈中(大量 NULL), 30min 宽限盖不住多小时自愈期 → 建议自愈后或仅测试群再开。默认关, 未启用。见 docs/verification-report.md**。设备留底 main.java.bak-before-v1113-20260609。
   - **懒加载;曾因解析失败被自动停用,注意确认开关 ON**。
 
 ## 挂起的真机收尾项（adb 输不了中文/红包，需人工在微信里做）
