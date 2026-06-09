@@ -21,6 +21,7 @@ metadata:
   - **全群基线重置(2026-06-08 17:19)**:应用户要求"从今天起算", 停微信→`UPDATE speak SET first_seen=now`(全 8 群所有行, **last_speak 保留**)→推回→重启验证。真机留底 `groupadmin.db.before-baseline-reset-20260608`。**预期**:之后 N 天 `#潜水 N` 基本空(全员新成员豁免期), N 天后从今天起没冒泡的人才上榜。
   - **v1.19.0 警告带理由(2026-06-09)**:`@TA 警告 <理由>` 解析(末token非动作词但前一token="警告"→动作=警告+理由), `doWarn` 双签名(旧3参转调4参), 通知拼 ` · 理由`; **自动来源(理由非空)对豁免对象静默跳过**(不发报错)。手动 `@TA 警告` 不变。为伸手党治理铺路。
   - **v1.19.1 自动来源豁免管理员(Santa 修复)**:`canActOn(owner→admin)=true` 会让自动警告误踢潜水管理员; doWarn auto 分支前置 `if(auto&&(isAdminInGroup||isOwner||isNativeOwner))return;`。
+  - **v1.19.2 [严重] recordSpeak last_speak 永卡 NULL(2026-06-09)**:l3Flush 的 UPSERT `last_speak=max(last_speak,excluded)`,**SQLite 标量 `max(NULL,x)=NULL`** → 先被建基线(last_speak=NULL)再发言的成员永远卡 NULL。**影响发言统计/#潜水(活跃者误判从未发言)/伸手党 全失真**(该群 491 人里 404 NULL,很多其实在发言)。修:`max(coalesce(last_speak,excluded),excluded)`(对齐 first_seen 那行本就有的 coalesce)。真机验证:长期 NULL 的活跃成员部署后再发言 last_speak 立即更新。**教训:SQLite UPSERT 里凡 max/min 旧列可能为 NULL,必须 coalesce 兜底**。注:此前 06-08 全群基线重置(first_seen=now)放大了此 bug(全员有 NULL 行)。修复后大家发言逐步自愈。
   - GroupAdmin 重启即加载。
 - **RedPacketStats v1.11.2**：v1.6.4 基础上累积 包类型(§22)/设置页拆分(§23)/转发对象按群(§24)/重试3(§4)/伸手党治理(§25)。
   - 包类型 普通/定制(v1.7.x):定制开关(仅 Dialog)+关键字(**包含匹配**)+定制档表;worker 判定零热路径;定制第一条用定制前缀、第二条「【查包】定制包」。
@@ -29,6 +30,7 @@ metadata:
   - **重试3(v1.10.0 §4)**:红包重试阶梯加末档 `rp_retry3_sec`(默认3600s=1小时), afterCoverNoDetail attempt≥2→≥3, 三段阶梯; cfgRetry3 仅 worker 读。延迟子页/命令(4参)/状态增列重试3。
   - **伸手党治理(v1.11.x §25, 2026-06-09, 默认关 `rp_freeloader_on_<gid>`)**:抢红包者在**红包检测时刻**前 N 分(默认30 `rp_freeloader_win_<gid>`)未在群发言 → 后台 fire-and-forget 线程发 `[AtWx=wxid] 警告 {N}分钟内未发言` 命令, 交群管 v1.19.1 原警告流程执行(同一计数到 wk_ 上限踢)。只读查 groupadmin.db speak.last_speak(rpQueryLastSpeak: -1无行/DB不可用跳过、0从未发言判、>0毫秒)。Santa 修复: 后台线程不占单飞锁/不撞30s看门狗 + 上限 FREELOADER_MAX_WARN=10(超出留痕) + flush 容差60s。安全网宁可漏判; 豁免靠群管 doWarn。只拼手气包、只领完的包。命令 `伸手党 开/关`、`伸手党窗口 N`; Dialog 子页🖐伸手党治理。**⚠️ 端到端启用实测(开开关+已知活跃/潜水各抢一次+管理员豁免)还没做, 用户暂未开启。**
   - **教训:红包领取者反射模型(LuckyMoneyNewReceiveUI 详情)无 per-person 领取时刻字段**(`g` 取不到、无任何时间戳数值字段; 真机 GPROBE 探测确认)。本想用每人领取时刻判定, 退用红包检测时刻(Job 加 JOB_DETECTMS 第10槽承载)。要按人领取时刻得另挖(UI 文本/字符串字段, 更脆弱)。
+  - **⚠️ 伸手党 v1.11.2 在仓里是 default-off,但真机当前是临时调试态(DRY-RUN 只记不发 + GFDBG/昵称诊断, main.java 未提交)**。排查"活跃者被误警告"时确认:红包反射 wxid 与聊天 sender wxid **一致(无错配)**,误判根因就是上面 v1.19.2 的 last_speak NULL bug(已修)。**伸手党剩余待办(建议新 session 做)**:① 删 GFDBG、恢复真发送;② **复用红包排除名单 getExcludeList 豁免**(用户要求, 已在 DRY-RUN 里并入 wouldWarn);③ **按用户洞见加 first_seen 基线豁免(仿 #潜水)**:刚修复后/刚重置基线后大量人仍 NULL, 直接判会误杀, 应跳过 first_seen 太新(数据没攒够)的人, 只判老成员 last_speak NULL/旧的; ④ 重新真机端到端验收。仓里 committed 版本(05f0fb5 之前的 08120dc)是会真发的 v1.11.2, 启用前务必先做①②③。
   - **懒加载;曾因解析失败被自动停用,注意确认开关 ON**。
 
 ## 挂起的真机收尾项（adb 输不了中文/红包，需人工在微信里做）
