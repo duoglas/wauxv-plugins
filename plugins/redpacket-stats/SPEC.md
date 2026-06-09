@@ -1,7 +1,8 @@
 # RedPacketStats SPEC（正式版 v1.0）
 
 > 插件行为规格（C-PLUGIN-03 要求）。**改行为先改本文件，再改 `main.java`。**
-> 当前版本：**v1.11.2（待部署）**——在 v1.11.1 之上把**红包伸手党治理**（§25）的判定基准由「每人领取时刻」改为「**红包检测时刻**」（全员统一）。原因：真机确认当前微信版本领取者反射模型无 per-person 领取时刻字段（`g` 取不到），故退用红包检测/到达时刻（`onHandleMsg` 入队那一刻，≈红包发出时刻）做统一基准，语义=「红包来之前 N 分钟你在不在场」。Job 增 `JOB_DETECTMS` 第 10 槽承载检测时刻（入队 O(1) 只塞已算好的 long，重试透传不改基准）；撤掉 `hbExtractTriple` 的 `g`/`grabMs` 提取 + `receivers` 回 3 元素；删临时 GPROBE 诊断。后台线程/警告人数上限/flush 容差/安全网/命令/Dialog 全不变。详见 §25.8。
+> 当前版本：**v1.11.3（待部署）**——在 v1.11.2 之上**收尾红包伸手党治理**（§25.9）：撤 DRY-RUN/GFDBG 调试态、恢复真发送警告。豁免模型改为「**全局开关时刻宽限**」——新增 per-group 键 `rp_freeloader_since_<gid>`（开关 OFF→ON 写当前 ms），判定段先闸门：`since<=0`（安全网跳过）或红包检测时刻 `packetMs` 在 `since+winMs` 内 → **整包跳过（全员豁免，数据预热期）**；宽限过后所有领取者（含新进群）按 `last_speak` 判，**不用 `first_seen`**（与 `#潜水` 区分）。复用红包排除名单 `getExcludeList` 豁免领取者。后台线程/cap10/容差/安全网/命令/Dialog 不变，日志脱敏。默认关。详见 §25.9。
+> 历史：**v1.11.2**——把伸手党判定基准由「每人领取时刻」改为「**红包检测时刻**」（全员统一）。原因：真机确认当前微信版本领取者反射模型无 per-person 领取时刻字段（`g` 取不到），故退用红包检测/到达时刻做统一基准。Job 增 `JOB_DETECTMS` 第 10 槽承载检测时刻；撤掉 `hbExtractTriple` 的 `g`/`grabMs` 提取 + `receivers` 回 3 元素；删临时 GPROBE。详见 §25.8。
 >
 > 历史当前版本：**v1.11.0（待部署）**——在 v1.10.0 之上新增**红包伸手党治理**（§25）：抢红包者在抢到时刻前 N 分钟（默认 30）未在群发言 → 后台反射线程自动发群管警告命令 `[AtWx=wxid] 警告 {N}分钟内未发言`，由 GroupAdmin v1.19.0 按原流程执行（v1.11.2 已把基准改为红包检测时刻，见上）。per-group 开关 `rp_freeloader_on_<gid>`（默认关）/ 窗口 `rp_freeloader_win_<gid>`（默认 30）。**全程后台线程、零 onHandleMsg 热路径、不直接踢人**。
 >
@@ -611,3 +612,20 @@ hbDetailExtract: 反射读领取者明细 (仅 wxid; 无 per-person 领取时刻
 - **承载**：Job 增 `JOB_DETECTMS` 第 10 槽（`int JOB_DETECTMS = 9;`）。入队时 `detectMs = System.currentTimeMillis(); dueAt = detectMs + delayMs;`，Job 末尾塞 `Long.valueOf(detectMs)`。**入队热路径只多塞一个已算好的 `long`，O(1) 不加新开销**（C-PERF-01）。重试重入队（`reJob`）透传原 `job[JOB_DETECTMS]`——**重试不改基准**。Job 两处构造（入队 + 重试）槽位数一致（均 10 槽）。
 - **撤销 v1.11.0 的 per-person 提取**：`hbExtractTriple` 删除 `g`/`grabMs` 提取，返回值回到 4 元素 `{nickname, amountCent, wxid, pathLog}`；`hbDetailExtract` 的 `receivers` 元素回到 3 元素 `{nickname, amountCent, wxid}`。临时诊断 `GPROBE` 删除。
 - **不变项**：后台 fire-and-forget 线程、警告人数上限、flush 容差、安全网、命令/Dialog/状态显示、`rpQueryLastSpeak` 全部保持 §25.1-§25.7 不变（仅判定基准由 `grabMs` 换为统一的 `packetMs`，快照仅存 `wxid`）。
+
+### 25.9 v1.11.3 收尾：豁免模型改「全局开关时刻宽限」+ 复用排除名单（默认关）
+
+> **背景**：排查「活跃者被误警告」期间，确认红包反射 wxid 与聊天 sender wxid **一致（无错配）**，误判根因是 GroupAdmin 的 `last_speak` 永卡 NULL bug（`SQLite max(NULL,x)=NULL`，已在 GA v1.19.2 用 `coalesce` 修复）。v1.11.3 在此基础上把伸手党从真机 DRY-RUN 调试态收尾为真发送，并按用户指示调整豁免模型。
+
+- **全局开关时刻宽限（替代「每人 first_seen 豁免」）**：新增 per-group 键 `rp_freeloader_since_<groupId>`（毫秒）。
+  - **写入时机**：开关 **OFF→ON** 时（命令 `伸手党 开` + Dialog toggle 两入口）写 `System.currentTimeMillis()`；已 ON 再开/重存 **不重置**（避免重新发放宽限）。语义=「我打开开关 / bot 进群开始追踪」那一刻。
+  - **判定闸门**：判定线程开头读 `since = cfgFreeloaderSince(talker)` 与 `win`：
+    - `since <= 0`（无锚点）→ **整包跳过**（安全网，不应发生于正常开启流程）。
+    - `packetMs - since < winMs`（红包检测时刻在 `since + 窗口` 内）→ **整包跳过，全员豁免**（刚开开关的数据预热期，`last_speak` 还没攒够，不判）。
+    - 否则进入逐人判定。
+  - **窗口过后无个体豁免**：宽限期一过，**所有领取者（含新进群者）一律按 `last_speak` 判**，伸手党**不使用 `first_seen`**。与 `#潜水`（GroupAdmin，新成员按 first_seen 给豁免期）刻意区分——「进群就抢、抢前没发言」即判。
+- **复用红包排除名单豁免**：判定线程起线程前 `fExcl = getExcludeList(talker)`（红包提醒的排除名单）；逐人时 `fExcl.contains(w)` → 跳过该领取者（即使应判）。
+- **逐人判定（窗口过后）**：`ls = rpQueryLastSpeak(talker, w)`；`ls<0`（无行/DB 不可用）→ 跳过（安全网）；`inactive = (ls==0)||(ls<thr)`（NULL=从未发言，或早于「窗口+flush 容差」）；命中 → `sendText(talker, "[AtWx=" + w + "] 警告 " + win + "分钟内未发言")`，`warned++`，`Thread.sleep(800)`；`warned>=FREELOADER_MAX_WARN` 计 `capped` 不发；末尾 `hbBgLog warned/capped/总数`。
+- **隐私**：撤销 DRY-RUN 的 `[GFDBG]` 昵称日志；判定日志只记 `tail4`（wxid 尾 4）+ `NULL/old` + 计数，不落昵称、不落完整 wxid（`[AtWx=wxid]` 仅出现在发往微信的命令文本中，是机制本身，不入 log 文件）。
+- **不变项**：`rpQueryLastSpeak` 不改；后台 fire-and-forget 线程 / `FREELOADER_MAX_WARN=10` / `FREELOADER_FLUSH_GRACE_MS=60s` / `JOB_DETECTMS` 基准 / `onHandleMsg` 零热路径全部不变。`since` 写入只在命令/Dialog 路径（非热路径）。
+- **默认关 + 启用提示**：`rp_freeloader_on_<gid>` 仍默认空（关）。⚠️ 因 `last_speak` 刚修复+重置仍大量 NULL（自愈中），30min 全局宽限盖不住多小时自愈期；**建议数据自愈后或仅在小测试群临时开**，启用即累计可触发 GroupAdmin 踢人。

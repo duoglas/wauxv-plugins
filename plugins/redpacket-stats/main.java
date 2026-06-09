@@ -1,3 +1,4 @@
+// RedPacketStats — v1.11.3 — 在 v1.11.2 之上 (伸手党收尾, SPEC §25.9): 撤 DRY-RUN/GFDBG 调试态、恢复真发送警告。豁免模型改为「全局开关时刻宽限」: 新增 per-group 键 rp_freeloader_since_<gid>(命令『伸手党 开』/Dialog OFF→ON 时写当前 ms), 判定段先闸门 — since<=0(无锚点, 安全网跳过) 或 红包检测时刻 packetMs 在 since+winMs 内 → 整包跳过(全员豁免, 刚开开关数据预热期); 宽限后所有领取者(含新进群)按 last_speak 判, 不用 first_seen(与潜水区分)。复用红包排除名单 getExcludeList 豁免领取者。后台线程/cap10/容差/安全网/命令/Dialog 不变, 日志脱敏(仅尾4/计数)。默认关。
 // RedPacketStats — v1.11.2 — 在 v1.11.1 之上: 伸手党判定基准从「每人领取时刻」改为「红包检测时刻」(全员统一, SPEC §25)。原因: 真机确认当前微信版本领取者反射模型无 per-person 领取时刻字段(g 取不到, 无任何时间戳数值字段)。改用红包检测/到达时刻(onHandleMsg 检测入队那一刻, ≈红包发出时刻)做基准, 语义=「红包来之前 N 分钟你在不在场」。Job 增 JOB_DETECTMS 第 10 槽承载检测时刻(入队 O(1) 只塞一个已算好的 long, 重试透传不改基准); 撤掉 hbExtractTriple 的 g/grabMs 提取(返回回 4 元素)+receivers 回 3 元素{nick,amount,wxid}; 删临时 GPROBE 诊断。后台线程/上限 FREELOADER_MAX_WARN/容差 FREELOADER_FLUSH_GRACE_MS/安全网 全不变。
 // RedPacketStats — v1.11.1 — 在 v1.11.0 之上 (Santa 修复): 伸手党判定整段移入独立 fire-and-forget 后台线程 (不占 IN_FLIGHT 单飞锁/不撞看门狗 30s; 闭包变量 fTalker+fSnap 快照均 final) + 警告人数上限 FREELOADER_MAX_WARN=10 (超出 capped 留痕不静默截断) + last_speak flush 容差 FREELOADER_FLUSH_GRACE_MS=60s (防抢前刚发言未落盘误判: 判定式 ls<grabMs-winMs-容差)。
 // RedPacketStats — v1.11.0 — 在 v1.10.0 之上: 红包伸手党治理 (SPEC §25) — 抢红包者在抢到时刻前 N 分(默认30, rp_freeloader_win_<gid>)未在群发言 → 后台反射线程自动发群管警告命令 `[AtWx=wxid] 警告 {N}分钟内未发言`, 交 GroupAdmin v1.19.0 按原流程执行(累计可触发踢人)。
@@ -274,6 +275,7 @@ String K_AT_LIMIT = "rp_at_limit";
 // v1.11.0 §25: 红包伸手党治理 (per-group)。抢到红包者在抢到时刻前 N 分未在群发言 → 发群管警告命令。
 String K_FREELOADER_ON_PREFIX = "rp_freeloader_on_";    // 开关: rp_freeloader_on_<gid> = "1"/"" (默认关)
 String K_FREELOADER_WIN_PREFIX = "rp_freeloader_win_";  // 窗口(分钟): rp_freeloader_win_<gid> (1-1440, 默认 30)
+String K_FREELOADER_SINCE_PREFIX = "rp_freeloader_since_"; // v1.11.3 §25.9: 开关打开时刻(ms), OFF→ON 写; 全局宽限锚点
 int DEF_FREELOADER_WIN = 30;
 int FREELOADER_MAX_WARN = 10;                          // v1.11.1 §25: 单次红包警告人数上限(超出留痕不发, 防刷屏)
 long FREELOADER_FLUSH_GRACE_MS = 60000L;               // v1.11.1 §25: last_speak flush 容差(60s, 防抢前刚发言未落盘误判)
@@ -459,7 +461,7 @@ void onLoad() {
         // v1.4.0 §20: 每日定时迁移 (一次性) — 首次把 rp_daily_groups 初始化 = 当前 rp_enabled_groups。
         try { rpDailyMigrateOnce(); } catch (Throwable t) {}
         try { log("RedPacketStats Activity.onResume hooked + onHandleMsg redpacket-stats enabled."); } catch (Throwable t) {}
-        hbBgLog("[RP] " + hbNow() + " v1.11.2 loaded (伸手党判定基准 每人领取时刻→红包检测时刻 全员统一 §25; 原因: 当前微信版本领取者反射模型无 per-person 领取时刻字段; Job 增 JOB_DETECTMS 第10槽承载检测时刻(入队 O(1) 只塞已算好 long, 重试透传); 撤 hbExtractTriple g/grabMs 提取(回 4 元素)+receivers 回 3 元素; 删临时 GPROBE; 后台线程/上限/容差/安全网不变).\\nv1.11.1 loaded (Santa 修复: 伸手党判定整段移入独立 fire-and-forget 后台线程, 不占 IN_FLIGHT 单飞锁/不撞看门狗30s, 闭包 fTalker+fSnap 快照均 final; 警告人数上限 FREELOADER_MAX_WARN=10 超出 capped 留痕不静默截断; last_speak flush 容差 FREELOADER_FLUSH_GRACE_MS=60s 判定式 ls<grabMs-winMs-容差 防刚发言未落盘误判).\\nv1.11.0 loaded (红包伸手党治理 §25: 抢红包者在抢到时刻前 N 分(默认30 rp_freeloader_win_<gid>)未在群发言 → 后台反射线程发群管警告命令 [AtWx=wxid] 警告 {N}分钟内未发言 交 GroupAdmin v1.19.0 执行; hbExtractTriple 增提领取时刻 g(归一为毫秒, 第5元素)+receivers 加 grabMs 第4元素(下游只读[0..2]不越界); 判定在均分跳过之后(仅拼手气)+rpRecordStats 之后; rpQueryLastSpeak 只读查 groupadmin.db speak.last_speak(OPEN_READONLY 用完即关); 安全网 开关关/wxid或grabMs取不到/查询<0(无行或DB不可用) → 跳过; 命令 伸手党 开/关/伸手党窗口 N/伸手党; Dialog 子页🖐伸手党治理+状态增显; 全程后台线程 try/catch, 零 onHandleMsg 热路径, 不直接踢人).\nv1.10.0 loaded (红包重试阶梯加末档「重试3」§3/§4/§15.5: rp_retry3_sec 默认 3600 秒=1 小时 + cfgRetry3(); afterCoverNoDetail 放弃点 attempt>=2→>=3, retrySec 三段阶梯(0→retry1/1→retry2/2→retry3), hbJitter 抖动公式不动; 延迟子页加 d3 重试3 EditText+onSave 写 K_RETRY3; 命令『红包延迟』加 4 参分支(保留空/1/3 参); 状态+当前延迟 toast 增列重试3; worker 主干/检测/入队/统计/定时/onHandleMsg 热路径零改, cfgRetry3 仅 afterCoverNoDetail 读).\nv1.9.2 loaded (每日定时开关+推送时间(全局)迁入「📮 转发对象」子页 §24/§20: showPageForward 加 📅本群每日定时开关(即时 enable/disableDailyGroup→刷新本页)+⏰每日推送时间 EditText(子页💾保存校验 0-23 写 K_DAILY_HOUR 全局); showPageBasic 移走每日定时 toggle 只留本群启用; 定时开关函数/cfgDailyHour 夹取/存储键不动, 只动 Dialog 展示层, worker/onHandleMsg 热路径零改).\nv1.9.1 loaded (转发对象 全局→按群 §24: rp_export_target_<gid>/name_<gid> + cfgExportTargetFor/NameFor 回退全局默认(向后兼容: 未设群=旧行为); rpApplyForwardTarget(groupId,...) 写按群键 + rpPickTarget/showPageForward 作用当前群; rpBuildGroupedMsgs 返回 List<Object[]{grp,msg}>, rpExportToday/rpDailySend 发送循环按 cfgExportTargetFor(grp) 路由到各自目标, 无达标心跳仍发全局默认; sendForwardNotice(groupId,target) 通知只讲当前群; 状态/子页按群显示; worker/检测/写库/onHandleMsg 热路径零改).\nv1.9.0 loaded (转发对象可选好友/群 §24: getFriendList/getGroupList 选择器 + rp_export_target_name + 设置后通知 sendForwardNotice; 后台线程加载 list+Handler 回主线程弹单选 AlertDialog 防 ANR(§7), sCachedFriendList/sCachedGroupList 缓存; 只动 Dialog(showPageForward 入口)+发送层, 每日定时/手动导出仍用 cfgExportTarget() 逻辑不动, onHandleMsg 热路径零改).\nv1.8.1 loaded (修主菜单关闭失效=对话框堆叠(menuHolder 捕获, 入口按钮开子页前 dismiss 主菜单)+排除名单显示名字(rpSenderName, 昵称（…尾4）); 仍只动 Dialog 层).\nv1.8.0 loaded (设置页拆分 §23: 主菜单 showConfigDialog(状态摘要+入口按钮) + 二级子页 showPageBasic/NormalTiers/Custom/Delay/Exclude, 每子页只写本页 key, 保存/返回回主菜单, 导出为主菜单直接动作; 只动 Dialog 展示层, worker/onHandleMsg 热路径/文字命令/存储键/校验/即时生效逻辑全不动, 只构建 Dialog 无 UI 遍历 §7, 每页整段 try/catch).\nv1.7.2 loaded (定制包第二条@消息【查包】前缀加「定制包」→【查包】定制包, §22.6, isCustom?checkPrefix; 其余不动).\nv1.7.1 loaded (定制判定 前缀→包含 §22.2: rpIsCustom title.contains(kw)(原 startsWith), 修「【定制】…」被【】包裹漏判; 定制包第一条群规文本 §22.6: rp_custom_rule_prefix_<gid>(默认「定制包请按要求执行」)+cfgCustomRulePrefix, hbTierAndSend 第一条前缀 isCustom?定制:普通, 各档仍「，过{阈值}元{动作}」(定制档表); 第二条@/【查包】机制一行不动; 命令 定制群规前缀 <文字>+Dialog 定制区块「定制群规前缀」+状态增显; 限频/排除/分档/两条消息骨架/抖动/ANR/onHandleMsg 热路径全不动).\nv1.7.0 loaded (包类型 普通/定制 SPEC §22: rp_custom_on/kw/tiers_custom per-group, 默认全关=逐字节兼容; 类型判定全在 worker(hbProcess)rpIsCustom(title包含kw), 回填 Job 第9槽 JOB_ISCUSTOM→hbDetailExtract→hbTierAndSend; onHandleMsg 热路径零改动(只塞常量 Boolean.FALSE); 选档 getTiersByType(定制读 rp_tiers_custom 未配回退普通), 限频/排除/分档/两条消息/ANR 全不动; 命令 定制阈值/定制文案K/定制增加档/定制减少档/定制关键字; Dialog 定制区块(开关仅此处改)+状态增显).\nv1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
+        hbBgLog("[RP] " + hbNow() + " v1.11.3 loaded (伸手党收尾 §25.9: 撤 DRY-RUN/GFDBG 恢复真发送; 豁免改全局开关时刻宽限 rp_freeloader_since_<gid>(OFF→ON 写当前ms, 命令/Dialog 两入口), 判定段 since<=0 或 packetMs 在 since+winMs 内 → 整包跳过(全员豁免预热期), 之后按 last_speak 判(不用 first_seen); 复用排除名单 getExcludeList 豁免; 后台线程/cap10/容差/安全网/命令/Dialog 不变, 日志脱敏(尾4/计数); 默认关).\\nv1.11.2 loaded (伸手党判定基准 每人领取时刻→红包检测时刻 全员统一 §25; 原因: 当前微信版本领取者反射模型无 per-person 领取时刻字段; Job 增 JOB_DETECTMS 第10槽承载检测时刻(入队 O(1) 只塞已算好 long, 重试透传); 撤 hbExtractTriple g/grabMs 提取(回 4 元素)+receivers 回 3 元素; 删临时 GPROBE; 后台线程/上限/容差/安全网不变).\\nv1.11.1 loaded (Santa 修复: 伸手党判定整段移入独立 fire-and-forget 后台线程, 不占 IN_FLIGHT 单飞锁/不撞看门狗30s, 闭包 fTalker+fSnap 快照均 final; 警告人数上限 FREELOADER_MAX_WARN=10 超出 capped 留痕不静默截断; last_speak flush 容差 FREELOADER_FLUSH_GRACE_MS=60s 判定式 ls<grabMs-winMs-容差 防刚发言未落盘误判).\\nv1.11.0 loaded (红包伸手党治理 §25: 抢红包者在抢到时刻前 N 分(默认30 rp_freeloader_win_<gid>)未在群发言 → 后台反射线程发群管警告命令 [AtWx=wxid] 警告 {N}分钟内未发言 交 GroupAdmin v1.19.0 执行; hbExtractTriple 增提领取时刻 g(归一为毫秒, 第5元素)+receivers 加 grabMs 第4元素(下游只读[0..2]不越界); 判定在均分跳过之后(仅拼手气)+rpRecordStats 之后; rpQueryLastSpeak 只读查 groupadmin.db speak.last_speak(OPEN_READONLY 用完即关); 安全网 开关关/wxid或grabMs取不到/查询<0(无行或DB不可用) → 跳过; 命令 伸手党 开/关/伸手党窗口 N/伸手党; Dialog 子页🖐伸手党治理+状态增显; 全程后台线程 try/catch, 零 onHandleMsg 热路径, 不直接踢人).\nv1.10.0 loaded (红包重试阶梯加末档「重试3」§3/§4/§15.5: rp_retry3_sec 默认 3600 秒=1 小时 + cfgRetry3(); afterCoverNoDetail 放弃点 attempt>=2→>=3, retrySec 三段阶梯(0→retry1/1→retry2/2→retry3), hbJitter 抖动公式不动; 延迟子页加 d3 重试3 EditText+onSave 写 K_RETRY3; 命令『红包延迟』加 4 参分支(保留空/1/3 参); 状态+当前延迟 toast 增列重试3; worker 主干/检测/入队/统计/定时/onHandleMsg 热路径零改, cfgRetry3 仅 afterCoverNoDetail 读).\nv1.9.2 loaded (每日定时开关+推送时间(全局)迁入「📮 转发对象」子页 §24/§20: showPageForward 加 📅本群每日定时开关(即时 enable/disableDailyGroup→刷新本页)+⏰每日推送时间 EditText(子页💾保存校验 0-23 写 K_DAILY_HOUR 全局); showPageBasic 移走每日定时 toggle 只留本群启用; 定时开关函数/cfgDailyHour 夹取/存储键不动, 只动 Dialog 展示层, worker/onHandleMsg 热路径零改).\nv1.9.1 loaded (转发对象 全局→按群 §24: rp_export_target_<gid>/name_<gid> + cfgExportTargetFor/NameFor 回退全局默认(向后兼容: 未设群=旧行为); rpApplyForwardTarget(groupId,...) 写按群键 + rpPickTarget/showPageForward 作用当前群; rpBuildGroupedMsgs 返回 List<Object[]{grp,msg}>, rpExportToday/rpDailySend 发送循环按 cfgExportTargetFor(grp) 路由到各自目标, 无达标心跳仍发全局默认; sendForwardNotice(groupId,target) 通知只讲当前群; 状态/子页按群显示; worker/检测/写库/onHandleMsg 热路径零改).\nv1.9.0 loaded (转发对象可选好友/群 §24: getFriendList/getGroupList 选择器 + rp_export_target_name + 设置后通知 sendForwardNotice; 后台线程加载 list+Handler 回主线程弹单选 AlertDialog 防 ANR(§7), sCachedFriendList/sCachedGroupList 缓存; 只动 Dialog(showPageForward 入口)+发送层, 每日定时/手动导出仍用 cfgExportTarget() 逻辑不动, onHandleMsg 热路径零改).\nv1.8.1 loaded (修主菜单关闭失效=对话框堆叠(menuHolder 捕获, 入口按钮开子页前 dismiss 主菜单)+排除名单显示名字(rpSenderName, 昵称（…尾4）); 仍只动 Dialog 层).\nv1.8.0 loaded (设置页拆分 §23: 主菜单 showConfigDialog(状态摘要+入口按钮) + 二级子页 showPageBasic/NormalTiers/Custom/Delay/Exclude, 每子页只写本页 key, 保存/返回回主菜单, 导出为主菜单直接动作; 只动 Dialog 展示层, worker/onHandleMsg 热路径/文字命令/存储键/校验/即时生效逻辑全不动, 只构建 Dialog 无 UI 遍历 §7, 每页整段 try/catch).\nv1.7.2 loaded (定制包第二条@消息【查包】前缀加「定制包」→【查包】定制包, §22.6, isCustom?checkPrefix; 其余不动).\nv1.7.1 loaded (定制判定 前缀→包含 §22.2: rpIsCustom title.contains(kw)(原 startsWith), 修「【定制】…」被【】包裹漏判; 定制包第一条群规文本 §22.6: rp_custom_rule_prefix_<gid>(默认「定制包请按要求执行」)+cfgCustomRulePrefix, hbTierAndSend 第一条前缀 isCustom?定制:普通, 各档仍「，过{阈值}元{动作}」(定制档表); 第二条@/【查包】机制一行不动; 命令 定制群规前缀 <文字>+Dialog 定制区块「定制群规前缀」+状态增显; 限频/排除/分档/两条消息骨架/抖动/ANR/onHandleMsg 热路径全不动).\nv1.7.0 loaded (包类型 普通/定制 SPEC §22: rp_custom_on/kw/tiers_custom per-group, 默认全关=逐字节兼容; 类型判定全在 worker(hbProcess)rpIsCustom(title包含kw), 回填 Job 第9槽 JOB_ISCUSTOM→hbDetailExtract→hbTierAndSend; onHandleMsg 热路径零改动(只塞常量 Boolean.FALSE); 选档 getTiersByType(定制读 rp_tiers_custom 未配回退普通), 限频/排除/分档/两条消息/ANR 全不动; 命令 定制阈值/定制文案K/定制增加档/定制减少档/定制关键字; Dialog 定制区块(开关仅此处改)+状态增显).\nv1.6.4 loaded (enabled 群内存缓存: isGroupEnabled 走 RP_ENABLED_CACHE(HashSet,TTL=60s,enable/disable 后立即刷新), 消除红包消息热路径最后一处 per-红包 FUSE 读 ~26ms; 缓存出错回退直接读 getString 保正确; 只动读路径+缓存维护, 检测/入队/worker/分档/发送/统计/定时/导出全不动, spike 埋点保留).\nv1.6.3 loaded (C-PERF-03: 红包检测重活(extract/专属判定 XML解析)移出热路径到后台 worker — 热路径只做廉价判定(type/含<nativeurl>)+入队原始content; 去重 key 改廉价 k:talker:sender:msgid(不依赖 nativeurl parse); worker(hbProcess)出队后做 专属早退/nativeurl/rpExtractTitle, title 回填 job 供写库. 消除红包消息 ~267ms 热路径 spike. 行为不变只换线程/时机).\nv1.6.2 loaded (spike 归因埋点(诊断用): onHandleMsg 按红包(A)/普通(B)分类计时 PERF_RP_*/PERF_NORM_*, spike(>50ms)分 spike_rp/spike_norm; perf.log 追加 rp_msg_*/norm_*/spike_*/rp_extract_*; 仅 nanoTime+整型, 不碰业务逻辑, try/catch 不影响消息).\nv1.6.1 loaded (档位上限 4→10 RP_MAX_TIERS; 修红包文案K 两位数解析 bug(前导整数 1-RP_MAX_TIERS); 全量保存错误检测加强(阈值/增加档/Dialog 逐行校验+行号错误, 全无效不保存不破坏原表); onHandleMsg 热路径仍零 getTiers/setTiers).\nv1.6.0a loaded (修订: 未设档动作不泄漏进群消息 — 群规第一条/@条渲染时把占位\"未设\"/空动作当作暂无动作, 只发阈值不发动作词; 存储/解析/getTiers/setTiers/分档/热路径全不动; 管理员可见处(红包统计状态/配置Dialog)仍保留\"未设\"提示).\nv1.6.0 loaded (per-group 1-4 tiers: rp_tiers_<gid>, 未配置群回退全局三档; 命令 红包阈值/红包文案K/红包增加档/红包减少档 全作用当前群; hbTierAndSend+rpRecordStats 改 N 档循环; getTiers 只在 bg/UI 调不碰热路径).\nv1.5.0 (grouped export: per-group one msg, multi-line format; export/daily-send 组装/分条/发送循环重写, SQL ORDER BY grp,ts; 热路径/写库/录入范围/WHERE 不变).\nv1.4.0 (sender group-nickname fix + daily scheduled stats §20 + perf instrumentation). per-group enable (default OFF), config via onClickSendBtn (NOT to group), dialog, "
             + "[v1.6.3] detect(廉价 type/含<nativeurl>)→enqueue raw content(dedup k:talker:sender:msgid,dueAt=now+delay jittered)→[worker tick single-flight]→hbProcess(CUR_JOB,后台):parse[skip exclusive→nativeurl→extract title 回填 job]→open cover→[手气→detail|查看领取详情→skip normal cover|no-entry→re-enqueue retry(2x,jittered)]→reflect(jittered,bg thread)→[skip normal/equal]→[stats-db INSERT OR REPLACE (qualified>=1, bg thread only, try/catch degrade)]→finish→exclude-filter→rate-limit→tier(random variant)→send(quote-rule + at). "
             + "v1.3.0: 在 v1.2.0(队列+两条消息定版)之上加回统计 DB(§17, redpacket_stats.db, rp_record 一红包一行, 仅后台反射线程写, 可降级) + 导出今日红包统计→私聊(§18, Dialog 按钮, sendText 给 rp_export_target) + 标题提取(§17.3) + 嗅探调试日志(title usedField/len, stats-db opened, export sent N). DB 存真实昵称/金额/wxid(本地存储), hbBgLog 仍只记计数(脱敏). 两条消息逻辑一行未动. "
             + "v1.1.4: 发两条修正(§16) — 第一条(引用群规)=固定简洁(cfgRulePrefix+\"过{t}元{动作}\"三档, 无随机无语气); 第二条(@)=随机(pickConnector+pickActionPhrase+[AtWx=]), 隔 rp_two_msg_gap_sec 秒(默认3,可配)延迟发以保序(delay+final捕获,fire-and-forget,不进在飞锁). >at上限只发第一条无第二条无延迟. 只改 hbTierAndSend. "
@@ -833,6 +835,11 @@ boolean cfgFreeloaderOn(String gid) { try { return "1".equals(getString(K_FREELO
 int cfgFreeloaderWin(String gid) {
     try { int v = Integer.parseInt(getString(K_FREELOADER_WIN_PREFIX + normGroupId(gid), "").trim()); return (v >= 1 && v <= 1440) ? v : DEF_FREELOADER_WIN; }
     catch (Throwable t) { return DEF_FREELOADER_WIN; }
+}
+// v1.11.3 §25.9: 开关打开时刻 (ms)。OFF→ON 时写当前时刻; 0 = 未记录 (安全网: 判定段 since<=0 整包跳过)。
+long cfgFreeloaderSince(String gid) {
+    try { long v = Long.parseLong(getString(K_FREELOADER_SINCE_PREFIX + normGroupId(gid), "").trim()); return (v > 0L) ? v : 0L; }
+    catch (Throwable t) { return 0L; }
 }
 long cfgMsgGap() { return cfgLong(K_MSG_GAP, DEF_MSG_GAP); }
 long cfgTwoMsgGap() { return cfgLong(K_TWO_MSG_GAP, DEF_TWO_MSG_GAP); }   // v1.1.4 §16
@@ -1488,7 +1495,12 @@ boolean onClickSendBtn(String text) {
         if (content.equals("伸手党 开") || content.equals("伸手党开")) {
             String groupId = rpCurrentGroupOrToast();
             if (groupId == null) return true;
-            try { putString(K_FREELOADER_ON_PREFIX + groupId, "1"); toast("✅ 已开启本群伸手党治理 (抢到前" + cfgFreeloaderWin(groupId) + "分钟未发言 → 发群管警告)"); } catch (Throwable t) {}
+            try {
+                boolean wasOn = cfgFreeloaderOn(groupId);   // v1.11.3 §25.9: 仅 OFF→ON 写 since, 不重置宽限
+                putString(K_FREELOADER_ON_PREFIX + groupId, "1");
+                if (!wasOn) putString(K_FREELOADER_SINCE_PREFIX + groupId, String.valueOf(System.currentTimeMillis()));
+                toast("✅ 已开启本群伸手党治理 (开后" + cfgFreeloaderWin(groupId) + "分钟内全员豁免, 之后抢到前未发言 → 发群管警告)");
+            } catch (Throwable t) {}
             return true;
         }
         if (content.equals("伸手党 关") || content.equals("伸手党关")) {
@@ -2659,15 +2671,16 @@ void hbDetailExtract(Object root, String key) {
         try { rpRecordStats(key, talker, jobSender, jobTitle, receivers); }
         catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " stats-db: write threw (ignored, degrade): " + t); }
 
-        // v1.11.2 §25: 伸手党判定 — 基准=红包检测时刻 job[JOB_DETECTMS](全员统一; 当前微信版本领取者模型无 per-person 领取时刻)。
-        // 整段移入 fire-and-forget 后台线程(不占 IN_FLIGHT 单飞锁); 安全网: packetMs<=0/开关关/ls<0/上限 → 跳过; flush 容差防刚发言误判。
+        // v1.11.3 §25.9 伸手党判定 (全后台 fire-and-forget 线程, 零热路径; 破坏性上游=最终累计触发群管踢人, 安全网严格)。
+        // 判定: 全局开关时刻宽限(§25.9) → 逐领取者(排除名单豁免 → rpQueryLastSpeak NULL/早于窗口 → 发群管警告)。基准=红包检测时刻 job[JOB_DETECTMS]。
         try {
             long packetMs = 0L;
             try { if (job != null && job[JOB_DETECTMS] != null) packetMs = ((Long) job[JOB_DETECTMS]).longValue(); } catch (Throwable t) { packetMs = 0L; }
             if (talker != null && packetMs > 0L && cfgFreeloaderOn(talker)) {
                 final String fTalker = talker;
                 final long fPacketMs = packetMs;
-                final java.util.List fSnap = new java.util.ArrayList();
+                final java.util.List fExcl = getExcludeList(talker);   // 复用红包提醒排除名单做豁免
+                final java.util.List fSnap = new java.util.ArrayList();   // 仅 wxid 快照 (v1.11.2 起)
                 for (int i = 0; i < receivers.size(); i++) {
                     Object[] r = (Object[]) receivers.get(i);
                     String w = (r.length > 2) ? (String) r[2] : null;
@@ -2676,22 +2689,32 @@ void hbDetailExtract(Object root, String key) {
                 new Thread(new Runnable() {
                     public void run() {
                         try {
+                            long since = cfgFreeloaderSince(fTalker);
                             int win = cfgFreeloaderWin(fTalker);
                             long winMs = (long) win * 60000L;
-                            int warned = 0, capped = 0;
+                            // 全局开关时刻宽限 (§25.9): since<=0 无锚点(安全网, 跳过); packetMs 在 since+winMs 内 → 全员豁免(刚开开关数据预热期)。
+                            if (since <= 0L) { hbBgLog("[RP] " + hbNow() + " freeloader skip: no since anchor."); return; }
+                            if (fPacketMs - since < winMs) { hbBgLog("[RP] " + hbNow() + " freeloader skip: within activation grace (" + win + "min)."); return; }
+                            long thr = fPacketMs - winMs - FREELOADER_FLUSH_GRACE_MS;
+                            int warned = 0;
+                            int capped = 0;
                             for (int i = 0; i < fSnap.size(); i++) {
                                 String w = (String) fSnap.get(i);
+                                if (w == null || w.isEmpty()) continue;
+                                if (fExcl != null && fExcl.contains(w)) continue;   // 排除名单豁免
                                 long ls = rpQueryLastSpeak(fTalker, w);
-                                if (ls < 0L) continue;                                   // 无 speak 行/DB 不可用 → 跳过
-                                if (ls == 0L || ls < fPacketMs - winMs - FREELOADER_FLUSH_GRACE_MS) {   // 从未发言 或 红包前 N 分(含容差)无发言
-                                    if (warned >= FREELOADER_MAX_WARN) { capped++; continue; }
-                                    sendText(fTalker, "[AtWx=" + w + "] 警告 " + win + "分钟内未发言");
-                                    warned++;
-                                    try { Thread.sleep(800L); } catch (Throwable t) {}
-                                }
+                                if (ls < 0L) continue;                              // 安全网: 无 speak 行 / DB 不可用 → 跳过
+                                boolean inactive = (ls == 0L) || (ls < thr);        // NULL=从未发言, 或 早于(窗口+容差)
+                                if (!inactive) continue;
+                                if (warned >= FREELOADER_MAX_WARN) { capped++; continue; }
+                                sendText(fTalker, "[AtWx=" + w + "] 警告 " + win + "分钟内未发言");
+                                warned++;
+                                String tail = (w.length() >= 4) ? w.substring(w.length() - 4) : w;
+                                hbBgLog("[RP] " + hbNow() + " freeloader warn tail=" + tail + " ls=" + (ls == 0L ? "NULL" : "old"));
+                                try { Thread.sleep(800L); } catch (Throwable t) {}
                             }
-                            hbBgLog("[RP] " + hbNow() + " freeloader: win=" + win + "min, warned=" + warned + ", capped=" + capped + "/" + fSnap.size() + " (anchor=packetMs, wxid NOT logged).");
-                        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " freeloader judge err: " + t); }
+                            if (warned > 0 || capped > 0) hbBgLog("[RP] " + hbNow() + " freeloader done warned=" + warned + " capped=" + capped + "/" + fSnap.size() + " win=" + win + "min.");
+                        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " freeloader thread err: " + t); }
                     }
                 }).start();
             }
@@ -3564,7 +3587,7 @@ void showPageFreeloader(final String groupId) {
         final android.widget.EditText winBox = _rpEdit(ctx, String.valueOf(cfgFreeloaderWin(groupId)), true); root.addView(winBox);
 
         android.widget.TextView hint = new android.widget.TextView(ctx);
-        hint.setText("说明: 抢到红包者在抢到时刻往前该窗口内未在本群发言 → 自动发 [警告] 命令交群管执行。只发命令不直接踢人。");
+        hint.setText("说明: 开启后该窗口时长内全员豁免(数据预热); 之后抢到红包者若抢前该窗口内未在本群发言 → 自动发 [警告] 命令交群管执行。排除名单内豁免。只发命令不直接踢人。");
         hint.setTextColor(_rpC("#7C828E"));
         hint.setTextSize(11);
         root.addView(hint);
@@ -3573,7 +3596,9 @@ void showPageFreeloader(final String groupId) {
         Runnable onSave = new Runnable() {
             public void run() {
                 try {
+                    boolean wasOn = cfgFreeloaderOn(fGroupId);   // v1.11.3 §25.9: 仅 OFF→ON 写 since, 不重置宽限
                     putString(K_FREELOADER_ON_PREFIX + fGroupId, onHolder[0] ? "1" : "");
+                    if (onHolder[0] && !wasOn) putString(K_FREELOADER_SINCE_PREFIX + fGroupId, String.valueOf(System.currentTimeMillis()));
                     // 窗口校验 1-1440, 越界/非法不写 (保留原值)。
                     String wv = winBox.getText().toString().trim();
                     boolean winOk = false;
