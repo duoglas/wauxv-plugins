@@ -9,15 +9,15 @@ metadata:
 
 **截至 2026-06-09。换机器/新 session 先看这条接上工作。**
 
-## 待用户确认的后续(伸手党收尾时浮现, 本轮 out-of-scope)
-1. **#潜水 新成员豁免改固定 1 天**?(用户提"潜水豁免1天、伸手党豁免30分钟"区分两者; #潜水 现在豁免=活跃判定同用 `days` 参数, 改成固定 1 天是 GroupAdmin 改动)——**待用户确认再做**。
-2. **GroupAdmin 主动为全体成员补 first_seen 基线**(关闭"入群从不发言者无 speak 行 → 伸手党 rpQueryLastSpeak 返 -1 跳过 → 漏检"的窄缺口); onLoad 现只对无任何基线的群补, 已重置的群不补新成员——**增强项, 安全网偏漏判可接受, 非急**。
+## 后续项(伸手党收尾时浮现)——均已完成 ✅
+1. ✅ **#潜水 新成员豁免改固定 1 天**:GA v1.20.0 已做(`LURK_NEWMEMBER_EXEMPT_MS`)。
+2. ✅ **GroupAdmin 主动补全员 first_seen 基线**:GA v1.20.0 已做(onLoad 对所有已启用群补 + coalesce 防 NULL)。
 
 ## 工作目录已迁 Dropbox
 工作目录 = `~/Dropbox/ops-work/android-ops`（多 Mac 经 Dropbox 同步）。新 session 先 `bash scripts/bootstrap.sh`（自识别机器/adb/scrcpy/手机/root/版本 + 本机记忆为空时从 `docs/memory-snapshot/` 自动 seed）。详见 `docs/ONBOARDING.md`。**写了新记忆后要 `cp ~/.claude/.../memory/*.md docs/memory-snapshot/` 同步回快照**，否则别的机器接不到。
 
 ## 当前部署版本（真机已上）
-- **GroupAdmin v1.19.1**：在 v1.16.3(onLoad 冷启动健壮化 C-PLUGIN-05/VH-02)之上:
+- **GroupAdmin v1.20.0**：在 v1.16.3(onLoad 冷启动健壮化 C-PLUGIN-05/VH-02)之上:
   - v1.17.0 **管理员时效**:加管理可选永久/N天,并行键 `admin_exp_<gid>`(未设=永久,向后兼容);到期惰性清除 `purgeExpiredAdmins`(管理函数入口,不进热路径);@命令 `@TA 管理员 [N]` + Dialog 天数双入口;Dialog 加删静默、群@命令保留群消息。
   - v1.17.1 列表/群消息文案「**有效期至** yyyy-MM-dd」(adminExpiryLabel 同源)。
   - v1.17.2 **@所有人(notify@all)不能踢** — @路径踢/请前置守卫 `_isAtAll`(标记真机待最终确认)。
@@ -26,6 +26,7 @@ metadata:
   - **v1.19.0 警告带理由(2026-06-09)**:`@TA 警告 <理由>` 解析(末token非动作词但前一token="警告"→动作=警告+理由), `doWarn` 双签名(旧3参转调4参), 通知拼 ` · 理由`; **自动来源(理由非空)对豁免对象静默跳过**(不发报错)。手动 `@TA 警告` 不变。为伸手党治理铺路。
   - **v1.19.1 自动来源豁免管理员(Santa 修复)**:`canActOn(owner→admin)=true` 会让自动警告误踢潜水管理员; doWarn auto 分支前置 `if(auto&&(isAdminInGroup||isOwner||isNativeOwner))return;`。
   - **v1.19.2 [严重] recordSpeak last_speak 永卡 NULL(2026-06-09)**:l3Flush 的 UPSERT `last_speak=max(last_speak,excluded)`,**SQLite 标量 `max(NULL,x)=NULL`** → 先被建基线(last_speak=NULL)再发言的成员永远卡 NULL。**影响发言统计/#潜水(活跃者误判从未发言)/伸手党 全失真**(该群 491 人里 404 NULL,很多其实在发言)。修:`max(coalesce(last_speak,excluded),excluded)`(对齐 first_seen 那行本就有的 coalesce)。真机验证:长期 NULL 的活跃成员部署后再发言 last_speak 立即更新。**教训:SQLite UPSERT 里凡 max/min 旧列可能为 NULL,必须 coalesce 兜底**。注:此前 06-08 全群基线重置(first_seen=now)放大了此 bug(全员有 NULL 行)。修复后大家发言逐步自愈。
+  - **v1.20.0 #潜水豁免+基线(2026-06-09, commit 95e012b)**:(1) **#潜水 新成员豁免改固定 1 天**(`LURK_NEWMEMBER_EXEMPT_MS`, 与潜水窗口 days 解耦):豁免 `fst>now-1天`、活跃仍 `lst>now-days天`;冷启动文案改"豁免1天"。语义=`#潜水 7` 列出"进群>1天 且 7天没发言"的人(原"进群>7天"), **名单更全**, 仍手动列表不自动踢。(2) **onLoad 对所有已启用群补 first_seen 基线**(去 `l3CountFirstSeen>0` skip, 幂等只补缺失), 堵"入群从不发言者无 speak 行→红包伸手党 rpQueryLastSpeak 返-1 漏检"窄缝(用户洞见)。(3) **`l3UpsertFirstSeen` coalesce 防 NULL**:`min(first_seen,excluded)`→`min(coalesce(...),excluded)`(对齐 v1.19.2 last_speak 教训)。验证:bsh EXIT=0 + 真机干净加载 baseline check「补基线0 新增0」(全员已有基线) + **受控 DB 实测 coalesce**(NULL→now/更早值保留/无行插入, 老 UPSERT 对比留 NULL 坐实) + Santa 双审(A逻辑PASS; B规格抓到 onLoad catch 块 stale v1.17.0 版本串→修→PASS)。#潜水 名单行为(T1/T2)需手动 scrcpy。设备留底 main.java.bak-before-v1200-20260609。**两个后续(#潜水改1天 + GA补基线)至此都做完**。
   - GroupAdmin 重启即加载。
 - **RedPacketStats v1.11.3**：v1.6.4 基础上累积 包类型(§22)/设置页拆分(§23)/转发对象按群(§24)/重试3(§4)/伸手党治理(§25, v1.11.3 收尾)。
   - 包类型 普通/定制(v1.7.x):定制开关(仅 Dialog)+关键字(**包含匹配**)+定制档表;worker 判定零热路径;定制第一条用定制前缀、第二条「【查包】定制包」。
