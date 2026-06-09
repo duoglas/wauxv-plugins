@@ -1,0 +1,27 @@
+// ============================================================
+// domain/speak — #潜水 三分类纯逻辑(线上 doShowInactive 核心 @1466-1509)。
+// 纯函数：只吃 firstSeen/lastSpeak/now/lurkDays 四个数，无 IO、无全局副作用。
+// now 由调用方(命令层)传入(依赖 CLOCK 取值在调用方完成)，本函数对时间无隐式依赖。
+//
+// 返回码：
+//   0 = NO_BASELINE  firstSeen==null(无基线；线上做法是补 first_seen 后跳过本轮)
+//   1 = NEW_EXEMPT   进群不足 LURK_NEWMEMBER_EXEMPT_MS(1 天) → 新成员豁免
+//   2 = ACTIVE       lastSpeak 在潜水窗口内(> cutoff) → 活跃
+//   3 = LURKER       有基线、非新成员、窗口内无发言(含从未发言) → 潜水
+//
+// 注：线上把 bot/管理员/群主/原生群主/保护名单成员在分类「之前」就 continue 排除了，
+//     那是调用方(命令层)的过滤，不属本纯函数。
+// ============================================================
+
+// 新成员豁免窗口(@1448)：固定 1 天，与潜水窗口 days 解耦。
+LURK_NEWMEMBER_EXEMPT_MS = 86400000L;
+DAY_MS = 86400000L;
+
+int lurkClassify(Long firstSeen, Long lastSpeak, long now, int lurkDays) {
+    long exemptCutoff = now - LURK_NEWMEMBER_EXEMPT_MS;
+    long cutoff = now - (long) lurkDays * DAY_MS;
+    if (firstSeen == null) return 0;                                   // NO_BASELINE
+    if (firstSeen.longValue() > exemptCutoff) return 1;               // NEW_EXEMPT
+    if (lastSpeak != null && lastSpeak.longValue() > cutoff) return 2; // ACTIVE
+    return 3;                                                          // LURKER
+}

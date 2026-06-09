@@ -1,0 +1,41 @@
+// L2 集成：speakRecord 的 last_speak 合并 UPSERT + sqlite-jdbc 真库。
+// 坐实 v1.19.2 coalesce NULL bug 的证明缝：
+//   先建 last_speak=NULL 的基线行(speakUpsertFirstSeen)，再 speakRecord —— 若 SQL 去掉
+//   coalesce，max(NULL,x)=NULL 会让 last_speak 永卡 NULL，本测变红。
+// 运行 cwd = merged/，classpath 含 sqlite-jdbc.jar。
+import java.sql.*;
+source("tests/_harness.bsh");
+source("src/domain/speak_store.bsh");
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(SPEAK_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+long T0 = 1700000000000L;
+long T1 = 1749470000000L;
+
+// 1) 造 last_speak=NULL 的基线行(first_seen UPSERT 写 last_speak=NULL)
+speakUpsertFirstSeen("g", "w", T0);
+check("基线: last_speak 初始为 NULL", speakQueryLastSpeak("g", "w") == null);
+check("基线: first_seen == T0", speakQueryFirstSeen("g", "w").longValue() == T0);
+
+// 2) 记一次发言 T1 → coalesce 让 NULL→T1(修复后)
+speakRecord("g", "w", T1);
+check("speakRecord(T1): last_speak == T1 (coalesce 兜底 NULL)",
+    speakQueryLastSpeak("g", "w").longValue() == T1);
+
+// 3) 再记更早 ts(T1-100) → max 单调不回退，last_speak 仍 == T1
+speakRecord("g", "w", T1 - 100);
+check("speakRecord(更早 ts): last_speak 仍 == T1 (max 不回退)",
+    speakQueryLastSpeak("g", "w").longValue() == T1);
+check("first_seen 仍 == T0 (min 不改晚)",
+    speakQueryFirstSeen("g", "w").longValue() == T0);
+
+// 4) 全新行(无基线)：speakRecord 直接建行，first_seen 初值=本次 ts
+speakRecord("g", "fresh", T0);
+check("全新行: last_speak == T0", speakQueryLastSpeak("g", "fresh").longValue() == T0);
+check("全新行: first_seen 初值 == T0", speakQueryFirstSeen("g", "fresh").longValue() == T0);
+
+conn.close();
+done();

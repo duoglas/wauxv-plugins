@@ -3,4 +3,9 @@
 # 测试侧不走这里——测试用 source() 直接加载模块 + 测试适配器(见 tests/)。
 # P0 仅含 storage 证明缝；P1+ 逐步加入 core/domain/app 各模块 + app/hooks 里 STORAGE=makeAndroidStorage(db) 的接线。
 src/core/storage_android.bsh
+src/core/host_android.bsh
+src/core/clock_android.bsh
 src/domain/speak_store.bsh
+src/domain/speak.bsh
+src/domain/membership.bsh
+src/domain/warning.bsh

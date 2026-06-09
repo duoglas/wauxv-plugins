@@ -1,0 +1,50 @@
+// 内存型 HostPort + ClockPort（单测用）：KV + 登录身份 + 原生群主探测缝 + 发消息/取名/踢人缝 + 时钟，全部可编程。
+// 不碰 WAuxiliary/反射 —— 单测验证 membership/warning 领域在受控宿主状态下的真值表。
+//
+// HOST 端口契约（生产由 core/host_android.bsh 实现，测试由本 fake 实现）:
+//   HOST.getString(String key, String def)   -> String   命中返存值，否则 def
+//   HOST.putString(String key, String val)   -> void     置入内存 KV
+//   HOST.getLoginWxid()                       -> String   当前登录(机器人)wxid
+//   HOST.detectNativeOwner(String grp)        -> String|null  反射缝；测试可编程
+//   HOST.sendText(String grp, String msg)     -> void     捕获进 FAKE_SENT
+//   HOST.lookupName(String wxid, String grp)  -> String   fake 直接回 wxid
+//   HOST.tryKickSilent(String grp, String wxid) -> boolean  记入 FAKE_KICKED, 返回 FAKE_KICK_RESULT
+// CLOCK 端口契约:
+//   CLOCK.now()                               -> long     返回 FAKE_NOW
+FAKE_KV = new java.util.HashMap();          // key -> value (String)
+FAKE_LOGIN_WXID = "";                        // 可编程：当前登录 wxid
+FAKE_NATIVE = new java.util.HashMap();      // grp -> wxid，detectNativeOwner 查它
+FAKE_SENT = new java.util.ArrayList();      // 捕获 sendText: Object[]{grp,msg}
+FAKE_KICKED = new java.util.ArrayList();    // 捕获 tryKickSilent 的 wxid
+FAKE_KICK_RESULT = true;                     // 可编程：tryKickSilent 返回值
+FAKE_NOW = 1000000L;                         // 可编程：CLOCK.now() 返回值
+
+Object _mkFakeHost() {
+    String getString(String key, String def) {
+        Object v = FAKE_KV.get(key);
+        return (v == null) ? def : v.toString();
+    }
+    // 仅 setup 便利：把键预置进内存 KV。
+    void putString(String key, String val) { FAKE_KV.put(key, val); }
+    String getLoginWxid() { return FAKE_LOGIN_WXID; }
+    String detectNativeOwner(String grp) {
+        Object v = FAKE_NATIVE.get(grp);
+        return (v == null) ? null : v.toString();
+    }
+    void sendText(String grp, String msg) {
+        FAKE_SENT.add(new Object[] { grp, msg });
+    }
+    String lookupName(String wxid, String grp) { return wxid; }
+    boolean tryKickSilent(String grp, String wxid) {
+        FAKE_KICKED.add(wxid);
+        return FAKE_KICK_RESULT;
+    }
+    return this;
+}
+HOST = _mkFakeHost();
+
+Object _mkFakeClock() {
+    long now() { return FAKE_NOW; }
+    return this;
+}
+CLOCK = _mkFakeClock();

@@ -1,1 +1,5 @@
-{"stage":"EXECUTE","since":"2026-06-08T08:43:10.000Z","task":"取证: 潜水统计今天两群把发言者误判潜水的根因(只读DB/perf.log)"}
+{
+  "stage": "EXECUTE",
+  "since": "2026-06-09T08:04:18.804Z",
+  "task": "合并工程 P1-b：warning 领域(doWarn/wn_计数/wk_上限/自动豁免/到顶踢)进 merged/ 骨架 + L1/L2 测试 + check.sh 全绿(纯本地)"
+}

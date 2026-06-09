@@ -13,6 +13,17 @@ SPEAK_UPSERT_FIRSTSEEN_SQL =
 
 SPEAK_QUERY_FIRSTSEEN_SQL = "SELECT first_seen FROM speak WHERE grp=? AND wxid=?";
 
+// 记一次发言：合并 last_speak+first_seen UPSERT(线上 flush SQL @437-439 逐字)。
+// last_speak 取 max(单调不回退)、first_seen 取 min(绝不改晚)；两边都 coalesce 兜底 NULL
+// (否则先建 last_speak=NULL 基线的人 max(NULL,x)=NULL 永卡 NULL — v1.19.2/v1.20.0 咬过两次)。
+SPEAK_UPSERT_LASTSEEN_SQL =
+    "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,?,?) "
+    + "ON CONFLICT(grp,wxid) DO UPDATE SET "
+    + "last_speak=max(coalesce(last_speak,excluded.last_speak),excluded.last_speak), "
+    + "first_seen=min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)";
+
+SPEAK_QUERY_LASTSPEAK_SQL = "SELECT last_speak FROM speak WHERE grp=? AND wxid=?";
+
 // 建表(测试/迁移用；生产由各自 onLoad 建)。
 SPEAK_CREATE_SQL =
     "CREATE TABLE IF NOT EXISTS speak(grp TEXT, wxid TEXT, last_speak INTEGER, first_seen INTEGER, PRIMARY KEY(grp,wxid))";
@@ -25,4 +36,18 @@ void speakUpsertFirstSeen(String grp, String wxid, long ts) {
 // 查 first_seen(无行/NULL → null)。
 Long speakQueryFirstSeen(String grp, String wxid) {
     return STORAGE.queryLong(SPEAK_QUERY_FIRSTSEEN_SQL, new Object[]{ grp, wxid });
+}
+
+// 记一次发言(线上 flush 的存储核心)：last_speak=max、first_seen=min(初值=本次 ts)。
+// 注：线上 recordSpeak 的异步缓冲/延迟 flush/降级(L3_dirtyLs 那套)是热路径 infra，
+//     本期不抽，留给后续 hooks 集成；此处只保 SQL+绑定语义的存储动作。
+// 绑定: 1=grp 2=wxid 3=ts(last_speak) 4=ts(first_seen 初值)。
+void speakRecord(String grp, String wxid, long ts) {
+    STORAGE.exec(SPEAK_UPSERT_LASTSEEN_SQL,
+        new Object[]{ grp, wxid, new Long(ts), new Long(ts) });
+}
+
+// 查 last_speak(无行/NULL → null)。
+Long speakQueryLastSpeak(String grp, String wxid) {
+    return STORAGE.queryLong(SPEAK_QUERY_LASTSPEAK_SQL, new Object[]{ grp, wxid });
 }

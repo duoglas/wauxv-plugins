@@ -1,0 +1,117 @@
+// ============================================================
+// domain/membership — 权限/管理员/群主/原生群主 领域逻辑。
+// 只依赖 HostPort(全局 HOST)，不碰 WAuxiliary/反射具体实现 → 可本地测。
+// 端口契约: HOST.getString(key,def)->String ; HOST.getLoginWxid()->String ;
+//           HOST.detectNativeOwner(grp)->String|null
+//
+// 键名与线上 plugins/group-admin/main.java 逐字保真，不许改:
+//   super_owners            群主 CSV                                 (@1728)
+//   admins_<normGroupId>    本群管理员 CSV(键用 norm 后的 gid)        (@1737)
+//   nat_owner_<裸gid>       原生群主 CSV(键用【裸 gid】，不 norm)      (@782)
+//
+// 逻辑逐字照搬线上 canActOn(@1851)，不查 admin_exp 时效(线上靠命令入口惰性清,不在此引入)。
+// parseCsv/normGroupId 暂置此处(纯工具，后续可移 core/util，本期 YAGNI 不动)。
+// ============================================================
+
+// parseCsv (@540): null/empty→空表; split(","); trim; 非空才 add。
+List parseCsv(String csv) {
+    List r = new ArrayList();
+    if (csv == null || csv.isEmpty()) return r;
+    String[] arr = csv.split(",");
+    for (int i = 0; i < arr.length; i++) {
+        String s = arr[i].trim();
+        if (!s.isEmpty()) r.add(s);
+    }
+    return r;
+}
+
+// joinCsv (@551): List → "a,b,c"。逐字照搬(无 trim，元素直接拼)。
+String joinCsv(List list) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < list.size(); i++) {
+        if (i > 0) sb.append(",");
+        sb.append(list.get(i));
+    }
+    return sb.toString();
+}
+
+// normGroupId (@560): 复杂版逐字照搬。
+String normGroupId(String groupId) {
+    if (groupId == null) return "";
+    String s = groupId.trim().replace(" ", "").replace(" ", "").replace(" ", "");
+    int end = s.indexOf("@chatroom");
+    if (end >= 0) {
+        int start = end;
+        while (start > 0) {
+            char ch = s.charAt(start - 1);
+            boolean ok = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-';
+            if (!ok) break;
+            start--;
+        }
+        return s.substring(start, end + 9);
+    }
+    return s;
+}
+
+// 群主 (owners) — 顶层权限,机器人账号自动是。
+List getOwners() { return parseCsv(HOST.getString("super_owners", "")); }
+boolean isOwner(String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    if (wxid.equals(HOST.getLoginWxid())) return true;   // 机器人账号永远是群主
+    return getOwners().contains(wxid);
+}
+
+// 管理员 (admins) — 群主自动是; 额外明确加进来的也是。键用 norm 后的 gid。
+List getAdmins(String groupId) { return parseCsv(HOST.getString("admins_" + normGroupId(groupId), "")); }
+boolean isAdminInGroup(String groupId, String wxid) {
+    if (isOwner(wxid)) return true;
+    if (wxid == null || wxid.isEmpty()) return false;
+    return getAdmins(groupId).contains(wxid);
+}
+
+// 原生群主 — 键用【裸 gid】不 norm (@782 保真照搬)。
+List getNativeOwners(String groupId) { return parseCsv(HOST.getString("nat_owner_" + groupId, "")); }
+boolean isNativeOwner(String groupId, String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    if (getNativeOwners(groupId).contains(wxid)) return true;     // 手动登记
+    String auto = HOST.detectNativeOwner(groupId);                // 自动检测(反射缝)
+    return auto != null && auto.equals(wxid);
+}
+
+// 群主: 能对管理员和普通成员动手, 不能对其他群主
+// 管理员: 只能对普通成员动手
+// 普通: 啥也不能
+boolean canActOn(String groupId, String operator, String target) {
+    if (target == null || target.isEmpty()) return false;
+    if (target.equals(operator)) return false;             // 不能动自己
+    if (target.equals(HOST.getLoginWxid())) return false;  // 不能动机器人
+    // 微信原生群主保护 (登记/检测到的任何人都不能动 — 即使插件群主也不行)
+    if (groupId != null && groupId.indexOf("@chatroom") >= 0) {
+        if (isNativeOwner(groupId, target)) return false;
+    }
+    if (isOwner(operator)) {
+        if (isOwner(target)) return false;                 // 插件群主互不能动
+        return true;
+    }
+    if (isAdminInGroup(groupId, operator)) {
+        if (isAdminInGroup(groupId, target)) return false; // 插件管理不能动管理/群主
+        return true;
+    }
+    return false;
+}
+
+// ============================================================
+// 白名单谓词族 — warning/doWarn 的免罚闸门。键用【裸 groupId】不 norm (@758/@765 保真)。
+//   wt_<裸gid>   本群白名单 CSV                                  (@758)
+//   wt_global    全局白名单 CSV                                  (@765)
+// ============================================================
+List getWhitelist(String groupId) { return parseCsv(HOST.getString("wt_" + groupId, "")); }   // @758
+List getGlobalWhitelist() { return parseCsv(HOST.getString("wt_global", "")); }                // @765
+boolean isGlobalWhitelist(String wxid) {                                                        // @767
+    return wxid != null && !wxid.isEmpty() && getGlobalWhitelist().contains(wxid);
+}
+// 合并视图: 是否在白名单(本群 OR 全局) (@770)
+boolean isWhitelistAny(String groupId, String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    return isGlobalWhitelist(wxid) || getWhitelist(groupId).contains(wxid);
+}

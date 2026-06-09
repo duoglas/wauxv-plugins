@@ -1,0 +1,31 @@
+// L1 单测：membership 领域 vs fake HostPort（canActOn 真值表，无 DB/反射）。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");
+source("src/domain/membership.bsh");
+
+// ---- setup ----
+FAKE_LOGIN_WXID = "bot";
+HOST.putString("super_owners", "owner1,owner2");
+// normGroupId("test@chatroom") == "test@chatroom" → admins 键与裸 gid 一致
+HOST.putString("admins_test@chatroom", "admin1,admin2");
+HOST.putString("nat_owner_test@chatroom", "native1");   // 原生群主键用裸 gid
+String gid = "test@chatroom";
+
+// ---- canActOn 真值表 9 例 ----
+check("1 群主互不能动 owner1→owner2",      canActOn(gid, "owner1", "owner2")  == false);
+check("2 群主→普通 owner1→normalX",        canActOn(gid, "owner1", "normalX") == true);
+check("3 管理互不能动 admin1→admin2",      canActOn(gid, "admin1", "admin2")  == false);
+check("4 管理→普通 admin1→normalX",        canActOn(gid, "admin1", "normalX") == true);
+check("5 不能动自己 admin1→admin1",        canActOn(gid, "admin1", "admin1")  == false);
+check("6 不能动机器人 admin1→bot",         canActOn(gid, "admin1", "bot")     == false);
+check("7 连群主都不能动原生群主 owner1→native1", canActOn(gid, "owner1", "native1") == false);
+check("8 普通无权 normalA→normalB",        canActOn(gid, "normalA", "normalB") == false);
+check("9 target 空 owner1→\"\"",           canActOn(gid, "owner1", "")        == false);
+
+// ---- detectNativeOwner 反射缝验证：自动检测到的原生群主也不能动 ----
+FAKE_NATIVE.put("test@chatroom", "native2");
+check("10 自动检测原生群主也不能动 owner1→native2", canActOn(gid, "owner1", "native2") == false);
+FAKE_NATIVE.clear();   // 用完清掉
+
+done();

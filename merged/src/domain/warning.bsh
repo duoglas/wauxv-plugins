@@ -1,0 +1,134 @@
+// ============================================================
+// domain/warning — 警告/计数/到顶踢 领域逻辑。
+// 依赖: membership.bsh 已加载(canActOn/isOwner/isAdminInGroup/isNativeOwner/isWhitelistAny/parseCsv/joinCsv)。
+// 端口: HOST(getString/putString/sendText/lookupName/tryKickSilent) + CLOCK(now)。
+// 不碰 WAuxiliary/反射具体实现 → 可本地测。
+//
+// 键名与线上 plugins/group-admin/main.java 逐字保真，键用【裸 groupId】不 norm:
+//   wn_<裸gid>_<wxid>   该人累计警告数                            (@1871)
+//   wk_<裸gid>          本群自动踢上限(默认 WARN_AUTO_KICK=10)     (@1882)
+//   wl_<裸gid>          本群被警告者名册 CSV(无 getKeys 故单列维护) (@1899)
+//   wnt_<裸gid>_<wxid>  最近一次警告时刻(毫秒, 走 CLOCK)            (@2726)
+//   wnf_<裸gid>_<wxid>  最近一次警告操作人 wxid                    (@2727)
+//   bp_<裸gid>          机器人群管权限态("none"=无权)              (@674)
+//
+// doWarn/doWarnDec/doWarnClear 逻辑逐字照搬线上(@2710/@2712/@2765/@2774)。
+// ============================================================
+
+int WARN_AUTO_KICK = 10;   // 警告几次自动踢 (默认; 每群可经 wk_<gid> 覆盖) (@55)
+
+// ---- 计数存储 (@1871/@1875) ----
+int getWarn(String groupId, String wxid) {
+    try { return Integer.parseInt(HOST.getString("wn_" + groupId + "_" + wxid, "0")); }
+    catch (Exception e) { return 0; }
+}
+void setWarn(String groupId, String wxid, int n) {
+    if (n <= 0) HOST.putString("wn_" + groupId + "_" + wxid, "0");
+    else HOST.putString("wn_" + groupId + "_" + wxid, "" + n);
+}
+
+// ---- W1: 每群自动踢上限 (@1882/@1893) ----
+int getWarnKick(String groupId) {
+    if (groupId == null) return WARN_AUTO_KICK;
+    String v = HOST.getString("wk_" + groupId, "");
+    if (v == null || v.isEmpty()) return WARN_AUTO_KICK;
+    try {
+        int n = Integer.parseInt(v.trim());
+        if (n < 1) n = 1; if (n > 99) n = 99;
+        return n;
+    } catch (Exception e) { return WARN_AUTO_KICK; }
+}
+int setWarnKick(String groupId, int n) {
+    if (n < 1) n = 1; if (n > 99) n = 99;
+    HOST.putString("wk_" + groupId, String.valueOf(n));
+    return n;
+}
+
+// ---- 被警告者名册 (@1899/@1903/@1910) ----
+List getWarnList(String groupId) { return parseCsv(HOST.getString("wl_" + groupId, "")); }
+void addWarnList(String groupId, String wxid) {
+    List l = getWarnList(groupId);
+    if (!l.contains(wxid)) {
+        l.add(wxid);
+        HOST.putString("wl_" + groupId, joinCsv(l));
+    }
+}
+void delWarnList(String groupId, String wxid) {
+    List l = getWarnList(groupId);
+    if (l.remove(wxid)) HOST.putString("wl_" + groupId, joinCsv(l));
+}
+
+// ---- 机器人群管权限态 (@674): "none"=无群管权限 ----
+String botPrivState(String groupId) { return HOST.getString("bp_" + groupId, "unknown"); }
+
+// ---- doWarn 核心 (@2710 三参转调 + @2712 四参), 逐字保真 ----
+void doWarn(String groupId, String sender, String target) { doWarn(groupId, sender, target, null); }
+void doWarn(String groupId, String sender, String target, String reason) {
+    boolean auto = (reason != null && !reason.trim().isEmpty());
+    // v1.19.1: 自动来源不警告管理员/群主/原生群主 (canActOn 对 owner→admin 不挡, 须显式豁免)。手动(auto=false)不受影响。
+    if (auto && (isAdminInGroup(groupId, target) || isOwner(target) || isNativeOwner(groupId, target))) return;
+    if (!canActOn(groupId, sender, target)) { if (!auto) HOST.sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
+    // v1.12: 白名单(本群+全局)免警告
+    if (isWhitelistAny(groupId, target)) {
+        if (!auto) HOST.sendText(groupId, "🛡 " + HOST.lookupName(target, groupId) + " 在白名单, 不警告");
+        return;
+    }
+    int n = getWarn(groupId, target) + 1;
+    setWarn(groupId, target, n);
+    addWarnList(groupId, target);
+    // v1.12: 记录最近警告时间 + 操作人
+    HOST.putString("wnt_" + groupId + "_" + target, String.valueOf(CLOCK.now()));
+    HOST.putString("wnf_" + groupId + "_" + target, sender);
+
+    String name = HOST.lookupName(target, groupId);
+    String byName = HOST.lookupName(sender, groupId);
+    int kick = getWarnKick(groupId);
+    int remain = kick - n;
+    String why = auto ? (" · " + reason.trim()) : "";
+
+    StringBuilder sb = new StringBuilder();
+    sb.append("[AtWx=").append(target).append("]\n");
+
+    if (n >= kick) {
+        sb.append("🚨 ").append(name).append(" 累计 ").append(n).append("/").append(kick).append(" 自动移除").append(why);
+        HOST.sendText(groupId, sb.toString());
+        if (botPrivState(groupId).equals("none")) {
+            HOST.sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");   // 无权限: 不清零
+        } else {
+            boolean kicked = HOST.tryKickSilent(groupId, target);
+            if (kicked) {
+                // 踢成功才清零
+                setWarn(groupId, target, 0);
+                delWarnList(groupId, target);
+                HOST.putString("wnt_" + groupId + "_" + target, "");
+                HOST.putString("wnf_" + groupId + "_" + target, "");
+            } else {
+                HOST.sendText(groupId, "⚠️ 机器人无群管权限, 未能踢出");   // 踢失败: 不清零
+            }
+        }
+    } else if (n == 1) {
+        sb.append("⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 还剩 ").append(remain).append(" 次").append(why);
+        HOST.sendText(groupId, sb.toString());
+    } else {
+        sb.append("⚠️⚠️ 警告 ").append(n).append("/").append(kick).append(" — ").append(name).append(" 仅剩 ").append(remain).append(" 次, 下次自动踢").append(why);
+        HOST.sendText(groupId, sb.toString());
+    }
+}
+
+// ---- doWarnDec (@2765): 计数 -1, 清零则出名册 ----
+void doWarnDec(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { HOST.sendText(groupId, "❌ 权限不足"); return; }
+    int n = getWarn(groupId, target) - 1;
+    if (n < 0) n = 0;
+    setWarn(groupId, target, n);
+    if (n == 0) delWarnList(groupId, target);
+    HOST.sendText(groupId, "⚠️ " + HOST.lookupName(target, groupId) + " 警告 " + n + "/" + getWarnKick(groupId));
+}
+
+// ---- doWarnClear (@2774): 清零 + 出名册 ----
+void doWarnClear(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { HOST.sendText(groupId, "❌ 权限不足"); return; }
+    setWarn(groupId, target, 0);
+    delWarnList(groupId, target);
+    HOST.sendText(groupId, "✅ " + HOST.lookupName(target, groupId) + " 警告已清零");
+}

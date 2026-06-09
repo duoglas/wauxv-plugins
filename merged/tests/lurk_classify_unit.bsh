@@ -1,0 +1,49 @@
+// L1 单测：lurkClassify 纯函数真值表(无 DB，固定 now/lurkDays)。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("src/domain/speak.bsh");
+
+long NOW = 10000000000L;
+int DAYS = 7;
+long DAY = DAY_MS;
+long cutoff = NOW - (long) DAYS * DAY;        // 窗口下界(活跃需 > 此值)
+long exemptCutoff = NOW - LURK_NEWMEMBER_EXEMPT_MS;  // 新成员豁免下界(进群晚于此则豁免)
+
+// firstSeen=null → NO_BASELINE(0)
+check("null firstSeen → 0 NO_BASELINE",
+    lurkClassify(null, new Long(NOW - 5 * DAY), NOW, DAYS) == 0);
+
+// 新成员(1 小时前进群) → NEW_EXEMPT(1)，不论 lastSpeak
+check("新成员(有发言) → 1 NEW_EXEMPT",
+    lurkClassify(new Long(NOW - 3600000L), new Long(NOW - 2 * DAY), NOW, DAYS) == 1);
+check("新成员(从未发言) → 1 NEW_EXEMPT",
+    lurkClassify(new Long(NOW - 3600000L), null, NOW, DAYS) == 1);
+
+// 老成员 + 窗口内发言 → ACTIVE(2)
+check("老成员+窗口内发言 → 2 ACTIVE",
+    lurkClassify(new Long(NOW - 30 * DAY), new Long(NOW - 2 * DAY), NOW, DAYS) == 2);
+
+// 老成员 + 从未发言 → LURKER(3)
+check("老成员+从未发言 → 3 LURKER",
+    lurkClassify(new Long(NOW - 30 * DAY), null, NOW, DAYS) == 3);
+
+// 老成员 + 窗口外发言 → LURKER(3)
+check("老成员+窗口外发言 → 3 LURKER",
+    lurkClassify(new Long(NOW - 30 * DAY), new Long(NOW - 10 * DAY), NOW, DAYS) == 3);
+
+// 边界: lastSpeak 恰在 cutoff → 不算活跃(> 才算) → LURKER(3)
+check("lastSpeak == cutoff → 3 (>cutoff 才活跃)",
+    lurkClassify(new Long(NOW - 30 * DAY), new Long(cutoff), NOW, DAYS) == 3);
+// 边界: lastSpeak = cutoff+1 → ACTIVE(2)
+check("lastSpeak == cutoff+1 → 2 ACTIVE",
+    lurkClassify(new Long(NOW - 30 * DAY), new Long(cutoff + 1), NOW, DAYS) == 2);
+
+// 边界: firstSeen 恰在 exemptCutoff → 不豁免(> 才豁免)，按 lastSpeak 判
+//   此处 lastSpeak=null → LURKER(3)
+check("firstSeen == exemptCutoff → 不豁免, 按 lastSpeak(null) → 3",
+    lurkClassify(new Long(exemptCutoff), null, NOW, DAYS) == 3);
+// 边界: firstSeen = exemptCutoff+1 → 豁免 NEW_EXEMPT(1)
+check("firstSeen == exemptCutoff+1 → 1 NEW_EXEMPT",
+    lurkClassify(new Long(exemptCutoff + 1), null, NOW, DAYS) == 1);
+
+done();

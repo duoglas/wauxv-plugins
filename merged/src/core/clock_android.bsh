@@ -1,0 +1,18 @@
+// ============================================================
+// core/clock (PROD 适配器) — 时钟端口 ClockPort。
+// 把 System.currentTimeMillis() 隔离到端口后面，使 doWarn 里的"最近警告时刻"可在
+// 单测中被编程(fake CLOCK 返回 FAKE_NOW)，领域逻辑不直接碰墙钟 → 真值表可控可重放。
+//
+// 端口契约(生产由本文件实现，测试由 host_fake.bsh 内的 fake 实现):
+//   CLOCK.now() -> long   当前毫秒时刻
+//
+// 本地不可执行无副作用；接线(CLOCK = makeAndroidClock()) 留到 app/hooks，本期不做。
+// ============================================================
+
+// 转发缝: 隔离静态调用，便于(若需)替换为别的时钟源。
+long _clkNow() { return System.currentTimeMillis(); }
+
+Object makeAndroidClock() {
+    long now() { return _clkNow(); }
+    return this;
+}

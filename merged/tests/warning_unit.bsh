@@ -1,0 +1,87 @@
+// L1 单测：warning 领域 vs fake HostPort/ClockPort（doWarn 真值表，无 DB/反射）。
+// 主断言副作用: wn_ 计数 / FAKE_KICKED / FAKE_SENT / 计数是否清零。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");
+source("src/domain/membership.bsh");
+source("src/domain/warning.bsh");
+
+// ---- setup ----
+FAKE_LOGIN_WXID = "bot";
+HOST.putString("super_owners", "owner1");
+// gid 不含空格 → normGroupId("g@chatroom")=="g@chatroom" → admins 键(norm)与裸 gid 一致
+HOST.putString("admins_g@chatroom", "admin1");
+String gid = "g@chatroom";
+
+// 每例前重置可变状态的小工具。
+void reset() {
+    FAKE_SENT.clear();
+    FAKE_KICKED.clear();
+}
+
+// ---- 真值表 ----
+
+// 1. 手动警告普通人首次
+reset(); HOST.putString("wn_g@chatroom_u1", "0");
+doWarn(gid, "owner1", "u1");
+check("1 首次警告 getWarn==1",        getWarn(gid, "u1") == 1);
+check("1 FAKE_SENT 有1条",            FAKE_SENT.size() == 1);
+check("1 FAKE_KICKED 空",            FAKE_KICKED.isEmpty());
+
+// 2. 累计到上限触发踢(默认10), 踢成功后清零
+reset(); FAKE_KICK_RESULT = true; setWarn(gid, "u2", 9);
+doWarn(gid, "owner1", "u2");
+check("2 触发后清零 getWarn==0",      getWarn(gid, "u2") == 0);
+check("2 FAKE_KICKED 含 u2",         FAKE_KICKED.contains("u2"));
+
+// 3. 踢失败不清零(计数保留=10)
+reset(); FAKE_KICK_RESULT = false; setWarn(gid, "u3", 9);
+doWarn(gid, "owner1", "u3");
+check("3 踢失败 FAKE_KICKED 含 u3",   FAKE_KICKED.contains("u3"));
+check("3 踢失败不清零 getWarn==10",   getWarn(gid, "u3") == 10);
+FAKE_KICK_RESULT = true;   // 复位
+
+// 4. 无群管权限: 不踢不清零
+reset(); HOST.putString("bp_g@chatroom", "none"); setWarn(gid, "u4", 9);
+doWarn(gid, "owner1", "u4");
+check("4 无权不踢 FAKE_KICKED 不含 u4", !FAKE_KICKED.contains("u4"));
+check("4 无权不清零 getWarn==10",      getWarn(gid, "u4") == 10);
+HOST.putString("bp_g@chatroom", "");   // 清掉 bp
+
+// 5. 自动来源豁免管理员: 静默, 计数不动
+reset(); HOST.putString("wn_g@chatroom_admin1", "0");
+doWarn(gid, "owner1", "admin1", "30分钟未发言");
+check("5 自动豁免管理 getWarn==0",     getWarn(gid, "admin1") == 0);
+check("5 自动豁免静默 FAKE_SENT 空",   FAKE_SENT.isEmpty());
+
+// 6. 手动可警告管理员(auto=false 不豁免)
+reset(); HOST.putString("wn_g@chatroom_admin1", "0");
+doWarn(gid, "owner1", "admin1");
+check("6 手动警告管理 getWarn==1",     getWarn(gid, "admin1") == 1);
+
+// 7. 白名单豁免: 计数不动, 手动时发🛡条
+reset(); HOST.putString("wn_g@chatroom_u5", "0"); HOST.putString("wt_g@chatroom", "u5");
+doWarn(gid, "owner1", "u5");
+check("7 白名单豁免 getWarn==0",       getWarn(gid, "u5") == 0);
+check("7 白名单手动发🛡",              FAKE_SENT.size() == 1
+        && ((Object[]) FAKE_SENT.get(0))[1].toString().indexOf("🛡") >= 0);
+HOST.putString("wt_g@chatroom", "");   // 清掉白名单
+
+// 8. 普通人无权(canActOn false): 手动发❌; 自动静默
+reset(); HOST.putString("wn_g@chatroom_u6", "0");
+doWarn(gid, "normalX", "u6");
+check("8 普通无权 getWarn==0",         getWarn(gid, "u6") == 0);
+check("8 普通无权手动发❌",            FAKE_SENT.size() == 1
+        && ((Object[]) FAKE_SENT.get(0))[1].toString().indexOf("❌") >= 0);
+reset(); HOST.putString("wn_g@chatroom_u7", "0");
+doWarn(gid, "normalX", "u7", "r");
+check("8 普通无权自动静默 FAKE_SENT 空", FAKE_SENT.isEmpty());
+check("8 普通无权自动 getWarn==0",      getWarn(gid, "u7") == 0);
+
+// 9. wk_ 覆盖上限: 设 3, 累计到 3 触发踢
+reset(); setWarnKick(gid, 3); setWarn(gid, "u8", 2);
+check("9 setWarnKick 返回3",          getWarnKick(gid) == 3);
+doWarn(gid, "owner1", "u8");
+check("9 wk_ 上限触发 FAKE_KICKED 含 u8", FAKE_KICKED.contains("u8"));
+
+done();

@@ -1,0 +1,42 @@
+// ============================================================
+// core/host (PROD 适配器) — WAuxiliary 宿主实现 HostPort。
+// 与测试 host_fake 同契约，跑同一份 membership/warning 领域逻辑。契约:
+//   getString(k,def)->String  putString(k,v)->void  getLoginWxid()->String
+//   detectNativeOwner(grp)->String|null
+//   sendText(grp,msg)->void  lookupName(wxid,grp)->String  tryKickSilent(grp,wxid)->boolean
+// 本地不可执行(无 WAuxiliary 运行时)；仅由 build.sh 拼入 main.java + bsh 离线解析门禁。
+// 接线(HOST = makeAndroidHost()) 留到 app/hooks，本期不做。
+//
+// 注意: WAuxiliary 把 getString/putString/getLoginWxid 作为插件作用域内置全局函数注入。
+//   端口方法必须避免与内置同名(否则方法体调用会自递归)，故内置经 _hostGet*/_hostPut* 转发缝隔离。
+// ============================================================
+
+// 转发缝: 直接打到 WAuxiliary 注入的同名内置全局。名字与内置不同，不会自递归。
+// (本期不接线、不在本地执行；P2 集成 + L4 真机验证这些缝确实命中宿主内置。)
+String _hostGetString(String key, String def) { return getString(key, def); }
+void   _hostPutString(String key, String val) { putString(key, val); }
+String _hostGetLoginWxid()                     { return getLoginWxid(); }
+// 发消息缝: WAuxiliary 注入的 sendText(会话, 文本) 内置全局。名字不同不会自递归。
+void   _hostSendText(String grp, String msg)   { sendText(grp, msg); }
+
+Object makeAndroidHost() {
+    String getString(String key, String def) { return _hostGetString(key, def); }
+    void putString(String key, String val) { _hostPutString(key, val); }
+    String getLoginWxid() { return _hostGetLoginWxid(); }
+    String detectNativeOwner(String grp) {
+        // TODO(P2): 占位 return null。真实反射在 GA main.java:785 _detectNativeOwner
+        //   (经 _getGroupDataObj / _readRoleMethod 读 GroupData/ChatRoomInfo 群主字段)。
+        //   P2 集成时移植，L4 真机验证；本期骨架不接反射，原生群主仅靠手动登记键 nat_owner_。
+        return null;
+    }
+    // 发文本到群会话: 直接转发 WAuxiliary 内置 sendText。
+    void sendText(String grp, String msg) { _hostSendText(grp, msg); }
+    // 取可读名: GA main.java:1917 lookupName (群名片>备注>昵称>getFriendName>"未知")。
+    //   TODO(P2): 占位返回 wxid。真实实现走 WAuxiliary 名片/昵称查询，P2 移植 L4 验。
+    String lookupName(String wxid, String grp) { return wxid; }
+    // 静默踢人: GA main.java:691 tryKickSilent (经群管反射移除成员; 失败含权限丢失会 setBotPriv)。
+    //   TODO(P2): 占位 return false (不踢)。真实反射 P2 移植，L4 真机验证。
+    //   调用前应自行检查 botPrivState(grp) != "none"。
+    boolean tryKickSilent(String grp, String wxid) { return false; }
+    return this;
+}

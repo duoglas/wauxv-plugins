@@ -6,3 +6,4 @@
 - [SQLite UPSERT max/min 要 coalesce 兜底 NULL](sqlite-upsert-coalesce-null-guard.md) — max(NULL,x)=NULL 已咬两次(last_speak/first_seen)，旧列可能 NULL 必须 coalesce
 - [切换才写的配置键当闸门=升级缺口](config-key-written-on-transition-upgrade-gap.md) — 老用户升级时键空→功能静默失效；读侧 lazy-init 自愈
 - [WAuxiliary config 按插件隔离](waux-config-per-plugin-isolated.md) — getString/putString 每插件各一份 config.prop，跨插件不共享；合并 RP→GA 靠 rp_ 前缀 union
+- [延迟判定要事件时刻快照](delayed-judgement-needs-event-time-snapshot.md) — 延迟跑的判定读"判定时刻"可变状态会被事件后变化污染(伸手党抢后发言洗白)；事件时刻快照+双判据
