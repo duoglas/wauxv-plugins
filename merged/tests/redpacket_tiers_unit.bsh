@@ -1,0 +1,142 @@
+// L1 单测：redpacket_tiers 分档纯逻辑 vs fake HostPort（内存 KV, 无 DB/反射/发送）。
+// 断言: 解析/序列化往返、选档(命中/边界严格大于/未达最低档)、未配置回退全局三档、
+//       定制 vs 普通选表、群规渲染(v1.6.0a 未设/空只发阈值不发动作词)、N 档循环、RP_MAX_TIERS 上限。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");
+source("src/domain/membership.bsh");
+source("src/domain/redpacket_tiers.bsh");
+
+String gid = "g@chatroom";   // RP normGroupId=trim, 键 rp_tiers_g@chatroom
+
+// 小工具: 取某档阈值/动作
+int thrOf(List tiers, int idx) { return ((Integer) ((Object[]) tiers.get(idx))[0]).intValue(); }
+String actOf(List tiers, int idx) { return (String) ((Object[]) tiers.get(idx))[1]; }
+
+// ---- 1. 键名逐字保真 ----
+check("1 普通键名 rp_tiers_g@chatroom", rpTiersKey(gid).equals("rp_tiers_g@chatroom"));
+check("1 定制键名 rp_tiers_custom_g@chatroom", rpTiersCustomKey(gid).equals("rp_tiers_custom_g@chatroom"));
+
+// ---- 2. 未配置 → 回退全局默认三档 (5/10/20 爆照/宣群/发视频) ----
+FAKE_KV.clear();
+List def = getTiers(gid);
+check("2 回退三档 size==3", def.size() == 3);
+check("2 默认档1 阈值5",   thrOf(def, 0) == 5);
+check("2 默认档2 阈值10",  thrOf(def, 1) == 10);
+check("2 默认档3 阈值20",  thrOf(def, 2) == 20);
+check("2 默认档1 动作爆照", actOf(def, 0).equals("爆照"));
+check("2 默认档2 动作宣群", actOf(def, 1).equals("宣群"));
+check("2 默认档3 动作发视频", actOf(def, 2).equals("发视频"));
+
+// ---- 3. 解析存储格式 "阈值|动作;..." + 升序 ----
+HOST.putString("rp_tiers_g@chatroom", "20|发视频;5|爆照;10|宣群");
+List t = getTiers(gid);
+check("3 解析 size==3", t.size() == 3);
+check("3 升序档1阈值5",  thrOf(t, 0) == 5);
+check("3 升序档2阈值10", thrOf(t, 1) == 10);
+check("3 升序档3阈值20", thrOf(t, 2) == 20);
+check("3 档2 动作宣群",  actOf(t, 1).equals("宣群"));
+
+// ---- 4. 解析: 阈值<=0/空动作/无竖线/重复阈值 全剔, 满 RP_MAX_TIERS 截断 ----
+HOST.putString("rp_tiers_g@chatroom", "0|零;5|爆照;noBar;7| ;5|重复;10|宣群");
+List t4 = getTiers(gid);
+check("4 剔无效后 size==2", t4.size() == 2);   // 5|爆照, 10|宣群 (0 剔/noBar 剔/空动作剔/重复5剔)
+check("4 档1阈值5",  thrOf(t4, 0) == 5);
+check("4 档2阈值10", thrOf(t4, 1) == 10);
+// 上限: 喂 12 档, 只留前 RP_MAX_TIERS(=10) 个
+StringBuilder big = new StringBuilder();
+for (int i = 1; i <= 12; i++) { if (i > 1) big.append(";"); big.append(i).append("|a").append(i); }
+HOST.putString("rp_tiers_g@chatroom", big.toString());
+List t4b = getTiers(gid);
+check("4 RP_MAX_TIERS 上限 size==10", t4b.size() == 10);
+check("4 RP_MAX_TIERS 常量==10", RP_MAX_TIERS == 10);
+
+// ---- 5. 序列化往返 (setTiers → getTiers) ----
+FAKE_KV.clear();
+List w = new java.util.ArrayList();
+w.add(new Object[]{ Integer.valueOf(50), "发红包" });
+w.add(new Object[]{ Integer.valueOf(8),  "点赞" });
+setTiers(gid, w);
+check("5 落盘格式 8|点赞;50|发红包", HOST.getString("rp_tiers_g@chatroom", "").equals("8|点赞;50|发红包"));
+List rt = getTiers(gid);
+check("5 往返 size==2", rt.size() == 2);
+check("5 往返档1阈值8",  thrOf(rt, 0) == 8);
+check("5 往返档2阈值50", thrOf(rt, 1) == 50);
+// 动作清洗: '|'→'/'、';'→','
+FAKE_KV.clear();
+List wsan = new java.util.ArrayList();
+wsan.add(new Object[]{ Integer.valueOf(5), "a|b;c" });
+setTiers(gid, wsan);
+check("5 sanitize |→/ ;→,", HOST.getString("rp_tiers_g@chatroom", "").equals("5|a/b,c"));
+// 空列表 → 删键(回退)
+setTiers(gid, new java.util.ArrayList());
+check("5 空列表删键回退三档", getTiers(gid).size() == 3);
+
+// ---- 6. 选档 tierOf: 严格大于, 归最高满足档, 1-based; 0=未达最低档 ----
+FAKE_KV.clear();
+HOST.putString("rp_tiers_g@chatroom", "5|爆照;10|宣群;20|发视频");
+List ts = getTiers(gid);   // 升序 [5,10,20]
+// tierCent = 阈值×100。严格大于(>)。
+check("6 4.99元(499分) 未达最低 →0", tierOf(ts, 499L) == 0);
+check("6 5元整(500分) 不算>5元 →0",  tierOf(ts, 500L) == 0);   // 边界: 严格大于, 等于不算
+check("6 5.01元(501分) 归档1",       tierOf(ts, 501L) == 1);
+check("6 10元整(1000分) 仍归档1",     tierOf(ts, 1000L) == 1); // 边界: 等于10不进档2
+check("6 10.01元(1001分) 归档2",     tierOf(ts, 1001L) == 2);
+check("6 20元整(2000分) 仍归档2",     tierOf(ts, 2000L) == 2);
+check("6 20.01元(2001分) 归档3",     tierOf(ts, 2001L) == 3);
+check("6 100元(10000分) 归最高档3",   tierOf(ts, 10000L) == 3);
+
+// ---- 7. 定制 vs 普通选表 ----
+FAKE_KV.clear();
+HOST.putString("rp_tiers_g@chatroom", "5|普通");           // 普通档表
+HOST.putString("rp_tiers_custom_g@chatroom", "100|定制");  // 定制档表
+List normal = getTiersByType(gid, false);
+List custom = getTiersByType(gid, true);
+check("7 普通选表读 rp_tiers 阈值5",   thrOf(normal, 0) == 5);
+check("7 定制选表读 rp_tiers_custom 阈值100", thrOf(custom, 0) == 100);
+check("7 定制档动作=定制",            actOf(custom, 0).equals("定制"));
+// 定制未配 → 回退普通档表
+HOST.putString("rp_tiers_custom_g@chatroom", "");
+List customFallback = getTiersByType(gid, true);
+check("7 定制未配回退普通 阈值5",      thrOf(customFallback, 0) == 5);
+
+// ---- 8. 群规渲染 renderTierRuleLine: 正常 N 档循环 ----
+FAKE_KV.clear();
+HOST.putString("rp_tiers_g@chatroom", "5|爆照;10|宣群;20|发视频");
+List tr = getTiers(gid);
+String line = renderTierRuleLine("抢到红包请按群规", tr);
+check("8 渲染含前缀",         line.indexOf("抢到红包请按群规") == 0);
+check("8 渲染档1 过5元爆照",  line.indexOf("，过5元爆照") >= 0);
+check("8 渲染档2 过10元宣群", line.indexOf("，过10元宣群") >= 0);
+check("8 渲染档3 过20元发视频", line.indexOf("，过20元发视频") >= 0);
+check("8 渲染全文逐字",
+    line.equals("抢到红包请按群规，过5元爆照，过10元宣群，过20元发视频"));
+
+// ---- 9. v1.6.0a 红线: 动作"未设"/空 → 只发阈值不发动作词, "未设"不泄漏 ----
+FAKE_KV.clear();
+// 构造含"未设"占位与空动作的档表(绕过 parse 的空动作剔除, 直接组 List)
+List leak = new java.util.ArrayList();
+leak.add(new Object[]{ Integer.valueOf(5),  "爆照" });
+leak.add(new Object[]{ Integer.valueOf(10), "未设" });
+leak.add(new Object[]{ Integer.valueOf(20), "   " });   // 空白动作
+String lline = renderTierRuleLine("群规", leak);
+check("9 未设不泄漏 不含'未设'", lline.indexOf("未设") < 0);
+check("9 有动作档照常 含'过5元爆照'", lline.indexOf("，过5元爆照") >= 0);
+check("9 未设档只发阈值 含'过10元'",  lline.indexOf("，过10元") >= 0);
+check("9 空白动作档只发阈值 含'过20元'", lline.indexOf("，过20元") >= 0);
+check("9 未设档后无残留动作词 逐字",
+    lline.equals("群规，过5元爆照，过10元，过20元"));
+
+// ---- 10. rpTiersSummary (管理员可见处保留"未设") ----
+String summ = rpTiersSummary(leak);
+check("10 summary 保留未设(管理员可见)", summ.indexOf("未设") >= 0);
+check("10 summary 档号 1-based",        summ.indexOf("档1>5元") >= 0);
+
+// ---- 11. rpCentToYuan (a3 依赖此 helper) ----
+check("11 整数元去小数 500→5",   rpCentToYuan(500L).equals("5"));
+check("11 一位小数 510→5.1",     rpCentToYuan(510L).equals("5.1"));
+check("11 两位小数 1234→12.34",  rpCentToYuan(1234L).equals("12.34"));
+check("11 去尾零 1200→12",       rpCentToYuan(1200L).equals("12"));
+check("11 frac<10 补零 505→5.05", rpCentToYuan(505L).equals("5.05"));
+
+done();

@@ -1,0 +1,149 @@
+// L1 单测：redpacket_qualify 领域 vs fake HostPort（达标判定/排除名单/定制/均分, 无 DB/反射/worker）。
+// tierOf/tierCent/rpCentToYuan 是 P2-a2(redpacket_tiers) 的 seam — 本测用 test-local 提供(线上 @662/@666/@2303 逐字),
+// 与 fakes 同理: 让本片判定逻辑可独立运行, prod 由 a2 模块在 manifest 拼入真实现。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");
+source("src/domain/membership.bsh");        // parseCsv/joinCsv/normGroupId
+source("src/domain/redpacket_qualify.bsh");
+
+// ---- test-local: a2 tier seam(线上逐字) ----
+long tierCent(Object[] tier) { return (long) ((Integer) tier[0]).intValue() * 100L; }   // @662
+int tierOf(java.util.List tiers, long cent) {                                            // @666: 严格 >, 1-based 最高满足档
+    for (int i = tiers.size() - 1; i >= 0; i--) {
+        if (cent > tierCent((Object[]) tiers.get(i))) return i + 1;
+    }
+    return 0;
+}
+String rpCentToYuan(long cent) {                                                         // @2303
+    try {
+        long yuan = cent / 100L, frac = cent % 100L;
+        if (frac == 0L) return String.valueOf(yuan);
+        String f = (frac < 10L) ? ("0" + frac) : String.valueOf(frac);
+        while (f.length() > 1 && f.charAt(f.length() - 1) == '0') f = f.substring(0, f.length() - 1);
+        return yuan + "." + f;
+    } catch (Throwable t) { return String.valueOf(cent) + "分"; }
+}
+
+// ---- 档表工具: 全局三档 5/10/20 元(线上默认口径) ----
+java.util.List mkTiers() {
+    java.util.List t = new java.util.ArrayList();
+    t.add(new Object[]{ new Integer(5),  "档1" });
+    t.add(new Object[]{ new Integer(10), "档2" });
+    t.add(new Object[]{ new Integer(20), "档3" });
+    return t;
+}
+// 领取者构造: {昵称, 金额分(Long), wxid}
+Object[] rcv(String nick, long cent, String wxid) { return new Object[]{ nick, new Long(cent), wxid }; }
+java.util.List lst() { return new java.util.ArrayList(); }
+
+String gid = "g@chatroom";
+
+// ============================================================
+// A. 达标判定边界(阈值上下/等于) — 严格 >, 最低档 5 元=500 分。
+// ============================================================
+java.util.List tiers = mkTiers();
+java.util.List excl0 = lst();
+
+// A1: 500 分(=5元, 等于最低档) → 严格 > 不满足 → 不达标。
+java.util.List r1 = lst(); r1.add(rcv("a", 500L, "wa"));
+Object[] q1 = rpComputeQualified(tiers, excl0, r1);
+check("A1 等于最低档阈值不达标 count==0", ((Integer) q1[0]).intValue() == 0);
+check("A1 qualifiers 空串",               q1[1].toString().isEmpty());
+
+// A2: 501 分(>5元) → 达标, 档1。
+java.util.List r2 = lst(); r2.add(rcv("a", 501L, "wa"));
+Object[] q2 = rpComputeQualified(tiers, excl0, r2);
+check("A2 超最低档1分达标 count==1",        ((Integer) q2[0]).intValue() == 1);
+check("A2 档次==1",                        q2[1].toString().endsWith("|1"));
+
+// A3: 1000 分(=10元, 等于档2) → 严格 > 档2 不满足, > 档1满足 → 归档1。
+java.util.List r3 = lst(); r3.add(rcv("a", 1000L, "wa"));
+Object[] q3 = rpComputeQualified(tiers, excl0, r3);
+check("A3 等于档2阈值归档1 count==1",        ((Integer) q3[0]).intValue() == 1);
+check("A3 归最高满足档==档1",               q3[1].toString().endsWith("|1"));
+
+// A4: 2001 分(>20元) → 归最高档3。
+java.util.List r4 = lst(); r4.add(rcv("a", 2001L, "wa"));
+Object[] q4 = rpComputeQualified(tiers, excl0, r4);
+check("A4 超最高档归档3",                   q4[1].toString().endsWith("|3"));
+
+// ============================================================
+// B. qualifiers 序列化格式 "昵称|金额元|档次;..." + 防污染 + 金额元格式。
+// ============================================================
+java.util.List rb = lst();
+rb.add(rcv("张三", 600L, "w1"));      // 6 元, 档1
+rb.add(rcv("李四", 1234L, "w2"));     // 12.34 元, 档2
+Object[] qb = rpComputeQualified(tiers, excl0, rb);
+check("B count==2",                  ((Integer) qb[0]).intValue() == 2);
+check("B 序列化两段用;连接",          qb[1].toString().equals("张三|6|1;李四|12.34|2"));
+
+// B2: 昵称含 | 和 ; → 替换为 / 和 ,
+java.util.List rb2 = lst(); rb2.add(rcv("a|b;c", 600L, "w1"));
+Object[] qb2 = rpComputeQualified(tiers, excl0, rb2);
+check("B2 昵称分隔符污染替换 |→/ ;→,", qb2[1].toString().equals("a/b,c|6|1"));
+
+// B3: 金额元 去尾零(1050分→10.5, 500分不达标跳过, 用 1050)
+java.util.List rb3 = lst(); rb3.add(rcv("a", 1050L, "w1"));
+Object[] qb3 = rpComputeQualified(tiers, excl0, rb3);
+check("B3 金额元去尾零 10.5",          qb3[1].toString().equals("a|10.5|2"));
+
+// ============================================================
+// C. 排除名单命中/未命中 — 键 rp_exclude_<gid>, CSV wxid。
+// ============================================================
+HOST.putString("rp_exclude_g@chatroom", "wx_excl, wx_excl2");   // 含空格, getExcludeList 应 trim
+check("C getExcludeList 解析2人",      getExcludeList(gid).size() == 2);
+check("C isExcluded 命中(带空格也trim)", isExcluded(gid, "wx_excl2"));
+check("C isExcluded 未命中",            !isExcluded(gid, "wx_other"));
+check("C isExcluded 空 wxid false",     !isExcluded(gid, ""));
+
+// C2: 达标计算时排除名单命中者被剔除(不计入)。
+java.util.List excl = getExcludeList(gid);
+java.util.List rc = lst();
+rc.add(rcv("正常", 600L, "wx_other"));     // 达标
+rc.add(rcv("被排除", 2000L, "wx_excl"));   // 金额够但被排除 → 不计入
+Object[] qc = rpComputeQualified(tiers, excl, rc);
+check("C2 排除者不计入 count==1",        ((Integer) qc[0]).intValue() == 1);
+check("C2 qualifiers 只含正常",          qc[1].toString().equals("正常|6|1"));
+HOST.putString("rp_exclude_g@chatroom", "");   // 清掉
+
+// C3: wxid 空的领取者被跳过(@需wxid)。
+java.util.List rc3 = lst();
+rc3.add(rcv("无wxid", 2000L, ""));
+rc3.add(rcv("有wxid", 600L, "w1"));
+Object[] qc3 = rpComputeQualified(tiers, lst(), rc3);
+check("C3 空wxid跳过 count==1",          ((Integer) qc3[0]).intValue() == 1);
+check("C3 qualifiers 只含有wxid者",       qc3[1].toString().equals("有wxid|6|1"));
+
+// ============================================================
+// D. 拼手气 vs 均分 — 均分(>=2人全等)跳过; 拼手气/1人继续。
+// ============================================================
+java.util.List eq = lst(); eq.add(rcv("a",300L,"w1")); eq.add(rcv("b",300L,"w2")); eq.add(rcv("c",300L,"w3"));
+check("D 均分包(3人全等)==true",         rpIsEqualSplit(eq));
+java.util.List lucky = lst(); lucky.add(rcv("a",300L,"w1")); lucky.add(rcv("b",301L,"w2"));
+check("D 拼手气(金额有差异)==false",      !rpIsEqualSplit(lucky));
+java.util.List one = lst(); one.add(rcv("a",300L,"w1"));
+check("D 仅1人无法判定==false",           !rpIsEqualSplit(one));
+check("D 空列表==false",                  !rpIsEqualSplit(lst()));
+check("D null==false",                    !rpIsEqualSplit(null));
+
+// ============================================================
+// E. rpIsCustom — 包含匹配 / 开关关 / 关键字空。
+// ============================================================
+// E1: 开关关(默认) → 普通(false), 即便 title 含任意词。
+check("E1 开关关→普通false",             !rpIsCustom(gid, "【定制】祝福"));
+// E2: 开关开 + 关键字"定制" + title 包含(被【】包裹也命中, v1.7.1 contains) → 定制(true)。
+HOST.putString("rp_custom_on_g@chatroom", "1");
+HOST.putString("rp_custom_kw_g@chatroom", "定制");
+check("E2 开关开+包含匹配→定制true",      rpIsCustom(gid, "【定制】生日快乐"));
+check("E2 title不含kw→普通false",         !rpIsCustom(gid, "恭喜发财"));
+check("E2 title null→普通false",          !rpIsCustom(gid, null));
+// E3: 关键字空串(含纯空格) → 未启用 → 普通(false)。
+HOST.putString("rp_custom_kw_g@chatroom", "   ");
+check("E3 关键字空(trim后)→普通false",    !rpIsCustom(gid, "【定制】x"));
+// E4: 开关键非"1"(如"") → 关。
+HOST.putString("rp_custom_kw_g@chatroom", "定制");
+HOST.putString("rp_custom_on_g@chatroom", "");
+check("E4 开关键空→普通false",            !rpIsCustom(gid, "【定制】x"));
+
+done();

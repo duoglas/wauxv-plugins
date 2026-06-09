@@ -1,0 +1,122 @@
+// L1 单测：redpacket_export 领域 vs fake HostPort。
+//   A. rpBuildGroupedMsgs 组装(直接喂 rpQueryToday 列序的 Object[] 行, 不依赖真库):
+//      多群分组 / 单群多行(红包行+人行+块间空行) / 群名空回退 grp / 空当日 / 标题空与非空两种渲染。
+//   B. cfgExportTargetFor/NameFor 按群路由 + 全局回退 + 默认值。
+// 行(列序与 redpacket_store.rpQueryToday 对齐): [0]ts(Long) [1]sender_name [2]title [3]qualified_count(Long) [4]qualifiers [5]group_name [6]grp
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");
+source("src/domain/membership.bsh");      // normGroupId
+source("src/domain/redpacket_export.bsh");
+
+// 构造一行的便捷工厂 (列序逐字对齐 rpQueryToday)。
+Object[] row(long ts, String sn, String ti, long qn, String qf, String gn, String grp) {
+    return new Object[]{ new Long(ts), sn, ti, new Long(qn), qf, gn, grp };
+}
+
+// 固定时刻 → HH:mm 稳定。1749470400000 = 2025-06-09 (本地时区某分钟)。用相对偏移让群内 ts 升序即可。
+long T = 1749470400000L;
+
+// ============================================================
+// A. rpBuildGroupedMsgs 组装
+// ============================================================
+
+// ---- A1: 多群分组 — gA 两个红包 + gB 一个红包 (SQL 已 grp,ts 升序) → 2 群 = 2 条消息, grp 路由键正确 ----
+java.util.List rows = new java.util.ArrayList();
+rows.add(row(T + 100, "张三", "恭喜发财", 2L, "李四|6|1;王五|8|2", "群A", "gA@chatroom"));
+rows.add(row(T + 300, "李四", "新年快乐", 1L, "赵六|5|1",          "群A", "gA@chatroom"));
+rows.add(row(T + 200, "王五", "",         1L, "钱七|9|2",          "群B", "gB@chatroom"));
+
+java.util.List msgs = rpBuildGroupedMsgs(rows, "📊 红包统计 06-09");
+check("A1 多群 → 2 条消息(每群一条)", msgs.size() == 2);
+Object[] m0 = (Object[]) msgs.get(0);
+Object[] m1 = (Object[]) msgs.get(1);
+check("A1 消息0 grp 路由键 = gA@chatroom", "gA@chatroom".equals(m0[0]));
+check("A1 消息1 grp 路由键 = gB@chatroom", "gB@chatroom".equals(m1[0]));
+
+// ---- A2: 头行格式 = headerPrefix + "  【群名】" ----
+String msgA = (String) m0[1];
+check("A2 头行 = headerPrefix + 群名【】", msgA.startsWith("📊 红包统计 06-09  【群A】\n"));
+
+// ---- A3: 有标题红包行 = "HH:mm 名「标题」达标N人" (名与标题间无空格, 标题后紧接达标) ----
+check("A3 有标题红包行(名「标题」达标)", msgA.indexOf("张三「恭喜发财」达标2人") >= 0);
+check("A3 标题非空: 名与达标间不出现 '张三 达标'", msgA.indexOf("张三 达标") < 0);
+
+// ---- A4: 人行 = 全角空格缩进 "　昵称 金额元" ----
+check("A4 人行 李四 6元 全角缩进", msgA.indexOf("　李四 6元") >= 0);
+check("A4 人行 王五 8元 全角缩进", msgA.indexOf("　王五 8元") >= 0);
+
+// ---- A5: 同群两红包之间空一行 (块间 add(\"\") → 渲染出连续两个换行) ----
+check("A5 同群红包块间空一行 (连续\\n\\n)", msgA.indexOf("\n\n") >= 0);
+
+// ---- A6: 无标题红包行 = "HH:mm 名 达标N人" (名后一个空格, 无「」) ----
+String msgB = (String) m1[1];
+check("A6 头行群B", msgB.startsWith("📊 红包统计 06-09  【群B】\n"));
+check("A6 无标题: 名后空格直接达标", msgB.indexOf("王五 达标1人") >= 0);
+check("A6 无标题: 不出现「」包裹", msgB.indexOf("王五「") < 0);
+
+// ---- A7: 群名空 → 头行回退用 grp ----
+java.util.List rows2 = new java.util.ArrayList();
+rows2.add(row(T + 100, "孙八", "包子", 1L, "周九|6|1", "", "gC@chatroom"));   // group_name 空
+java.util.List msgs2 = rpBuildGroupedMsgs(rows2, "📊 X");
+check("A7 群名空 → 1 条消息", msgs2.size() == 1);
+check("A7 群名空 → 头行回退 grp", ((String) ((Object[]) msgs2.get(0))[1]).startsWith("📊 X  【gC@chatroom】"));
+
+// ---- A8: 群名与 grp 都空 → 头行 【】(空群名) ----
+java.util.List rows3 = new java.util.ArrayList();
+rows3.add(row(T, "无名", "x", 1L, "a|1|1", "", ""));   // group_name 空, grp 空
+java.util.List msgs3 = rpBuildGroupedMsgs(rows3, "H");
+check("A8 群名 grp 都空 → 头行 【】", ((String) ((Object[]) msgs3.get(0))[1]).startsWith("H  【】"));
+check("A8 都空 → grp 路由键空串", "".equals(((Object[]) msgs3.get(0))[0]));
+
+// ---- A9: 空当日 → 空消息列表 ----
+java.util.List none = rpBuildGroupedMsgs(new java.util.ArrayList(), "H");
+check("A9 空当日 → 空消息列表", none.isEmpty());
+
+// ---- A10: qualifiers 空 → 只红包行无人行 ----
+java.util.List rows4 = new java.util.ArrayList();
+rows4.add(row(T, "甲", "t", 0L, "", "群D", "gD@chatroom"));
+String msgD = (String) ((Object[]) rpBuildGroupedMsgs(rows4, "H").get(0))[1];
+check("A10 qualifiers 空 → 有红包行", msgD.indexOf("甲「t」达标0人") >= 0);
+check("A10 qualifiers 空 → 无全角缩进人行", msgD.indexOf("　") < 0);
+
+// ============================================================
+// B. cfgExportTargetFor / cfgExportTargetNameFor 按群路由 + 全局回退
+// ============================================================
+String gA = "gA@chatroom";
+String gB = "gB@chatroom";
+
+// ---- B1: 全局键全未设 → 回退编码默认 wxid ----
+check("B1 无任何配置 → 默认 wxid", "wxid_REDACTED".equals(cfgExportTargetFor(gA)));
+check("B1 显示名默认空串", "".equals(cfgExportTargetNameFor(gA)));
+
+// ---- B2: 只设全局默认 → 按群回退到全局 ----
+HOST.putString("rp_export_target", "wxid_global");
+HOST.putString("rp_export_target_name", "全局好友");
+check("B2 未设按群 → 回退全局目标", "wxid_global".equals(cfgExportTargetFor(gA)));
+check("B2 未设按群 → 回退全局显示名", "全局好友".equals(cfgExportTargetNameFor(gA)));
+
+// ---- B3: 设按群目标 → 用按群, 不串到全局; 其他群仍回退全局 ----
+HOST.putString("rp_export_target_" + gA, "gAtgt@chatroom");
+HOST.putString("rp_export_target_name_" + gA, "群A目标");
+check("B3 gA 用按群目标", "gAtgt@chatroom".equals(cfgExportTargetFor(gA)));
+check("B3 gA 用按群显示名", "群A目标".equals(cfgExportTargetNameFor(gA)));
+check("B3 gB 仍回退全局目标", "wxid_global".equals(cfgExportTargetFor(gB)));
+
+// ---- B4: 按群目标含前后空白 → trim 后返回 ----
+HOST.putString("rp_export_target_" + gB, "  trimmed@chatroom  ");
+check("B4 按群目标 trim", "trimmed@chatroom".equals(cfgExportTargetFor(gB)));
+
+// ---- B5: 按群目标为纯空白 → 视作未设, 回退全局 ----
+HOST.putString("rp_export_target_" + gB, "   ");
+check("B5 按群目标纯空白 → 回退全局", "wxid_global".equals(cfgExportTargetFor(gB)));
+
+// ---- B6: 按群目标未设但按群名残留 → 显示名不取残留, 回退全局名 ----
+HOST.putString("rp_export_target_name_" + gB, "残留名");   // 目标仍是纯空白(B5)
+check("B6 目标未设 → 显示名忽略残留回退全局", "全局好友".equals(cfgExportTargetNameFor(gB)));
+
+// ---- B7: gid 空/null → normGroupId 空 → 直接走全局 ----
+check("B7 gid 空 → 全局目标", "wxid_global".equals(cfgExportTargetFor("")));
+check("B7 gid null → 全局目标", "wxid_global".equals(cfgExportTargetFor(null)));
+
+done();

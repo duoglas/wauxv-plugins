@@ -1,0 +1,95 @@
+// ============================================================
+// domain/redpacket_store — RedPacketStats 红包统计(rp_record)持久化领域逻辑。
+// 抽自线上 plugins/redpacket-stats/main.java v1.11.5(§17): rpDb 建表 + rpRecordStats 写库 + rpExportToday 当日查询。
+// 只依赖 StoragePort(全局 STORAGE)，不碰 android/jdbc/反射/UI/worker → 可本地测。
+// 端口契约: STORAGE.exec(String sql, Object[] binds) ; STORAGE.queryLong(...) ; STORAGE.queryRows(...) -> List<Object[]>
+// binds 元素为 String 或 Long。
+// ============================================================
+//
+// 与 speak_store 平级、无相互依赖。本片只抽【存储动作】:
+//   - 建表 schema(线上 rpDb @2164 逐字)
+//   - 录入一条达标红包(线上 INSERT OR REPLACE @2279 逐字, 10 列绑定 @2281-2290 逐字)
+//   - 查当日记录(线上 rpExportToday rawQuery @2449 逐字, ORDER BY grp,ts)
+//   - 当日按群聚合(线上无 SQL 级 GROUP BY/sum/count — 聚合在 Java 层用 LinkedHashMap 按 grp 分组,
+//     见线上 rpBuildGroupedMsgs @2366-2380; 此处领域层等价复刻该分组, 不臆造 SQL 聚合)。
+//
+// 不抽(留给后续 a3/hooks):
+//   - 达标判定纯逻辑(金额>最低档 tierOf / qualifiers 序列化 / 排除名单剔除, 线上 rpRecordStats @2222-2253)
+//     → 本片只保"已算好 qualified_count+qualifiers 后的录入动作", 阈值/分档判定 a3 处理。
+//   - 反射取昵称/群名(rpGroupName/rpSenderName)、UI 导出发送、worker、每日定时窗口查询(动态 grp IN(...) 占位符)。
+
+// ---- SQL 由领域拥有(被测的真正逻辑)。表名/列名/WHERE/ORDER BY 与线上逐字保真。----
+
+// 建表(测试/迁移用；生产由 onLoad rpDb 建)。线上 @2164 逐字。
+// 注: 线上还有 ALTER TABLE ADD COLUMN group_name 老库兜底(@2166), 因 CREATE 已含该列, 仅历史兼容, 本片建表不需要。
+RP_CREATE_SQL =
+    "CREATE TABLE IF NOT EXISTS rp_record("
+    + "key TEXT, date TEXT, ts INTEGER, grp TEXT, group_name TEXT, "
+    + "sender_wxid TEXT, sender_name TEXT, title TEXT, qualified_count INTEGER, qualifiers TEXT, "
+    + "PRIMARY KEY(key))";
+
+// 录入一条达标红包统计。线上 @2279 逐字(INSERT OR REPLACE, key 为主键 → 同 key 幂等覆盖, 重试不重复)。
+// 绑定顺序线上 @2281-2290 逐字: 1=key 2=date 3=ts 4=grp 5=group_name 6=sender_wxid 7=sender_name 8=title 9=qualified_count 10=qualifiers。
+RP_INSERT_SQL =
+    "INSERT OR REPLACE INTO rp_record("
+    + "key,date,ts,grp,group_name,sender_wxid,sender_name,title,qualified_count,qualifiers) "
+    + "VALUES(?,?,?,?,?,?,?,?,?,?)";
+
+// 查当日记录(导出读)。线上 rpExportToday @2449 逐字: WHERE date=? ORDER BY grp ASC, ts ASC。
+// 列顺序线上逐字: ts,sender_name,title,qualified_count,qualifiers,group_name,grp。
+RP_QUERY_TODAY_SQL =
+    "SELECT ts,sender_name,title,qualified_count,qualifiers,group_name,grp "
+    + "FROM rp_record WHERE date=? ORDER BY grp ASC, ts ASC";
+
+// 录入一条达标红包统计(线上 rpRecordStats 的存储核心)。
+// 入参为【已算好】的达标结果: qualifiedCount(达标人数, 线上 qualified) + qualifiers(序列化串 "昵称|金额元|档次;...")。
+// 达标阈值/分档/排除名单判定 → a3(本片不做, 见文件头)。
+// 绑定: 1=key 2=date 3=ts 4=grp 5=groupName 6=senderWxid 7=senderName 8=title 9=qualifiedCount(Long) 10=qualifiers。
+void rpRecord(String key, String date, long ts, String grp, String groupName,
+              String senderWxid, String senderName, String title,
+              long qualifiedCount, String qualifiers) {
+    STORAGE.exec(RP_INSERT_SQL, new Object[]{
+        key, date, new Long(ts), grp, groupName,
+        senderWxid, senderName, title, new Long(qualifiedCount), qualifiers });
+}
+
+// 查当日全部达标红包行(按 grp,ts 升序)。返回 List<Object[]>:
+//   每行槽位与线上 rpReadRow @2324-2333 对齐:
+//   [0]=ts(Long) [1]=sender_name(String) [2]=title(String) [3]=qualified_count(Long)
+//   [4]=qualifiers(String) [5]=group_name(String) [6]=grp(String)
+// 列若 NULL: INTEGER 列(ts/qualified_count)→ null(调用方按线上 rpReadRow 用 0L 兜底); TEXT 列 → null。
+java.util.List rpQueryToday(String date) {
+    return STORAGE.queryRows(RP_QUERY_TODAY_SQL, new Object[]{ date });
+}
+
+// 当日按群聚合(领域层, 与线上一致)。
+// 线上无 SQL 级 GROUP BY/sum/count — 聚合在 Java 层: rpExportToday 取回当日行后, rpBuildGroupedMsgs 用
+// LinkedHashMap 按 grp 列分组(@2372-2380, SQL 已 ORDER BY grp 故顺序稳定)。此处等价复刻该分组,
+// 顺带算每群红包条数(count)与达标人数合计(sum qualified_count) — 即"按群聚合 count/sum"。
+//
+// 返回 List<Object[]>(按 grp 首现顺序, 即 SQL ORDER BY grp 顺序):
+//   [0]=grp(String) [1]=groupName(String, 取该群首条记录的 group_name, 空回退 grp, 都空留空串)
+//   [2]=packetCount(Long, 该群红包条数) [3]=qualifiedSum(Long, 该群达标人数合计)
+java.util.List rpAggregateTodayByGroup(String date) {
+    java.util.List rows = rpQueryToday(date);
+    java.util.LinkedHashMap groups = new java.util.LinkedHashMap();   // grp -> Object[]{grp, groupName, count, sum}
+    for (int i = 0; i < rows.size(); i++) {
+        Object[] r = (Object[]) rows.get(i);
+        String grp = (r[6] == null) ? "" : r[6].toString();
+        String gn = (r[5] == null) ? "" : r[5].toString();
+        long qn = (r[3] == null) ? 0L : ((Long) r[3]).longValue();   // 线上 rpReadRow: isNull→0L
+        Object[] agg = (Object[]) groups.get(grp);
+        if (agg == null) {
+            // 群名取该群首条记录的 group_name, 空回退 grp(对齐线上 rpBuildGroupedMsgs 头行群名取首条 group_name 空回退 grp)。
+            String gname = (gn != null && !gn.isEmpty()) ? gn : grp;
+            agg = new Object[]{ grp, gname, new Long(0L), new Long(0L) };
+            groups.put(grp, agg);
+        }
+        agg[2] = new Long(((Long) agg[2]).longValue() + 1L);          // count: 红包条数 +1
+        agg[3] = new Long(((Long) agg[3]).longValue() + qn);          // sum: 达标人数合计
+    }
+    java.util.List out = new java.util.ArrayList();
+    java.util.Iterator it = groups.values().iterator();
+    while (it.hasNext()) out.add(it.next());
+    return out;
+}

@@ -1,0 +1,179 @@
+// ============================================================
+// domain/redpacket_export — RedPacketStats 导出/每日推送的【消息组装 + 转发目标按群路由】领域逻辑。
+// 抽自线上 plugins/redpacket-stats/main.java v1.9.1:
+//   - rpBuildGroupedMsgs (@2366): 把当日 rows(rpQueryToday 的列序) 按 grp 分组 → 每群拼一条多行文本 → 超长按行兜底分条。
+//   - rpParseQualifiers (@2337): qualifiers 串 "昵称|金额元|档次;..." → List<String[]{name, amount}> (rpBuildGroupedMsgs 内部用)。
+//   - cfgExportTargetFor/NameFor (@879/@890): rp_export_target_<gid>/name_<gid> 非空则用, 否则回退全局默认。
+//
+// 依赖: redpacket_store.bsh 已加载(提供 rpQueryToday 列序 [0]ts [1]sender_name [2]title [3]qualified_count [4]qualifiers [5]group_name [6]grp);
+//       membership.bsh 已加载(提供 normGroupId)。端口: HOST.getString (配置读, per-plugin config.prop)。
+// 不碰 jdbc/WAuxiliary/反射/UI/worker/线程 → 可本地测。
+//
+// 本片只抽【纯文本组装 + 纯 config 路由】。不抽(留 seam 给 hooks/app):
+//   真发送 sendText、每日定时 delay 调度、好友/群选择器反射(rpPickTarget)、手动导出触发(rpExportToday/rpDailySend 的发送循环)、
+//   无达标时的全局心跳分支。
+// 线上错误路径 hbBgLog(后台日志) 此处无日志端口 → 整段 try/catch 吞掉(行为等价: 解析失败返回已组装部分), 留 seam。
+//
+// 转发目标键名(线上 @291/@292/@300 逐字保真):
+//   rp_export_target            全局默认转发目标 (默认 RP_DEF_EXPORT_TARGET)
+//   rp_export_target_name       全局默认转发目标显示名 (默认空串)
+//   rp_export_target_<gid>      按群转发目标 (非空则覆盖全局, 用裸 normGroupId(gid))
+//   rp_export_target_name_<gid> 按群转发目标显示名 (仅当该群目标已设时才用)
+// ============================================================
+
+// 线上常量逐字 (@291/@292/@300)。
+String RP_K_EXPORT_TARGET = "rp_export_target";
+String RP_K_EXPORT_TARGET_NAME = "rp_export_target_name";
+String RP_DEF_EXPORT_TARGET = "wxid_REDACTED";
+
+// ---- 全局默认转发目标 (线上 cfgExportTarget @875): rp_export_target 空回退默认 wxid。----
+// 线上 cfgStr 语义: 取值 null/empty → def, 否则原值(不 trim)。
+String rpCfgExportTarget() {
+    try {
+        String s = HOST.getString(RP_K_EXPORT_TARGET, "");
+        if (s == null || s.isEmpty()) return RP_DEF_EXPORT_TARGET;
+        return s;
+    } catch (Throwable t) { return RP_DEF_EXPORT_TARGET; }
+}
+
+// ---- 全局默认转发目标显示名 (线上 cfgExportTargetName @877): 空回退空串。----
+String rpCfgExportTargetName() {
+    try { String s = HOST.getString(RP_K_EXPORT_TARGET_NAME, ""); return (s == null) ? "" : s; }
+    catch (Throwable t) { return ""; }
+}
+
+// ---- 按群转发目标 (线上 cfgExportTargetFor @879)。----
+// rp_export_target_<裸gid> trim 非空 → 用 trim 后值, 否则回退全局默认 rpCfgExportTarget()。
+String cfgExportTargetFor(String gid) {
+    try {
+        String g = normGroupId(gid);
+        if (!g.isEmpty()) {
+            String s = HOST.getString(RP_K_EXPORT_TARGET + "_" + g, "");
+            if (s != null && !s.trim().isEmpty()) return s.trim();
+        }
+    } catch (Throwable t) {}
+    return rpCfgExportTarget();
+}
+
+// ---- 按群转发目标显示名 (线上 cfgExportTargetNameFor @890)。----
+// 仅当该群【目标】已设(非空)时才用按群显示名(避免目标空但名残留); 否则回退全局 rpCfgExportTargetName()。
+String cfgExportTargetNameFor(String gid) {
+    try {
+        String g = normGroupId(gid);
+        if (!g.isEmpty()) {
+            String tgt = HOST.getString(RP_K_EXPORT_TARGET + "_" + g, "");
+            if (tgt != null && !tgt.trim().isEmpty()) {
+                String s = HOST.getString(RP_K_EXPORT_TARGET_NAME + "_" + g, "");
+                return (s == null) ? "" : s;
+            }
+        }
+    } catch (Throwable t) {}
+    return rpCfgExportTargetName();
+}
+
+// ---- 解析 qualifiers 列 (线上 rpParseQualifiers @2337 逐字)。----
+// "昵称|金额元|档次;昵称|金额元|档次;..." → List<String[]{name, amount}>。
+// ';' 分多人, '|' 分三段; 空/段数不足(<2)/空昵称 → 跳过, 单人解析失败不抛。
+List rpParseQualifiers(String qf) {
+    List out = new java.util.ArrayList();   // 每元素 String[]{name, amount}
+    try {
+        if (qf == null || qf.trim().isEmpty()) return out;
+        String[] persons = qf.split(";");
+        for (int i = 0; i < persons.length; i++) {
+            try {
+                String p = persons[i];
+                if (p == null) continue;
+                p = p.trim();
+                if (p.isEmpty()) continue;
+                String[] seg = p.split("\\|");
+                if (seg.length < 2) continue;             // 缺段 → 跳过
+                String name = (seg[0] == null) ? "" : seg[0].trim();
+                String amt = (seg[1] == null) ? "" : seg[1].trim();
+                if (name.isEmpty()) continue;             // 无昵称 → 跳过
+                out.add(new String[]{ name, amt });
+            } catch (Throwable t) { /* 单人解析失败跳过, 不抛 */ }
+        }
+    } catch (Throwable t) { /* 整体解析失败 → 返回已解析部分 */ }
+    return out;
+}
+
+// ---- 按群把当日 rows 组装成每群一条多行消息 (线上 rpBuildGroupedMsgs @2366 逐字保真)。----
+// 入参 rows: rpQueryToday(date) 的返回 (List<Object[]>, 列序 [0]ts [1]sender_name [2]title [3]qualified_count [4]qualifiers [5]group_name [6]grp,
+//            已 ORDER BY grp ASC, ts ASC)。headerPrefix: 调用方传当天/每日窗口前缀文本。
+// 返回 List<Object[]{String grp, String msg}> (每元素 = {该群 grp, 一条待发消息}); 发送循环据此按 cfgExportTargetFor(grp) 路由。
+//
+// 格式逐字保真:
+//   头行   = headerPrefix + "  【" + 群名 + "】"  (群名取该群首条 group_name, 空回退 grp, 都空则 【】)
+//   红包行 = "HH:mm 发包人「标题」达标N人"  (有标题: 名后紧接「标题」再接"达标"; 无标题: 名后一个空格再"达标")
+//   人  行 = "　昵称 金额元"  (全角空格缩进)
+//   红包之间空一行(bi>0 先 add 空行), 群内最后一个不额外留空行。
+//   超长(MAX_CHARS=1800)按行兜底分条, 不切单行, 每条都带 header。
+List rpBuildGroupedMsgs(List rows, String headerPrefix) {
+    List msgs = new java.util.ArrayList();
+    try {
+        int MAX_CHARS = 1800;
+        java.text.SimpleDateFormat hm = new java.text.SimpleDateFormat("HH:mm");
+        // 按 grp 分组, 保持遍历顺序 (SQL 已 ORDER BY grp,ts)。
+        java.util.LinkedHashMap groups = new java.util.LinkedHashMap();   // grp(String) -> List<Object[]>
+        for (int i = 0; i < rows.size(); i++) {
+            Object[] r = (Object[]) rows.get(i);
+            String gkey = (String) r[6];   // 用 grp 列作分组键 (稳定)
+            if (gkey == null) gkey = "";
+            List bucket = (List) groups.get(gkey);
+            if (bucket == null) { bucket = new java.util.ArrayList(); groups.put(gkey, bucket); }
+            bucket.add(r);
+        }
+        // 逐群拼文本。
+        java.util.Iterator it = groups.values().iterator();
+        while (it.hasNext()) {
+            List bucket = (List) it.next();
+            if (bucket.isEmpty()) continue;
+            Object[] first = (Object[]) bucket.get(0);
+            String fgn = (String) first[5];
+            String fgid = (String) first[6];
+            String grpKey = (fgid != null) ? fgid : "";   // v1.9.1: 该群 grp, 随每条消息返回供按群路由
+            String groupName = (fgn != null && !fgn.isEmpty()) ? fgn : fgid;
+            if (groupName == null) groupName = "";
+            String header = headerPrefix + "  【" + groupName + "】";
+            // 先把该群所有"行"(每红包的多行块)摊平成 List<String>, 块间已含空行, 再按 MAX_CHARS 兜底分条 (每条带 header)。
+            List blockLines = new java.util.ArrayList();
+            for (int bi = 0; bi < bucket.size(); bi++) {
+                Object[] r = (Object[]) bucket.get(bi);
+                long ts = ((Long) r[0]).longValue();
+                String sn = (String) r[1];
+                String ti = (String) r[2];
+                long qn = ((Long) r[3]).longValue();
+                String qf = (String) r[4];
+                if (bi > 0) blockLines.add("");   // 红包之间空一行
+                String hhmm = "?";
+                try { if (ts > 0L) hhmm = hm.format(new java.util.Date(ts)); } catch (Throwable t) {}
+                StringBuilder rpLine = new StringBuilder();
+                rpLine.append(hhmm).append(" ").append(sn);
+                // 样例: 有标题 "张三「恭喜发财」达标2人" (标题后紧接达标, 无空格); 无标题 "赵六 达标1人" (名后空格)。
+                if (ti != null && !ti.isEmpty()) rpLine.append("「").append(ti).append("」");
+                else rpLine.append(" ");
+                rpLine.append("达标").append(qn).append("人");
+                blockLines.add(rpLine.toString());
+                List ppl = rpParseQualifiers(qf);
+                for (int pi = 0; pi < ppl.size(); pi++) {
+                    String[] pa = (String[]) ppl.get(pi);
+                    blockLines.add("　" + pa[0] + " " + pa[1] + "元");
+                }
+            }
+            // 分条: 同群多行超 MAX_CHARS 时切到下一条, 不切断单行; 每条都带 header。
+            StringBuilder cur = new StringBuilder();
+            cur.append(header);
+            for (int li = 0; li < blockLines.size(); li++) {
+                String ln = (String) blockLines.get(li);
+                if (cur.length() + 1 + ln.length() > MAX_CHARS && cur.length() > 0) {
+                    msgs.add(new Object[]{ grpKey, cur.toString() });   // v1.9.1: 带 grp
+                    cur = new StringBuilder();
+                    cur.append(header);   // 续条重复 header 保持每条可读
+                }
+                cur.append("\n").append(ln);
+            }
+            if (cur.length() > 0) msgs.add(new Object[]{ grpKey, cur.toString() });   // v1.9.1: 带 grp
+        }
+    } catch (Throwable t) { /* 组装失败 → 返回已组装部分 (线上 hbBgLog 留痕, 此处无日志端口, 留 seam) */ }
+    return msgs;
+}

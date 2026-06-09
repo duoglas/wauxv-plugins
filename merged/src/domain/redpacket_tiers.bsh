@@ -1,0 +1,218 @@
+// ============================================================
+// domain/redpacket_tiers — RedPacketStats 分档(tier)纯逻辑。
+// 抽自线上 plugins/redpacket-stats/main.java v1.7.x/v1.6.x 的档表相关 helper。
+// 只依赖 HostPort(全局 HOST.getString/putString)，不碰 jdbc/WAuxiliary/反射/UI/worker/发送 → 可本地测。
+// 端口契约: HOST.getString(key,def)->String ; HOST.putString(key,val)->void
+// 复用 membership.bsh 的 parseCsv/joinCsv(本片实际未用 CSV，但按约定不重定义工具)。
+//
+// 键名与线上逐字保真:
+//   rp_tiers_<gid>          普通档表 (@266 K_TIERS_PREFIX + normGroupId)         (@499/@511)
+//   rp_tiers_custom_<gid>   定制档表 (@274 K_TIERS_CUSTOM_PREFIX + normGroupId)  (@501/@558)
+//   rp_t1/rp_t2/rp_t3       全局默认三档阈值 (回退源)                            (@262/@488)
+//   rp_txt1/rp_txt2/rp_txt3 全局默认三档动作文案 (回退源)                        (@263/@491)
+//
+// 默认三档(线上 @302-306 逐字): 阈值 5/10/20 元, 动作 爆照/宣群/发视频。
+// 档位存储格式(线上 parseTiersFromKey @526 / setTiersToKey @641 逐字):
+//   "阈值|动作;阈值|动作;..."  分号分档, 竖线分阈值与动作。
+//   解析: split(";"); 段内 indexOf('|') 切; 阈值 Integer.parseInt(>0); 动作整体 trim(非空); 阈值去重; 满 RP_MAX_TIERS 截断。
+// 选档语义(线上 tierOf @666 逐字): 升序档表从最高档往低判, 金额(分) 严格大于 该档阈值×100 即归该档,
+//   返回 1-based 档次(0=未达最低档)。注意是【严格大于 >】, 不是 >=。
+// RP_MAX_TIERS = 10 (线上 @267)。
+//
+// v1.6.0a 红线(线上群规第一条渲染 @3036-3045 逐字): 动作占位"未设"或空 → 只发阈值不发动作词,
+//   不让"未设"二字泄漏进群消息。本片 renderTierRuleLine 复刻该判定。
+//
+// 不抽(留 seam, 见 a3/hooks): 真发送(rpSendQuote/rpSendAt)、worker(hbTierAndSend 主干)、
+//   定制开关 Dialog、@条逐档 pickConnector/pickActionPhrase(含 Math.random 随机语气, 非纯逻辑)。
+//
+// 注: 线上 RedPacketStats 的 normGroupId(@964) 仅 trim(), 与 GroupAdmin/membership.bsh 的复杂版不同。
+//   为键名逐字保真, 本片用本地 rpNormGroupId(=trim) 算键, 不调 membership.normGroupId。
+// ============================================================
+
+int RP_MAX_TIERS = 10;   // 档位上限 (线上 @267)。
+
+// 全局默认三档 (回退源, 线上 @302-306 逐字)。
+int RP_DEF_T1 = 5;  int RP_DEF_T2 = 10; int RP_DEF_T3 = 20;
+String RP_DEF_TXT1 = "爆照"; String RP_DEF_TXT2 = "宣群"; String RP_DEF_TXT3 = "发视频";
+
+// 键前缀 (线上 @266/@274 逐字)。
+String RP_K_TIERS_PREFIX = "rp_tiers_";
+String RP_K_TIERS_CUSTOM_PREFIX = "rp_tiers_custom_";
+String RP_K_T1 = "rp_t1"; String RP_K_T2 = "rp_t2"; String RP_K_T3 = "rp_t3";
+String RP_K_TXT1 = "rp_txt1"; String RP_K_TXT2 = "rp_txt2"; String RP_K_TXT3 = "rp_txt3";
+
+// 线上 RedPacketStats normGroupId(@964): 仅 trim()。逐字保真(不用 membership 复杂版)。
+String rpNormGroupId(String g) { if (g == null) return ""; return g.trim(); }
+
+String rpTiersKey(String groupId) { return RP_K_TIERS_PREFIX + rpNormGroupId(groupId); }          // @499
+String rpTiersCustomKey(String groupId) { return RP_K_TIERS_CUSTOM_PREFIX + rpNormGroupId(groupId); }  // @501
+
+// 全局默认档 cfg 读 (线上 cfgInt/cfgStr @853/@861: 空串/异常→默认)。
+int rpCfgInt(String key, int def) {
+    try { String s = HOST.getString(key, ""); if (s == null || s.isEmpty()) return def; return Integer.parseInt(s.trim()); }
+    catch (Throwable t) { return def; }
+}
+String rpCfgStr(String key, String def) {
+    try { String s = HOST.getString(key, ""); if (s == null || s.isEmpty()) return def; return s; }
+    catch (Throwable t) { return def; }
+}
+
+// ---- 动作清洗 (线上 sanitizeTierAction @504 逐字): 把 '|'→'/'、';'→','、整体 trim。----
+String sanitizeTierAction(String a) {
+    if (a == null) return "";
+    return a.replace('|', '/').replace(';', ',').trim();
+}
+
+// ---- 解析某存储键的档表 (线上 parseTiersFromKey @526 逐字)。----
+//   键不存在/为空/全无效 → 返回空 List(由调用方决定回退源)。
+//   升序去重(阈值), 长度 1-RP_MAX_TIERS。返回 List<Object[]{Integer,String}>。
+List parseTiersFromKey(String key) {
+    List out = new java.util.ArrayList();
+    try {
+        String raw = HOST.getString(key, "");
+        if (raw != null && !raw.trim().isEmpty()) {
+            String[] segs = raw.split(";");
+            for (int i = 0; i < segs.length; i++) {
+                String seg = segs[i].trim();
+                if (seg.isEmpty()) continue;
+                int bar = seg.indexOf('|');
+                if (bar < 0) continue;
+                String tStr = seg.substring(0, bar).trim();
+                String act = seg.substring(bar + 1);   // 动作可能含空格, 仅整体 trim
+                act = (act == null) ? "" : act.trim();
+                int thr;
+                try { thr = Integer.parseInt(tStr); } catch (Throwable t) { continue; }
+                if (thr <= 0) continue;
+                if (act.isEmpty()) continue;
+                boolean dup = false;   // 阈值去重
+                for (int j = 0; j < out.size(); j++) { if (((Integer) ((Object[]) out.get(j))[0]).intValue() == thr) { dup = true; break; } }
+                if (dup) continue;
+                out.add(new Object[]{ Integer.valueOf(thr), act });
+                if (out.size() >= RP_MAX_TIERS) break;
+            }
+        }
+    } catch (Throwable t) { out = new java.util.ArrayList(); }
+    return out;
+}
+
+// ---- 按阈值升序插入排序 (线上 sortTiers @622 逐字)。----
+void sortTiers(List tiers) {
+    try {
+        for (int i = 1; i < tiers.size(); i++) {
+            Object[] cur = (Object[]) tiers.get(i);
+            int cv = ((Integer) cur[0]).intValue();
+            int j = i - 1;
+            while (j >= 0 && ((Integer) ((Object[]) tiers.get(j))[0]).intValue() > cv) {
+                tiers.set(j + 1, tiers.get(j));
+                j--;
+            }
+            tiers.set(j + 1, cur);
+        }
+    } catch (Throwable t) {}
+}
+
+// ---- 取某群普通档表 (线上 getTiers @511 逐字)。----
+//   键存在且解析出 >=1 档 → 用它(升序); 否则回退全局三档。绝不返回空/null。
+List getTiers(String groupId) {
+    List out = parseTiersFromKey(rpTiersKey(groupId));
+    if (out != null && out.size() >= 1) { sortTiers(out); return out; }
+    // 回退: 全局三档 (旧行为)。
+    out = new java.util.ArrayList();
+    out.add(new Object[]{ Integer.valueOf(rpCfgInt(RP_K_T1, RP_DEF_T1)), rpCfgStr(RP_K_TXT1, RP_DEF_TXT1) });
+    out.add(new Object[]{ Integer.valueOf(rpCfgInt(RP_K_T2, RP_DEF_T2)), rpCfgStr(RP_K_TXT2, RP_DEF_TXT2) });
+    out.add(new Object[]{ Integer.valueOf(rpCfgInt(RP_K_T3, RP_DEF_T3)), rpCfgStr(RP_K_TXT3, RP_DEF_TXT3) });
+    sortTiers(out);
+    return out;
+}
+
+// ---- 按包类型取档表 (线上 getTiersByType @558 逐字)。----
+//   isCustom=true → 读 rp_tiers_custom_<gid>(未配/全无效 → 回退普通档表 getTiers);
+//   isCustom=false → getTiers(普通, 未配回退全局三档)。绝不返回空/null。
+List getTiersByType(String groupId, boolean isCustom) {
+    try {
+        if (isCustom) {
+            List out = parseTiersFromKey(rpTiersCustomKey(groupId));
+            if (out != null && out.size() >= 1) { sortTiers(out); return out; }
+        }
+    } catch (Throwable t) {}
+    return getTiers(groupId);   // 普通 / 定制未配 → 回退普通档表
+}
+
+// ---- 落盘到指定键 (线上 setTiersToKey @641 逐字)。空列表 → 删键(回退)。----
+void setTiersToKey(String key, List tiers) {
+    try {
+        if (tiers == null || tiers.isEmpty()) { HOST.putString(key, ""); return; }
+        sortTiers(tiers);
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (int i = 0; i < tiers.size(); i++) {
+            Object[] e = (Object[]) tiers.get(i);
+            int thr = ((Integer) e[0]).intValue();
+            String act = sanitizeTierAction((String) e[1]);
+            if (thr <= 0 || act.isEmpty()) continue;
+            if (n > 0) sb.append(";");
+            sb.append(thr).append("|").append(act);
+            n++;
+            if (n >= RP_MAX_TIERS) break;
+        }
+        HOST.putString(key, sb.toString());
+    } catch (Throwable t) {}
+}
+
+// ---- 落盘某群普通档表 (线上 setTiers @638 逐字)。----
+void setTiers(String groupId, List tiers) { setTiersToKey(rpTiersKey(groupId), tiers); }
+
+// ---- 某档阈值的分单位金额 (线上 tierCent @662 逐字)。----
+long tierCent(Object[] tier) { return (long) ((Integer) tier[0]).intValue() * 100L; }
+
+// ---- 按金额选档 (线上 tierOf @666 逐字)。----
+//   tiers 已升序; 从最高档往低判: cent 【严格大于】 该档阈值×100 → 归该档。
+//   返回 1-based 档次 (0 = 未达最低档)。
+int tierOf(List tiers, long cent) {
+    for (int i = tiers.size() - 1; i >= 0; i--) {
+        if (cent > tierCent((Object[]) tiers.get(i))) return i + 1;
+    }
+    return 0;
+}
+
+// ---- 分单位金额 → 元字符串 (线上 rpCentToYuan @2303 逐字)。----
+//   qualifiers 序列化的"金额元"字段(线上 @2244)、按金额相关展示共用。
+//   整数元去小数; 否则两位小数去尾零; 异常 → "{cent}分"。
+String rpCentToYuan(long cent) {
+    try {
+        long yuan = cent / 100L, frac = cent % 100L;
+        if (frac == 0L) return String.valueOf(yuan);
+        String f = (frac < 10L) ? ("0" + frac) : String.valueOf(frac);
+        while (f.length() > 1 && f.charAt(f.length() - 1) == '0') f = f.substring(0, f.length() - 1);   // 去尾零
+        return yuan + "." + f;
+    } catch (Throwable t) { return String.valueOf(cent) + "分"; }
+}
+
+// ---- 档表 → 人读字符串 (线上 rpTiersSummary @674 逐字; 管理员可见处, 保留"未设")。----
+String rpTiersSummary(List tiers) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < tiers.size(); i++) {
+        Object[] e = (Object[]) tiers.get(i);
+        if (i > 0) sb.append(" | ");
+        sb.append("档").append(i + 1).append(">").append(((Integer) e[0]).intValue()).append("元 ").append((String) e[1]);
+    }
+    return sb.toString();
+}
+
+// ---- 群规第一条 文本渲染 (纯逻辑, 线上 hbTierAndSend @3036-3045 逐字抽出)。----
+//   prefix = 群规前缀(普通 cfgRulePrefix / 定制 cfgCustomRulePrefix, 由调用方按类型传入, 本片不读该键不发送)。
+//   各档拼 "，过{阈值}元{动作}"。
+//   v1.6.0a 红线: 动作为 null/空/"未设" → 只发阈值不发动作词, 不让"未设"泄漏进群消息。
+//   仅纯文本拼装; 真发送(rpSendQuote)、@条(appendTierLine 含 Math.random 语气)、worker 不在此片。
+String renderTierRuleLine(String prefix, List tiers) {
+    StringBuilder ruleSb = new StringBuilder();
+    ruleSb.append((prefix == null) ? "" : prefix);
+    for (int gi = 0; gi < tiers.size(); gi++) {
+        Object[] te = (Object[]) tiers.get(gi);
+        ruleSb.append("，过").append(((Integer) te[0]).intValue()).append("元");
+        // v1.6.0a: 动作未设(占位"未设")或空 → 只发阈值不发动作词。
+        String _act = (String) te[1];
+        if (_act != null && !_act.trim().isEmpty() && !"未设".equals(_act.trim())) ruleSb.append(_act);
+    }
+    return ruleSb.toString();
+}

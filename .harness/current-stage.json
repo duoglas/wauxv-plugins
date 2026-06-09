@@ -1,5 +1,5 @@
 {
   "stage": "EXECUTE",
-  "since": "2026-06-09T10:02:39.717Z",
-  "task": "排查 RedPacketStats v1.11.5 伸手党误警告(明明发言过的人被警告)真机 BUG：先取证(rp.log 判定行 + config 窗口 + groupadmin.db 实际 last_speak)定位根因，再修"
+  "since": "2026-06-09T11:42:23.875Z",
+  "task": "合并工程 P2-a：抽 RedPacketStats 红包领域逻辑进 merged/(a1存储/a2分档/a3达标排除定制/a4导出组装) + L1/L2 测试 + check.sh 全绿(纯本地零真机)；cutover 落 GroupAdminPlus/ 留 P3 后"
 }

@@ -1,0 +1,137 @@
+// ============================================================
+// domain/redpacket_qualify — RedPacketStats 达标判定 / 排除名单 / 定制包判定 / 拼手气vs均分判定。
+// 抽自线上 plugins/redpacket-stats/main.java v1.11.5。纯判定逻辑(零反射/UI/worker/线程/发送) → 可本地测。
+//
+// 端口: HOST(getString/putString)。config 走 HOST 端口(每插件隔离的 config.prop)。
+//
+// 依赖(由 manifest 在本片之前拼入, 本片不重定义, 测试用 test-local 提供):
+//   - membership.bsh: parseCsv / joinCsv / normGroupId(键规范化)。
+//   - redpacket_tiers.bsh(P2-a2): tierOf(List tiers, long cent)->int(1-based最高满足档,0=未达最低)
+//                                 tierCent(Object[] tier)->long   rpCentToYuan(long cent)->String
+//     tiers 形如 List<Object[]{Integer 阈值(元), String 动作}>; 由调用方(getTiers/getTiersByType seam)给出。
+//
+// 与 redpacket_store.bsh 衔接: 本片算出的 qualifiedCount + qualifiers 即喂给 rpRecord 的第 9/10 列。
+// 不抽(留 seam): 反射取领取者列表、getTiers/getTiersByType(a2)、worker/发送/UI、伸手党判定(freeloader.bsh)。
+//
+// ★保真红线(逐字照搬线上, 不许改):
+//   - 达标 = tierOf(tiers,cent) >= 1, 即金额(分)严格大于最低档阈值×100(tierCent 用严格 >, 线上 @668)。
+//   - qualifiers 序列化: "昵称|金额元|档次" 用 ";" 连接(线上 @2228/@2247); 昵称防分隔符污染 '|'→'/' ';'→','(线上 @2245)。
+//   - 排除名单: 键 rp_exclude_<normGroupId>(K_EXCLUDE_PREFIX + normGroupId, 线上 @290/@1031), CSV wxid;
+//               命中比较 wxid.equals(excl 元素 .trim())(线上 @2239/@1041)。
+//   - 拼手气vs均分: 领取者 >=2 人 且 所有金额(分)全等 → 均分(skip 不记); 有差异/仅 1 人 → 拼手气(继续)(线上 @2707-2730)。
+//   - 定制判定 rpIsCustom: 开关关→普通(false); 否则 kw.trim() 非空 且 title.contains(kw)→定制(true)(v1.7.1 包含匹配, 线上 @609);
+//               开关键 rp_custom_on_<normGroupId>(="1" 为开, 线上 @272/@575); 关键字键 rp_custom_kw_<normGroupId>(线上 @273)。
+//               整段安全降级: 任何异常/空 → 普通(false)。
+// ============================================================
+
+// ---- 线上键前缀(逐字保真, @272/@273/@290) ----
+String RPQ_K_EXCLUDE_PREFIX   = "rp_exclude_";      // 排除名单: rp_exclude_<groupId> (CSV wxid, §12)
+String RPQ_K_CUSTOM_ON_PREFIX = "rp_custom_on_";    // 定制开关: rp_custom_on_<gid> = "1"/"" (默认关)
+String RPQ_K_CUSTOM_KW_PREFIX = "rp_custom_kw_";    // 定制关键字: rp_custom_kw_<gid> (空串=未启用)
+
+// ==================== 排除名单 (按群, 线上 @1029-1043 逐字) ====================
+// 键用 normGroupId(线上 excludeKey @1031); g 为空串(无效 gid)→空表(线上 @1034)。
+String rpExcludeKey(String groupId) { return RPQ_K_EXCLUDE_PREFIX + normGroupId(groupId); }
+List getExcludeList(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return new java.util.ArrayList();
+    return parseCsv(HOST.getString(rpExcludeKey(g), ""));
+}
+// 某 wxid 是否在本群排除名单。线上 @1037 逐字: wxid 先 trim, 与名单元素 trim 后 equals。
+boolean isExcluded(String groupId, String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    String w = wxid.trim();
+    List l = getExcludeList(groupId);
+    for (int i = 0; i < l.size(); i++) if (w.equals(((String) l.get(i)).trim())) return true;
+    return false;
+}
+
+// ==================== 定制包判定 (v1.7.0/v1.7.1, 线上 @568-619 逐字) ====================
+String rpCustomOnKey(String groupId) { return RPQ_K_CUSTOM_ON_PREFIX + normGroupId(groupId); }
+// 定制开关: 键值 trim 后 =="1" 为开(线上 @575); 无效 gid/异常 → 关(false)。
+boolean isCustomOn(String groupId) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty()) return false;
+        String s = HOST.getString(rpCustomOnKey(g), "");
+        return s != null && s.trim().equals("1");
+    } catch (Throwable t) { return false; }
+}
+String rpCustomKwKey(String groupId) { return RPQ_K_CUSTOM_KW_PREFIX + normGroupId(groupId); }
+// 定制关键字: 取本群键值; 无效 gid/异常 → 空串(线上 @588 逐字, 注意不 trim, trim 留给 rpIsCustom)。
+String getCustomKw(String groupId) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty()) return "";
+        String s = HOST.getString(rpCustomKwKey(g), "");
+        return (s == null) ? "" : s;
+    } catch (Throwable t) { return ""; }
+}
+// 包类型判定(线上 @609 逐字, v1.7.1 包含匹配):
+//   开关关 → 普通(false); 否则 kw trim 后非空 且 title 包含 kw → 定制(true); 否则普通。
+//   整段 try/catch 安全降级, 任何异常退回普通(false)。
+boolean rpIsCustom(String groupId, String title) {
+    try {
+        if (!isCustomOn(groupId)) return false;
+        String kw = getCustomKw(groupId);
+        if (kw == null) return false;
+        kw = kw.trim();
+        if (kw.isEmpty()) return false;
+        String t = (title == null) ? "" : title;
+        return t.contains(kw);
+    } catch (Throwable t) { return false; }
+}
+
+// ==================== 拼手气 vs 均分 (线上 @2707-2730 逐字) ====================
+// 仅处理拼手气包。均分(普通)包 = 领取者 >=2 人 且所有金额(分)全等 → true(应 skip 不记/不发)。
+//   金额有差异(拼手气) → false; 仅 1 人无法判定 → false(按拼手气正常处理, 线上 @2710)。
+// receivers: List<Object[]>, 每元素槽位 [1] = 金额(分, Long)(对齐线上 receivers 第 2 槽 @2714/@2717)。
+boolean rpIsEqualSplit(java.util.List receivers) {
+    if (receivers == null) return false;
+    int rn = receivers.size();
+    if (rn < 2) return false;                                          // 1 人无法判定 → 拼手气
+    long firstCent = ((Long) ((Object[]) receivers.get(0))[1]).longValue();
+    for (int i = 1; i < rn; i++) {
+        long c = ((Long) ((Object[]) receivers.get(i))[1]).longValue();
+        if (c != firstCent) return false;                             // 有差异 → 拼手气
+    }
+    return true;                                                      // 全等 → 均分
+}
+
+// ==================== 达标判定 + qualifiers 序列化 (线上 rpRecordStats @2228-2248 逐字) ====================
+// 入参:
+//   tiers      : 档表 List<Object[]{Integer 阈值元, String 动作}>(由 a2 getTiers/getTiersByType seam 给; 本片不读 config)。
+//   excl       : 本群排除名单 List<String wxid>(调用方传 getExcludeList(talker) 结果, 与 §6 同口径, 线上 @2226)。
+//   receivers  : 领取者 List<Object[]{ String 昵称[0], Long 金额分[1], String wxid[2] }>(对齐线上 @2233-2235)。
+// 逐字规则(线上 @2231-2248):
+//   - wxid 空 → 跳过(@ 需 wxid 才计入, @2236)。
+//   - 命中排除名单(wxid.equals(excl 元素 .trim())) → 跳过(@2239)。
+//   - tier = tierOf(tiers, cent); tier<1(未超最低档) → 不计入达标(@2241-2242)。
+//   - 达标: qualified++; 昵称 '|'→'/' ';'→',' 防污染(@2245); 段 "昵称|金额元|档次" 用 ";" 连接(@2246-2247)。
+// 返回 Object[]{ Integer qualifiedCount, String qualifiers }(qualifiers 即喂 redpacket_store.rpRecord 第 10 列)。
+//   注: 线上 qualified==0 时 not recorded(@2250); 本片只算结果(count=0 时 qualifiers=""), 记不记由调用方按 count 决策。
+Object[] rpComputeQualified(java.util.List tiers, java.util.List excl, java.util.List receivers) {
+    StringBuilder qb = new StringBuilder();
+    int qualified = 0;
+    if (receivers == null) return new Object[]{ new Integer(0), "" };
+    java.util.List ex = (excl == null) ? new java.util.ArrayList() : excl;
+    for (int i = 0; i < receivers.size(); i++) {
+        Object[] r = (Object[]) receivers.get(i);
+        String nick = (String) r[0];
+        long cent = ((Long) r[1]).longValue();
+        String wxid = (String) r[2];
+        if (wxid == null || wxid.isEmpty()) continue;                 // @2236
+        // 剔除本群排除名单(@2238-2240)
+        boolean skip = false;
+        for (int j = 0; j < ex.size(); j++) { if (wxid.equals(((String) ex.get(j)).trim())) { skip = true; break; } }
+        if (skip) continue;
+        int tier = tierOf(tiers, cent);                               // 1-based 最高满足档; 0=未达最低
+        if (tier < 1) continue;                                       // 未超最低档, 不计入达标(@2242)
+        qualified++;
+        String yuan = rpCentToYuan(cent);
+        String nm = (nick == null) ? "" : nick.replace('|', '/').replace(';', ',');   // 防分隔符污染(@2245)
+        if (qb.length() > 0) qb.append(";");
+        qb.append(nm).append("|").append(yuan).append("|").append(tier);
+    }
+    return new Object[]{ new Integer(qualified), qb.toString() };
+}

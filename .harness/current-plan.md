@@ -1,47 +1,48 @@
-# PLAN — 合并工程 P1-d（app 层装配）
+# PLAN — 合并工程 P2（RedPacketStats 进骨架 + 迁移设计）
 
-## 背景
-P0 + P1-a/b/c 已落（commit 1566aba）：core 端口骨架 + membership/warning/speak/speak_store 四领域 + L1/L2，merged/check.sh GREEN。
-P1-d 把线上 GroupAdmin 的 **app 层**（hooks + 命令路由 + recordSpeak 异步 infra + 设置 UI）抽进 merged/ 骨架。
-这是合并工程**最重、热路径风险最高**的一期 → 切成 4 个独立可验证 slice，逐个做、逐个 check.sh 绿。
+## 关键现实约束（决定 P2 怎么拆）
+设计文档把 P2 写成"redpacket 领域+测试 + config union 迁移 + 停旧插件 + 真机"。但：
+- 停旧 RP 插件 + config 迁移 = 最终 cutover，只有合并插件真能跑红包（依赖设备反射检测/领取者抽取/UI自动化 + P3 伸手党直连）后才能做。
+- 现在停旧插件会直接让红包瘫掉（merged/ 还没部署、反射层还没接）。
+- 沿用纪律：merged/ 不碰线上插件，直到最终 cutover。
 
-## 线上锚点（plugins/group-admin/main.java）
-- recordSpeak + L3 缓冲/flush/降级 infra：@146-166（状态/锁）、@403-514（l3Flush/降级/恢复）、@710（recordSpeak 热路径入口）
-- onHandleMsg 包装层 @2086 → onHandleMsgBody @2107（热路径主体：采集 recordSpeak + 文本命令路由）
-- 设置对话框 UI：@3100-4010（一堆 onClick handler）
+→ P2 拆两段：能本地测的红包领域逻辑现在抽（纯本地、零真机）；不可逆 cutover 现在只设计、不执行，留到 P3 之后合并插件功能完整时再带独立 PLAN 执行。
 
-## Slice 拆分（每片独立可验证，check.sh 必绿）
+## P2-a（现在做，纯本地，零真机，check.sh 全绿）：红包领域逻辑抽进 merged/
+线上 plugins/redpacket-stats/main.java（4111 行）里可领域化（纯逻辑 + StoragePort 驱动）的部分抽进 merged/src/domain/redpacket.bsh（+ 必要时拆 redpacket_store）。反射/UI/worker/调度留设备 seam，不在本期。
 
-### P1-d1 — recordSpeak 异步缓冲/flush/降级 infra → src/app/speak_buffer.bsh
-- 抽：L3 状态机（L3_dirtyLs/L3_dirtySeen/L3_DEGRADED/双锁 L3_LOCK+FLUSH_LOCK）、recordSpeak 热路径入队（O(1) 内存写）、l3Flush 换出+落库、降级/恢复触发器。
-- 落库走 **STORAGE 端口**（speakRecord/speakUpsertFirstSeen 已在 speak_store），不直接碰 jdbc。
-- **保真红线**：锁序恒为 FLUSH_LOCK 外/L3_LOCK 内；recordSpeak 只持 L3_LOCK、绝不碰 DB/FLUSH_LOCK（C-PERF-03）；降级只影响采集入口，不影响命令/查询。
-- 测试：L1 纯逻辑能测的部分 —— 降级触发器（缓冲上界 N→DEGRADED）、恢复条件（flush 成功且低水位<CAP/2→解除）、换出后 dirtyCount 归零。**诚实标注**：infra 本体的并发正确性本地测不了，只测纯状态转移，真并发留 L4 真机。
+### 切片（每片 L1/L2 + 红→绿 mutation，check.sh 绿）
+- P2-a1 红包存储：redpacket_stats 表 schema + 录入/查询（rpRecordStats 核心 + 当日聚合）走 StoragePort；L2 sqlite-jdbc 真库测。
+- P2-a2 分档逻辑：getTiers/getTiersByType（per-group 1-10 档、普通vs定制回退）、按金额选档、阈值/动作渲染（含 v1.6.0a "未设档不泄漏"）；config 驱动，L1。
+- P2-a3 达标/排除/定制判定：拼手气vs均分（只判拼手气）、达标(>阈值)、getExcludeList 排除、rpIsCustom(title 包含关键字)；纯逻辑 L1。
+- P2-a4 导出组装：rpBuildGroupedMsgs（按群分条组装多行）、当日统计聚合、转发对象按群路由(cfgExportTargetFor 回退全局)；L2(存储)+L1(组装)。
+- 配置访问器（cfgRetry/cfgDailyHour/cfgExportTarget/cfgCustom* 等）按需抽，走 HOST 端口。
 
-### P1-d2 — 命令路由骨架 → src/app/commands.bsh
-- 抽 onHandleMsgBody 里"文本 → 领域调用"的路由（#警告/#清零/#潜水/… → doWarn/doWarnClear/lurkClassify 等已抽领域函数）。
-- 纯分发：解析命令 token → 调 domain 函数；不含热路径采集（那在 d1）。
-- 测试：L1 —— 喂命令字符串，断言路由到正确 domain 函数（用 host_fake 记录 FAKE_SENT/调用）。
+### 明确留设备 seam（本期不抽，占位/TODO 指向线上行号）
+红包检测(onHandleMsg type 判定)、worker 队列(hbProcess)、领取者反射抽取(hbDetailExtract/NewDetailUI/NewReceiveUI)、无障碍 UI 自动化、Job/重试/delay 调度、sendText 真发。最终设备集成期接。
 
-### P1-d3 — 生命周期 hooks + 端口接线 → src/app/hooks.bsh
-- onLoad（建表 + STORAGE=makeAndroidStorage(db) / HOST=makeAndroidHost() / CLOCK=makeAndroidClock() 接线）、onHandleMsg 包装层（性能埋点 + 调 d1 采集 + d2 路由）、onActivityResume。
-- 测试：L3 装配解析门（check.sh 已有：build → 去 final 全文 bsh 解析 EXIT=0）。本地不跑真 hook。
+### P2-a 验收
+merged/check.sh GREEN（build + bsh 解析 EXIT=0 + 所有 L1/L2）；红包领域逐字保真线上（分档/达标/排除/定制/导出 SQL）；Security grep 干净。无任何真机动作。
 
-### P1-d4 — 设置对话框 UI → src/app/dialogs.bsh
-- 抽 @3100-4010 的 onClick handler（设置开关读写走 HOST.getString/putString）。
-- 风险最低（UI、非热路径）。测试：仅 L3 解析门。
+## P2-b（现在只设计，不执行）：最终 cutover 方案
+写成可执行脚本 + 回滚预案，留到 P3 之后合并插件功能完整时执行：
+1. config union 迁移：RedPacketStats/config.prop 并入合并插件目录 config.prop（rp_ 前缀零冲突=等价 union）。一次性、脚本化、先备份。
+2. DB 接入：合并插件按绝对路径同时开 groupadmin.db + redpacket_stats.db（或迁 redpacket_stats.db 进合并目录）。数据不动。
+3. 停旧 RedPacketStats 插件（防红包双重处理）。
+4. 回滚：保留两旧插件目录 + config 备份；出问题切回。
 
-## 本期范围/边界（YAGNI）
-- 只抽 **GA** 的 app 层；RP 并入（config union 迁移、freeloader→doWarn 直连、停旧 RP 插件）是 P2/P3，不在本期。
-- 不动真机：本期纯本地（merged/ 文件 + check.sh）。**无真机不可逆动作**。
-- manifest.prod.txt 增加 app/* 模块（core→domain→app 顺序）。
+## ⚠️ 真机不可逆动作清单（本 P2 PLAN 内一个都不执行，全部留最终 cutover 另开 PLAN 确认）
+- 改/并入合并插件 config.prop（config union）
+- 停用线上 RedPacketStats 插件
+- 部署合并 main.java 到真机、迁移 redpacket_stats.db
+→ 只在 P3 完成、合并插件端到端可跑红包后，带独立 PLAN + 真机 Santa 双审执行。
 
-## 验收（每 slice）
-- merged/check.sh GREEN（build + 装配体去 final bsh 解析 EXIT=0 + L1/L2 全绿）
-- 新增逻辑有对应 L1 测，红→绿 mutation 验证过
-- 逐字保真：抽出的逻辑与线上锚点一致（关键红线：热路径 O(1)、锁序、降级隔离）
-- Security grep 干净（交付批次时）
+## 本期产出边界（YAGNI）
+- 只抽 P2-a 红包领域逻辑 + 测试（纯本地）。
+- P2-b 只产出迁移脚本/cutover 文档，不执行。
+- freeloader→doWarn 直连是 P3，不在本期（判定逻辑已就位）。
 
-## 建议执行顺序
-P1-d1 先做（热路径心脏、喂 speak_store，价值最高也最该先锁死保真）→ 暂停看结果 → 再 d2 → d3 → d4。
-每片做完 check.sh 绿即可 commit 或攒批。
+## 待确认
+1. 同意 P2 这样拆（P2-a 现在抽红包领域+测试纯本地；cutover 留 P3 后执行）？
+2. P2-a 四片一口气做，还是先做某片？
+3. 合并插件最终落哪个目录：复用 GroupAdmin/ 还是新建 GroupAdminPlus/？（影响 P2-b cutover，现在定方向即可，不执行）
