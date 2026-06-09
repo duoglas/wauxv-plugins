@@ -1,0 +1,401 @@
+// ============================================================
+// app/redpacket_worker — RP 红包 worker 调度 spine + Job 重试阶梯 + hbProcess(出队解析→开页) + perf 落盘 (P3-b T3)。
+// 逐字保真移植自线上 plugins/redpacket-stats/main.java v1.11.5:
+//   · rpWorkerTick      (@1666-1710): 每日检查 + perf 聚合落盘 + 看门狗(30s 强清在飞) + 单飞闸门 + 挑最早到期 job 出队 + 进在飞 + hbProcess + finally 自重调度(worker 绝不停摆)。
+//   · rpClearInFlight   (@1713): 统一清在飞。
+//   · hbProcess         (@1753-1829): 出队后 worker 侧解析(专属早退 / nativeurl / rpExtractTitle 回填 JOB_TITLE / rpIsCustom 回填 JOB_ISCUSTOM) → 开封面页(经 rpOpenCover seam, T4)。
+//   · rpExtractTitle    (@1872): 从红包 wcpayinfo 提取标题(sendertitle→receivertitle→scenetext→des 取首个非空)。纯字符串函数(经 hbGetElement)。
+//   · hbGetElement      (@1895): 轻量 XML 取值(DocumentBuilder)。纯字符串函数。
+//   · afterCoverNoDetail(@2070): 三段重试阶梯(放弃点 attempt>=3; retrySec 三段 attempt0→retry1/1→retry2/2→retry3; hbJitter ±25% 抖动; 重新入队)。
+//   · perfFlush         (@4035): 聚合 PERF_* 窗口 → 后台线程写 perf.log(rp_msg/norm/spike/rp_extract 各列)。脱敏: 只写耗时(us)/计数, 绝不写 wxid/群名/群ID/消息内容。
+//   · cfgRetry1/2/3     (@835-837): 三段重试秒(经 rpCfgLong → K_RETRY1/2/3 + 默认)。
+//   · rpDailyCheck      (@2494): 每日定时统计 worker-tick 驱动(抗重启 last_sent 日期串)。其"组装+发送"经 rpDailySend seam(T6)。
+//
+// 依赖 (manifest 在本片之前拼入, 解析门只解析语法不要求其存在; 缺的置 seam/leaf):
+//   device_base.bsh   : RP_QUEUE / RP_QUEUE_MAX / RP_TICK_MS / RP_WATCHDOG_MS / IN_FLIGHT / CUR_JOB / inflightStartMs
+//                       / SEEN / DONE / OPENED / COVER_ACT / JOB_* 槽常量 / FREELOADER_SNAP / hbBgLog / hbNow / hbJitter
+//                       / PERF_* (全套窗口计数 + PERF_LOG + PERF_FLUSH_EVERY) / UI_RECEIVE
+//   redpacket_detect.bsh : rpEnqueue / rpQueueSize / rpCurKey / rpCfgLong / cfgDelay
+//   domain/redpacket_qualify.bsh : rpIsCustom / isCustomOn / getCustomKw (包类型判定, 已抽 → 直接调, 不重复实现)
+//   宿主内置 (WAuxiliary 注入, 本地无, 解析门只解析语法): delay / log
+//
+// ★C-PERF-01/03 红线: 本片全在后台 worker 线程(delay 自重调度) / hbProcess 出队后执行 — 重活(XML 解析/title/包类型)在此,
+//   绝不反噬 onHandleMsg 消息热路径。perf 埋点只 nanoTime + 整型累加 + 后台 FileWriter, 落盘在后台线程。
+//
+// ★seam 边界 (明确留给后续任务, 置 leaf 占位):
+//   · rpOpenCover(talker, nativeurl)  → UI 启动器 (hostContext/getTopActivity + Intent + startLuckyMoneyReceive 反射) 属 T4。本片置 leaf, hbProcess 末尾调它。
+//   · rpDailySend(windowStart, windowEnd, manual) → 每日统计"组装+发送"(rpDb/rpReadRow/getDailyGroups/rpBuildGroupedMsgs/sendText) 属 T6。本片置 leaf, rpDailyCheck 调它。
+//   · cfgDailyHour / rpToday / rpTodayHourMs / K_DAILY_LAST_SENT 取值/存储 → rpDailyCheck 的日期闸门依赖, 属设置/存储层 (T6/T7)。本片置 leaf 占位 (日期闸门骨架成立, 真实值由后续接)。
+//
+// ★关键协调点 (FREELOADER_SNAP 生命周期, 交 T5):
+//   线上 v1.11.5 hbProcess 有几处 FREELOADER_SNAP.remove(key) 清理 (专属早退 @1775 / 无 hostCtx abort @1815),
+//   对应旧"检测时刻拍快照"生命周期。合并版 P3-a 已把伸手党快照改为 in-process T_snap=packetMs+G 拍照(T5 freeloaderRunForPacket, 晚于 hbProcess),
+//   故 hbProcess 执行时本包尚无快照 → 本片【不移植】这些 FREELOADER_SNAP.remove 行, 仅在退出点留注释标记 (见下), 协调点交 T5。
+// ============================================================
+
+// ==================== cfgRetry1/2/3 (线上 @835-837 逐字) ====================
+// 三段重试秒。仅 worker 的 afterCoverNoDetail 读, 不进热路径 (v1.10.0 §4)。
+// 键/默认逐字保真线上: K_RETRY1=rp_retry1_sec(@275, DEF=300), K_RETRY2=rp_retry2_sec(DEF=600), K_RETRY3=rp_retry3_sec(DEF=3600=1h)。
+String RP_K_RETRY1 = "rp_retry1_sec"; String RP_K_RETRY2 = "rp_retry2_sec"; String RP_K_RETRY3 = "rp_retry3_sec";   // 线上 @275
+long   RP_DEF_RETRY1 = 300L;   // 重试1 = 5 分钟 (线上 @319)
+long   RP_DEF_RETRY2 = 600L;   // 重试2 = 10 分钟 (线上 @320)
+long   RP_DEF_RETRY3 = 3600L;  // 重试3 = 1 小时 (线上 @321, v1.10.0 §3/§4 末档)
+long cfgRetry1() { return rpCfgLong(RP_K_RETRY1, RP_DEF_RETRY1); }
+long cfgRetry2() { return rpCfgLong(RP_K_RETRY2, RP_DEF_RETRY2); }
+long cfgRetry3() { return rpCfgLong(RP_K_RETRY3, RP_DEF_RETRY3); }
+
+// ==================== XML 取值 helper (线上 hbGetElement @1895 逐字) ====================
+// 轻量 XML 取值 (源: 自动抢红包), 仅红包命中时调用一次 (worker 侧, 非热路径)。
+//   去掉首行 "<前缀>:\n" (微信红包 content 形如 "wxid_xxx:\n<msg>...") 再解析。取不到/异常返 null。
+String hbGetElement(String xmlString, String elementName, String tagName) {
+    try {
+        if (xmlString == null) return null;
+        javax.xml.parsers.DocumentBuilderFactory factory = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+        javax.xml.parsers.DocumentBuilder builder = factory.newDocumentBuilder();
+        org.xml.sax.InputSource is = new org.xml.sax.InputSource(
+            new java.io.StringReader(xmlString.replaceAll("^[^:]+:\n", "")));
+        org.w3c.dom.Document document = builder.parse(is);
+        org.w3c.dom.NodeList list = document.getElementsByTagName(elementName);
+        if (list.getLength() > 0) {
+            org.w3c.dom.Node parent = list.item(0);
+            org.w3c.dom.NodeList children = parent.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                org.w3c.dom.Node child = children.item(i);
+                if (child.getNodeName().equalsIgnoreCase(tagName)) return child.getTextContent();
+            }
+        }
+    } catch (Throwable t) { return null; }
+    return null;
+}
+
+// ==================== 标题提取 (线上 rpExtractTitle @1872 逐字) ====================
+// 从红包消息 wcpayinfo 提取标题/祝福语 (只在红包命中时调用, 低频; 不碰普通消息热路径 — v1.6.3 已移后台 worker)。
+// 候选字段取首个非空: sendertitle → receivertitle → scenetext → des。全部取不到返回空串。
+// 嗅探日志只记字段名 + 长度, 不打标题原文 (脱敏, 线上 @1882/@1888)。
+String rpExtractTitle(String content) {
+    try {
+        if (content == null) return "";
+        String[] cands = new String[]{ "sendertitle", "receivertitle", "scenetext", "des" };
+        for (int i = 0; i < cands.length; i++) {
+            String v = null;
+            try { v = hbGetElement(content, "wcpayinfo", cands[i]); } catch (Throwable t) { v = null; }
+            if (v != null) {
+                String s = v.trim();
+                if (!s.isEmpty()) {
+                    // 嗅探日志① (字段来源): 只记字段名 + 长度, 不打标题原文 (脱敏)。
+                    hbBgLog("[RP] " + hbNow() + " stats title: usedField=" + cands[i] + " len=" + s.length());
+                    return s;
+                }
+            }
+        }
+        // 全部字段空: 嗅探日志① 记 none。
+        hbBgLog("[RP] " + hbNow() + " stats title: usedField=none len=0");
+    } catch (Throwable t) {}
+    return "";
+}
+
+// ==================== perf 落盘 (线上 perfFlush @4035 逐字; 收口 hooks.bsh 占位) ====================
+// 聚合 PERF_* 窗口 → 后台线程追加写 perf.log。worker tick 定时驱动 (有样本才写) + 热路径窗口异常膨胀时兜底调。
+// 脱敏红线: 只写耗时(us)/计数 (ohm/rp_msg/norm/spike/rp_extract 各列), 绝不写 wxid/群名/群ID/消息内容。
+//   快照后立即清零窗口 (新样本进下一窗口); 后台 FileWriter, 绝不在热路径同步写盘 (C-PERF-01)。
+// ★装配体唯一定义点: hooks.bsh 的 `void perfFlush(){}` 占位本任务已移除 → 无双重定义。
+void perfFlush() {
+    try {
+        long n = PERF_N;
+        if (n <= 0L) return;
+        long fN = n;
+        long fSum = PERF_SUM_NS;
+        long fMax = PERF_MAX_NS;
+        // v1.6.2: spike 归因字段快照。
+        long fRpN = PERF_RP_N;
+        long fRpSum = PERF_RP_SUM_NS;
+        long fRpMax = PERF_RP_MAX_NS;
+        long fNormN = PERF_NORM_N;
+        long fNormSum = PERF_NORM_SUM_NS;
+        long fNormMax = PERF_NORM_MAX_NS;
+        long fSpikeN = PERF_SPIKE_N;
+        long fSpikeRp = PERF_SPIKE_RP_N;
+        long fSpikeNorm = PERF_SPIKE_NORM_N;
+        long fExN = PERF_EXTRACT_N;
+        long fExSum = PERF_EXTRACT_SUM_NS;
+        long fExMax = PERF_EXTRACT_MAX_NS;
+        // 清零窗口 (快照后立即清, 新样本进下一窗口)。v1.6.2 新增组同步清零。
+        PERF_N = 0L; PERF_SUM_NS = 0L; PERF_MAX_NS = 0L;
+        PERF_RP_N = 0L; PERF_RP_SUM_NS = 0L; PERF_RP_MAX_NS = 0L;
+        PERF_NORM_N = 0L; PERF_NORM_SUM_NS = 0L; PERF_NORM_MAX_NS = 0L;
+        PERF_SPIKE_N = 0L; PERF_SPIKE_RP_N = 0L; PERF_SPIKE_NORM_N = 0L;
+        PERF_EXTRACT_N = 0L; PERF_EXTRACT_SUM_NS = 0L; PERF_EXTRACT_MAX_NS = 0L;
+        new Thread() {
+            public void run() {
+                try {
+                    long avgUs = (fSum / fN) / 1000L;
+                    long maxUs = fMax / 1000L;
+                    long nowMs = System.currentTimeMillis();
+                    String iso = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date(nowMs));
+                    // v1.6.2: A/B 分类均值/最大 (各自 n 为 0 时置 0, 防除零)。
+                    long rpAvgUs = (fRpN > 0L) ? ((fRpSum / fRpN) / 1000L) : 0L;
+                    long rpMaxUs = fRpMax / 1000L;
+                    long normAvgUs = (fNormN > 0L) ? ((fNormSum / fNormN) / 1000L) : 0L;
+                    long normMaxUs = fNormMax / 1000L;
+                    long exAvgUs = (fExN > 0L) ? ((fExSum / fExN) / 1000L) : 0L;
+                    long exMaxUs = fExMax / 1000L;
+                    String line = "ts=" + nowMs + " iso=" + iso + " n=" + fN
+                        + " ohm_avg_us=" + avgUs + " ohm_max_us=" + maxUs
+                        + " rp_msg_n=" + fRpN + " rp_msg_avg_us=" + rpAvgUs + " rp_msg_max_us=" + rpMaxUs
+                        + " norm_avg_us=" + normAvgUs + " norm_max_us=" + normMaxUs
+                        + " spike_n=" + fSpikeN + " spike_rp=" + fSpikeRp + " spike_norm=" + fSpikeNorm
+                        + " rp_extract_n=" + fExN + " rp_extract_avg_us=" + exAvgUs + " rp_extract_max_us=" + exMaxUs + "\n";
+                    java.io.FileWriter fw = new java.io.FileWriter(PERF_LOG, true);  // append
+                    try { fw.write(line); } finally { fw.close(); }
+                } catch (Throwable t) {
+                    try { log("RedPacketStats perf flush fail: " + t); } catch (Throwable t2) {}
+                }
+            }
+        }.start();
+    } catch (Throwable t) {
+        try { log("RedPacketStats perfFlush err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// ==================== 每日定时统计 (线上 rpDailyCheck @2494 逐字 + 发送 seam) ====================
+// worker-tick 驱动 (抗重启, 不用精确定时器): 到点(curHour>=cfgDailyHour)且今天未发(last_sent != today) → 标记 last_sent + 触发每日发送。
+//   先置 last_sent (即使发送出错也不重发, 避免循环刷屏; 心跳本身能反映)。窗口 = [昨天 hour:00, 今天 hour:00)。
+// ★ 仅 "组装+发送" (rpDb/rpReadRow/getDailyGroups/rpBuildGroupedMsgs/sendText, 依赖 DB/反射/发送) 经 rpDailySend seam → 属 T6。
+//   日期闸门本身 (cfgDailyHour/rpToday/rpTodayHourMs + K_DAILY_LAST_SENT 读写) 是纯逻辑(Calendar/SimpleDateFormat + HOST KV),
+//   故本片【真实移植】之 (逐字保真线上), 非 seam — 它们随 worker tick 驱动, 不碰 DB/反射, 可本地解析/测。
+void rpDailyCheck() {
+    try {
+        int hour = cfgDailyHour();
+        java.util.Calendar cal = java.util.Calendar.getInstance();   // 本地时区
+        int curHour = cal.get(java.util.Calendar.HOUR_OF_DAY);
+        if (curHour < hour) return;   // 还没到今天的发送时刻
+        String today = rpToday();
+        String last = HOST.getString(RP_K_DAILY_LAST_SENT, "");
+        if (last != null && last.equals(today)) return;   // 今天已发过
+        // 到点且今天未发 → 执行每日发送。先置 last_sent (即使发送过程出错也不重发)。
+        HOST.putString(RP_K_DAILY_LAST_SENT, today);
+        hbBgLog("[RP] " + hbNow() + " daily-check: trigger daily send (hour>=" + hour + ", today=" + today + ", last marked). ");
+        // 窗口 = [今天 hour:00 往前 24 小时 (即昨天 hour:00), 今天 hour:00)。
+        long windowEnd = rpTodayHourMs(hour);
+        long windowStart = windowEnd - 24L * 3600L * 1000L;
+        rpDailySend(windowStart, windowEnd, false);   // ★seam(T6): 组装+发送
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " daily-check err: " + t);
+    }
+}
+
+// 今天本地 hour:00:00.000 的毫秒 (线上 rpTodayHourMs @2516 逐字)。
+long rpTodayHourMs(int hour) {
+    try {
+        java.util.Calendar cal = java.util.Calendar.getInstance();
+        cal.set(java.util.Calendar.HOUR_OF_DAY, hour);
+        cal.set(java.util.Calendar.MINUTE, 0);
+        cal.set(java.util.Calendar.SECOND, 0);
+        cal.set(java.util.Calendar.MILLISECOND, 0);
+        return cal.getTimeInMillis();
+    } catch (Throwable t) { return System.currentTimeMillis(); }
+}
+
+// ==================== 单工作者 tick (线上 rpWorkerTick @1666-1710 逐字) ====================
+// §15.3: 每日检查 → perf flush → 看门狗 → 单飞 return → 挑最早到期 job 出队 → 进在飞 → hbProcess。末尾必自重调度 (finally), 工作者绝不停摆。
+void rpWorkerTick() {
+    try {
+        long now = System.currentTimeMillis();
+        // v1.4.0 §20: 每日定时检查 (抗重启, 不用精确定时器)。整段独立 try/catch, 异常不影响红包流水线。
+        try { rpDailyCheck(); } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-check err: " + t); }
+        // v1.4.0: perf 聚合落盘 (worker 必跑, 借此定时 flush; 有样本才写)。独立 try/catch。
+        try { if (PERF_N >= (long) PERF_FLUSH_EVERY) perfFlush(); } catch (Throwable t) {}
+        // 1) 看门狗: 在飞超时强清
+        if (IN_FLIGHT && (now - inflightStartMs) > RP_WATCHDOG_MS) {
+            hbBgLog("[RP] " + hbNow() + " WATCHDOG: in-flight " + ((now - inflightStartMs) / 1000L) + "s > " + (RP_WATCHDOG_MS / 1000L) + "s. force-clear in-flight (key=" + rpCurKey() + ").");
+            try { SEEN.clear(); } catch (Throwable t) {}
+            IN_FLIGHT = false; CUR_JOB = null;
+        }
+        // 2) 单飞: 有在飞则等
+        if (IN_FLIGHT) return;
+        // 3) 挑 dueAt<=now 最早的 job 出队
+        Object[] picked = null;
+        synchronized (RP_QUEUE) {
+            int bestIdx = -1; long bestDue = Long.MAX_VALUE;
+            for (int i = 0; i < RP_QUEUE.size(); i++) {
+                Object[] q = (Object[]) RP_QUEUE.get(i);
+                if (q == null) continue;
+                long due = ((Long) q[JOB_DUEAT]).longValue();
+                if (due <= now && due < bestDue) { bestDue = due; bestIdx = i; }
+            }
+            if (bestIdx >= 0) { picked = (Object[]) RP_QUEUE.get(bestIdx); RP_QUEUE.remove(bestIdx); }
+        }
+        if (picked == null) return;   // 无到期 job, 等下个 tick
+        // 出队成功 → 进入在飞
+        IN_FLIGHT = true; inflightStartMs = System.currentTimeMillis(); CUR_JOB = picked;
+        try { SEEN.clear(); } catch (Throwable t) {}   // 新 job 开始, 清上一 job 残留页面去重 (单飞下安全)
+        int attempt = ((Integer) picked[JOB_ATTEMPT]).intValue();
+        hbBgLog("[RP] " + hbNow() + " worker: pick job (attempt=" + attempt + ", queue left=" + rpQueueSize() + ") -> hbProcess.");
+        try { hbProcess(picked); }
+        catch (Throwable t) {
+            hbBgLog("[RP] " + hbNow() + " worker hbProcess err: " + t + ". clear in-flight.");
+            IN_FLIGHT = false; CUR_JOB = null;
+        }
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " worker tick err: " + t);
+    } finally {
+        // §15.3: 任何情况下必重调度, 工作者绝不停摆。
+        try { delay(RP_TICK_MS, new Runnable() { public void run() { rpWorkerTick(); } }); } catch (Throwable t) {}
+    }
+}
+
+// ==================== 统一清在飞 (线上 rpClearInFlight @1713 逐字) ====================
+// v1.1.0 §15.5: 流水线退出点调用。
+void rpClearInFlight() { IN_FLIGHT = false; CUR_JOB = null; }
+
+// ==================== hbProcess: 出队后 worker 侧解析 → 开封面页 (线上 @1753-1829 逐字) ====================
+// 一次尝试。v1.6.3 (C-PERF-03): 原热路径"重活"在此后台 worker 线程执行 (逻辑不变, 只换线程/时机)。
+//   出队后才解析: (a) 专属判定(early-exit, 仅 attempt==0) → (b) nativeurl(开页用) → (c) title(写库, 回填本 job) + 包类型 rpIsCustom 回填 JOB_ISCUSTOM。
+//   只在首跑(attempt==0)解析专属/title (重试时 job 已带回填值; 专属在首跑已被早退, 不会有重试)。
+// ★UI 启动器 (hostContext/getTopActivity + Intent + startLuckyMoneyReceive) → seam rpOpenCover(talker, nativeurl), 属 T4。
+//   rpOpenCover 内部负责取 hostContext / 无 hostCtx 兜底处理。本片调它后, 在飞由 onResume 链路(T4/T5)各退出点清; 看门狗 30s 兜底强清。
+void hbProcess(Object[] job) {
+    try {
+        if (job == null) { hbBgLog("[RP] " + hbNow() + " hbProcess: job null, skip. clear in-flight."); rpClearInFlight(); return; }
+        int attempt = ((Integer) job[JOB_ATTEMPT]).intValue();
+        String talker = (String) job[JOB_TALKER];
+        String key = (String) job[JOB_KEY];
+        String content = (String) job[JOB_CONTENT];
+        hbBgLog("[RP] " + hbNow() + " hbProcess attempt=" + attempt + " -> (worker-side parse) opening cover " + UI_RECEIVE + ".");
+
+        // ---- v1.6.3 (C-PERF-03): 原热路径"重活"在此后台 worker 线程执行 (逻辑不变, 只换线程/时机)。----
+        String nativeurl = null;
+        if (content != null) {
+            // (a) 专属红包早退: wcpayinfo.exclusive_recv_username 非空 = 指定接收人 → 跳过(不开页/不排程)。
+            //     只在首跑判 (attempt==0); 专属一旦命中即 return, 不会进入重试路径。
+            if (attempt == 0) {
+                String exclusiveRecv = null;
+                try { exclusiveRecv = hbGetElement(content, "wcpayinfo", "exclusive_recv_username"); } catch (Throwable t) { exclusiveRecv = null; }
+                if (exclusiveRecv != null && !exclusiveRecv.trim().isEmpty()) {
+                    hbBgLog("[RP] " + hbNow() + " skip exclusive (exclusive_recv_username present, worker-side). not opening. clear in-flight.");
+                    if (key != null) DONE.add(key);   // 专属: 标记完成, 避免再次入队
+                    // ★刻意未搬 (交 T5): 线上 v1.11.5 @1775 此处 FREELOADER_SNAP.remove(key) — 对应旧"检测时刻拍快照"生命周期。
+                    //   合并版 P3-a 伸手党快照改 in-process T_snap 拍照 (T5 freeloaderRunForPacket, 晚于 hbProcess), 故此刻本包尚无快照。
+                    //   FREELOADER_SNAP 生命周期(拍照/清理) 由 T5 in-process 管理 → 本片不在此 remove。
+                    SEEN.clear();
+                    rpClearInFlight();
+                    return;
+                }
+            }
+            // (b) nativeurl: 开封面页需要 (原热路径解析, 现移此)。
+            try { nativeurl = hbGetElement(content, "wcpayinfo", "nativeurl"); } catch (Throwable t) { nativeurl = null; }
+            if (nativeurl != null && nativeurl.length() == 0) nativeurl = null;
+            // (c) title: rpExtractTitle (原占 ~50ms 热路径 spike, 现在后台)。回填本 job[JOB_TITLE] 供 rpRecordStats 读。
+            //     首跑解析并回填; 重试时 job[JOB_TITLE] 已是首跑回填值, 不重复 parse。
+            if (attempt == 0) {
+                long _exStart = 0L; boolean _exOn = false;
+                try { _exStart = System.nanoTime(); _exOn = true; } catch (Throwable t) { _exOn = false; }
+                String hbTitle = null;
+                try { hbTitle = rpExtractTitle(content); } catch (Throwable t) { hbTitle = null; }
+                if (_exOn) {
+                    try {
+                        long exDur = System.nanoTime() - _exStart;
+                        PERF_EXTRACT_N++;
+                        PERF_EXTRACT_SUM_NS += exDur;
+                        if (exDur > PERF_EXTRACT_MAX_NS) PERF_EXTRACT_MAX_NS = exDur;
+                    } catch (Throwable t) {}
+                }
+                try { job[JOB_TITLE] = (hbTitle == null) ? "" : hbTitle; } catch (Throwable t) {}
+                // v1.7.0 §22.2 (v1.7.1): 包类型判定 (worker 内, 零热路径)。该群定制关 → 普通; 否则 title 包含 kw → 定制。
+                //   rpIsCustom/isCustomOn/getCustomKw 已在 domain/redpacket_qualify.bsh 抽好 → 直接调。
+                //   回填本 job[JOB_ISCUSTOM] 供 hbDetailExtract 透传给 hbTierAndSend。整段 try/catch, 异常退回普通(FALSE)。
+                try {
+                    boolean isCustom = rpIsCustom(talker, (String) job[JOB_TITLE]);
+                    job[JOB_ISCUSTOM] = isCustom ? Boolean.TRUE : Boolean.FALSE;
+                    hbBgLog("[RP] " + hbNow() + " pkg-type: " + (isCustom ? "custom" : "normal") + " (custom_on=" + isCustomOn(talker) + ", kwLen=" + getCustomKw(talker).length() + ", titleLen=" + ((String) job[JOB_TITLE]).length() + ").");
+                } catch (Throwable t) { try { job[JOB_ISCUSTOM] = Boolean.FALSE; } catch (Throwable t2) {} }
+            }
+        }
+
+        // ---- 开封面页 (★seam T4: UI 启动器)。----
+        //   线上 @1810-1822: 取 hostContext (null 回退 getTopActivity().getApplicationContext()), 无 hostCtx → ABORT 清在飞;
+        //   否则建 Intent(key_native_url/key_username/key_is_self_sent) + startLuckyMoneyReceive(hostCtx, intent)。
+        //   ★刻意未搬 (交 T5): 线上 @1815 无 hostCtx abort 处的 FREELOADER_SNAP.remove(key) — 同上, 旧快照生命周期, T5 in-process 管理。
+        //   全部反射/Intent/上下文取值 + 无 hostCtx 兜底 → rpOpenCover leaf (T4); rpOpenCover 返回 true=已开页(在飞交 onResume 链路清),
+        //   false=未开页(无 hostCtx 等) → 此处兜底清在飞 (与线上 ABORT 行为一致)。
+        boolean opened = rpOpenCover(talker, key, nativeurl);
+        if (!opened) {
+            hbBgLog("[RP] " + hbNow() + " ABORT: cover not opened (no hostContext or open fail). clear in-flight.");
+            rpClearInFlight();
+            return;
+        }
+        // 成功开页后, 在飞由 onResume 链路(封面/详情→各退出点, T4/T5)负责清; 若版本漂移开页失败, 看门狗 30s 兜底强清。
+    } catch (Throwable t) {
+        try { log("RedPacketStats hbProcess err: " + t); } catch (Throwable t2) {}
+        hbBgLog("[RP] " + hbNow() + " hbProcess err: " + t + ". clear in-flight.");
+        rpClearInFlight();
+    }
+}
+
+// ==================== 重试阶梯 (线上 afterCoverNoDetail @2070 逐字) ====================
+// 封面页落地但未进详情(没领完) → 重试阶梯。放弃点 attempt>=3; 否则按 attempt 三段取 retrySec(0→retry1/1→retry2/2→retry3), ±25% 抖动, 重新入队(attempt+1)。
+//   先 finish 封面页 (经 rpFinishCover seam, T4: finishActivityByHash + UI 线程); COVER_ACT 清理。
+//   ★UI finish (finishActivityByHash/getTopActivity/runOnUiThread) → seam rpFinishCover(key), 属 T4。本片调它。
+void afterCoverNoDetail() {
+    Object[] job = CUR_JOB;
+    String key = (job != null) ? (String) job[JOB_KEY] : null;
+    // 先 finish 封面页 (UI 线程) — ★seam(T4)。
+    rpFinishCover(key);
+    if (key != null) COVER_ACT.remove(key);
+
+    if (job == null) { SEEN.clear(); rpClearInFlight(); return; }
+    int attempt = ((Integer) job[JOB_ATTEMPT]).intValue();
+
+    if (attempt >= 3) {
+        // v1.10.0 §4/§15.5: attempt3 (1 小时后) 还没领完 → 放弃 (原 attempt2 10 分钟后放弃, 末档后移一档)
+        if (key != null) DONE.add(key);   // 放弃: 标记完成, 避免再次入队
+        // ★刻意未搬 (交 T5): 线上 v1.11.5 @2083 此处 FREELOADER_SNAP.remove(key) — 旧快照生命周期, T5 in-process 管理。
+        SEEN.clear(); // 该红包流转结束, 清 Activity 去重防内存增长 (下一个红包重新建)
+        rpClearInFlight();
+        hbBgLog("[RP] " + hbNow() + " GIVE UP: attempt=" + attempt + " still not finished. drop this redpacket. in-flight cleared.");
+        return;
+    }
+
+    int nextAttempt = attempt + 1;
+    // v1.10.0 §4: 三段重试阶梯 attempt0→retry1, attempt1→retry2, attempt2→retry3(末档默认1小时)。
+    long retrySec = (attempt == 0) ? cfgRetry1() : ((attempt == 1) ? cfgRetry2() : cfgRetry3());
+    // v1.0.6 §13.1: 重试间隔 ±25% 抖动 (base*0.75 ~ base*1.25)。long 乘防溢出。
+    long retryMs = hbJitter((long) (retrySec * 1000L * 0.75), (long) (retrySec * 1000L * 0.5));
+    long dueAt = System.currentTimeMillis() + retryMs;
+    // §15.5: job 重新入队 (新 dueAt + attempt+1); 复用 talker/sender/msgid/title/content/isCustom/detectMs (10 元组, v1.11.2)。
+    Object[] reJob = new Object[]{ job[JOB_KEY], job[JOB_TALKER], job[JOB_SENDER], job[JOB_MSGID], Long.valueOf(dueAt), Integer.valueOf(nextAttempt), job[JOB_TITLE], job[JOB_CONTENT], job[JOB_ISCUSTOM], job[JOB_DETECTMS] };
+    SEEN.clear(); // 清 Activity 去重, 下次重开封面是新实例
+    rpClearInFlight();   // 先清在飞, 否则 rpEnqueue 会因"在飞"去重而拒绝重入
+    rpEnqueue(reJob);
+    hbBgLog("[RP] " + hbNow() + " not finished at attempt=" + attempt + ". RE-ENQUEUE retry in " + (retryMs / 1000L) + "s (cfg=" + retrySec + "s, jittered, attempt=" + nextAttempt + "). in-flight cleared, queue size=" + rpQueueSize() + ".");
+}
+
+// ============================================================
+// seam 占位 (leaf): 真实实现在后续任务接, 解析门只解析语法 + 调用骨架成立。占位返回值非真实语义。
+// ============================================================
+// ★UI 启动器 (T4): 线上 hbProcess @1810-1822 取 hostContext/getTopActivity + Intent(key_native_url/key_username/key_is_self_sent) + startLuckyMoneyReceive。
+//   返回 true=已开封面页(在飞交 onResume 链路清); false=未开(无 hostContext/版本漂移开页失败) → hbProcess 兜底清在飞。
+//   占位恒返 false (= 不开页, 兜底清在飞, 调用骨架成立); T4 接真实 Intent + 反射 startActivity。
+boolean rpOpenCover(String talker, String key, String nativeurl) { return false; }
+// ★UI finish (T4): 线上 afterCoverNoDetail @2074 finishActivityByHash(COVER_ACT.get(key)) + getTopActivity + runOnUiThread。
+//   占位无副作用; T4 接真实 Activity finish。
+void rpFinishCover(String key) { }
+// ★发送 (T6): 线上 rpDailySend @2530 每日统计"组装+发送" (rpDb/rpReadRow/getDailyGroups/rpBuildGroupedMsgs/sendText, 后台线程)。
+//   占位无副作用; T6 接真实组装+发送 (其中 rpBuildGroupedMsgs 已在 domain/redpacket_export.bsh 抽好, T6 直接调)。
+void rpDailySend(long windowStart, long windowEnd, boolean manual) { }
+
+// ============================================================
+// rpDailyCheck 日期闸门依赖 — 纯逻辑 (Calendar/SimpleDateFormat + HOST KV), 非 seam, 本片逐字保真移植。
+// ============================================================
+String RP_K_DAILY_LAST_SENT = "rp_daily_last_sent";   // 线上 @297: 上次每日发送日期串 (抗重启不重发不漏发)
+String K_DAILY_HOUR_KEY      = "rp_daily_hour";       // 线上 @296: 每日发送小时键
+int    RP_DEF_DAILY_HOUR     = 7;                     // 线上 @298: 默认每日推送小时
+// 每日发送小时 (线上 cfgDailyHour @906 逐字: 夹取 0-23, 越界回默认)。经 rpCfgInt (redpacket_tiers.bsh)。
+int cfgDailyHour() {
+    int h = rpCfgInt(K_DAILY_HOUR_KEY, RP_DEF_DAILY_HOUR); if (h < 0 || h > 23) h = RP_DEF_DAILY_HOUR; return h;
+}
+// 今天日期串 yyyy-MM-dd (线上 rpToday @2314 逐字)。
+String rpToday() {
+    try { return new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date()); }
+    catch (Throwable t) { return "?"; }
+}

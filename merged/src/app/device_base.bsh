@@ -1,0 +1,167 @@
+// ============================================================
+// app/device_base — RedPacketStats 设备层【共享顶层声明 + 通用工具 helper】基座 (P3-b T1)。
+// 逐字保真移植自线上 plugins/redpacket-stats/main.java v1.11.5 (主要 @282-287 / @326-444 / @4093-4111)。
+// 供后续 device 模块共用: T2(检测热路径 onHandleMsg)、T3(worker+Job 调度/重试)、T4(UI 自动化)、
+//   T5(反射领取者→RECV 端口+伸手党调度)、T6(发送)。
+//
+// ★只搬【声明 + 纯工具 helper(hbJitter/hbBgLog/hbNow)】, 不搬任何函数体逻辑/hook 注册/onLoad。
+//   onHandleMsg/hbProcess/UI/extract/send/dialog/onLoad/onResume hook 全在 T2-T8, 本片不碰。
+//
+// ★刻意未搬 (已被 domain/app 模块声明, device 复用其声明, 不重复以免顶层重声明冲突):
+//   - FREELOADER_MAX_WARN          → domain/freeloader.bsh:22 (=10, 同值)。本片不再声明, 设备代码复用之。
+//   - 全部 K_*/DEF_* 配置键/默认值 (tier/qualify/export/freeloader 相关)
+//       → domain/redpacket_tiers.bsh (RP_K_*/RP_DEF_*)、redpacket_qualify.bsh (RPQ_K_*)、
+//         redpacket_export.bsh (RP_K_EXPORT_*/RP_DEF_EXPORT_TARGET)、app/redpacket_app.bsh (K_FREELOADER_SINCE_PREFIX)。
+//     这些是领域配置键, 不属设备层独占 → 本片不搬。
+// ============================================================
+
+// ==================== v1.11.0 §25: 红包伸手党 设备侧基座 (线上 @282-287) ====================
+// (注: FREELOADER_MAX_WARN 已在 domain/freeloader.bsh:22 声明=10, 本片不重复声明。)
+long FREELOADER_FLUSH_GRACE_MS = 60000L;               // v1.11.1 §25: last_speak flush 容差(60s, 防抢前刚发言未落盘误判)
+// v1.11.5 §25.10: 检测时刻快照表。key=JOB_KEY 字符串; value=HashMap<wxid(String)->Long(last_speak ms; NULL 存 0L; 不在表里=不 put)>。
+//   onHandleMsg 入队后 fire-and-forget 线程在「红包到达那一刻」快照本群 speak (赶在抢后发言落盘之前); 判定用快照值+当前值双判据; 判定/清理路径 remove 防泄漏; >200 backstop clear。
+java.util.concurrent.ConcurrentHashMap FREELOADER_SNAP = new java.util.concurrent.ConcurrentHashMap();
+int FREELOADER_SNAP_MAX = 200;                         // backstop: put 前 size>此值 → clear() 防泄漏
+
+// ==================== 对象图遍历强上界 (ANR 防护, 线上 @326-328) ====================
+int MAX_VISIT = 4000;
+int MAX_DEPTH = 6;
+
+// 详情页落地后, 后台反射等 cgi 数据到位 (v1.0.6: 抖动 3000~4500ms, 去零方差; 每次调用 hbJitter 现算)
+int REFLECT_DELAY_BASE_MS = 3000; int REFLECT_DELAY_SPAN_MS = 1500;
+// 封面页落地后, UI 线程有界查找 detail 入口 (v1.0.6: 抖动 1500~2800ms; 每次调用 hbJitter 现算)
+int RECEIVE_CLICK_DELAY_BASE_MS = 1500; int RECEIVE_CLICK_DELAY_SPAN_MS = 1300;
+
+// 随机抖动 helper (v1.0.6 §13.1): base + Math.random()*span。去零方差机器指纹。
+// BeanShell 设备上 Math.random() 可用; 任何异常退回 base (绝不返回负/0 异常值)。
+long hbJitter(long baseMs, long spanMs) {
+    try {
+        if (spanMs <= 0L) return baseMs;
+        return baseMs + (long) (Math.random() * (double) spanMs);
+    } catch (Throwable t) { return baseMs; }
+}
+
+// View 树查找强上界 (线上 @344-346)
+int CLICK_MAX_NODES = 800;
+int CLICK_MAX_DEPTH = 50;
+
+// 防重复注册守卫 (线上 @348-349)
+boolean HOOKED = false;
+
+// 每 Activity 实例只处理一次 (key = identityHashCode) (线上 @351-352)
+java.util.Set SEEN = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+// 每红包只成功处理一次 (key = nativeurl) (线上 @354-355)
+java.util.Set DONE = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+// v1.1.0: 旧"红包运行态 RP_STATE"已被 Job 队列(§15)取代; talker/sender/msgid/attempt 全部随 Job 在队列/CUR_JOB 中携带, 不再单独存 Map。
+
+// onHandleMsg 去重 (每红包只排一次首跑) (线上 @359-360)
+java.util.Set OPENED = java.util.Collections.synchronizedSet(new java.util.HashSet());
+
+// bot 自己开的封面页 Activity (key = nativeurl -> identityHashCode of NewReceiveUI), 用于点详情成功后连封面一起 finish (线上 @362-363)
+java.util.Map COVER_ACT = java.util.Collections.synchronizedMap(new java.util.HashMap());
+
+// ==================== v1.1.0 §15: 队列 + 单工作者(单飞) (线上 @365-383) ====================
+// Job = Object[]{ key(=廉价去重key k:talker:sender:msgid, String), talker(String), sender(String), msgid(Long), dueAt(Long, ms), attempt(Integer), title(String), content(String 原始消息 XML) }
+// 索引常量 (BeanShell 无 enum, 用 int 常量映射)。v1.3.0: 加 JOB_TITLE 第 7 槽 (供后台写统计 DB 用)。
+// v1.6.3: 去重 key 改用廉价 k:talker:sender:msgid (不再依赖 nativeurl XML parse); 加 JOB_CONTENT 第 8 槽携原始 content,
+//         worker(hbProcess) 出队后才做 nativeurl/exclusive/title 的 XML 解析 (重活移出热路径, C-PERF-03)。
+//         入队时 JOB_TITLE 留空, 由 worker rpExtractTitle 后写回本 job 数组 (CUR_JOB), 供 rpRecordStats 读。
+// v1.7.0 §22: 加 JOB_ISCUSTOM 第 9 槽 (Boolean), worker(hbProcess) 判定包类型后回填本 job, hbDetailExtract 取用透传给 hbTierAndSend。
+//   入队时留 Boolean.FALSE; worker 拿到 title 后 rpIsCustom 算出真值并回填。绝不在热路径算 (C-PERF-01/03)。
+int JOB_KEY = 0; int JOB_TALKER = 1; int JOB_SENDER = 2; int JOB_MSGID = 3; int JOB_DUEAT = 4; int JOB_ATTEMPT = 5; int JOB_TITLE = 6; int JOB_CONTENT = 7; int JOB_ISCUSTOM = 8; int JOB_DETECTMS = 9;
+// 待处理 Job 队列 (生产者 onHandleMsg 入队; 单工作者出队)。所有读写持 RP_QUEUE 自身锁 (synchronized(RP_QUEUE))。
+java.util.List RP_QUEUE = new java.util.ArrayList();
+int RP_QUEUE_MAX = 50;           // 队列上限: 满则丢最旧一条 + log
+int RP_TICK_MS = 3000;           // 单工作者自重调度间隔
+long RP_WATCHDOG_MS = 30000L;    // 看门狗: 在飞超过此值强清 (防卡死)
+boolean WORKER_STARTED = false;  // 防重复启动工作者
+// 在飞态 (单飞: 同一时刻只一个红包流水线)。CUR_JOB = 当前处理的 Job 对象 (旧 CUR_NATIVEURL 升级)。
+boolean IN_FLIGHT = false;
+Object[] CUR_JOB = null;
+long inflightStartMs = 0L;
+
+// 同群红包提醒上次发送时间 (groupId -> lastSentMs), 用于 @ 限频 (v1.0.6 §13.3, 内存, 不落盘) (线上 @385-386)
+java.util.Map RP_LAST_MSG = java.util.Collections.synchronizedMap(new java.util.HashMap());
+
+// v1.9.0 §24.2: 好友/群 list 缓存 (getFriendList()/getGroupList() 可能慢; 首次用时后台线程加载, 简单不主动失效)。
+// 只在「转发对象」子页后台线程读写, 不碰热路径 (C-PERF-01/03)。null = 尚未加载。(线上 @390-391)
+java.util.List sCachedFriendList = null;
+java.util.List sCachedGroupList = null;
+
+String HB_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/rp.log";   // 线上 @393
+
+// ==================== v1.4.0: 轻量 perf 埋点 (仿 GroupAdmin; 为明早性能分析) (线上 @395-429) ====================
+// 热路径(onHandleMsg)只做 nanoTime + 整型累加, 绝不每条写文件/写 log (埋点不得反噬热路径)。
+// 聚合行由 rpWorkerTick 定时驱动落盘 (worker 必跑), 或窗口异常膨胀时兜底 flush。perf.log 与 rp.log 分开。
+// perf.log 只写耗时/计数, 绝不写 wxid/群名/群ID/消息内容。
+String PERF_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/perf.log";
+int  PERF_FLUSH_EVERY = 200;   // 每累计 N 条(或 worker tick)聚合落盘一行
+long PERF_N           = 0L;    // 当前窗口样本数 (onHandleMsg 调用数)
+long PERF_SUM_NS      = 0L;    // 窗口 onHandleMsg 累计耗时 (ns)
+long PERF_MAX_NS      = 0L;    // 窗口 onHandleMsg 最大耗时 (ns)
+
+// ==================== v1.6.2: spike 归因埋点 (诊断用, 仿上方 PERF_* 风格) ====================
+// 目的: 区分 "每 ~200 条出现 1 次 200-370ms onHandleMsg max spike" 是 (A)真红包那条在热路径做重活,
+//       还是 (B)GC/框架抖动落在普通消息上。判据: spike 几乎全落普通消息→GC/框架抖动(与本插件无关);
+//       spike 集中在红包消息→extract/入队在热路径做了重活, 需移后台。
+// 实现: 仍只 nanoTime + 顶层整型累加, 绝不在热路径加 IO/log/反射。分类由 onHandleMsgBody 设的 PERF_LAST_RP 标记驱动。
+// 分类: A 红包消息 = 命中检测(isHb)且本群启用, 走 extract title + 入队(或 skip exclusive)那条路径;
+//       B 普通消息 = 未命中或未启用, 快速 return。
+long PERF_RP_SUM_NS   = 0L;    // 窗口内 红包消息 累计 onHandleMsg 耗时 (ns)
+long PERF_RP_MAX_NS   = 0L;    // 窗口内 红包消息 最大单条耗时 (ns)
+long PERF_RP_N        = 0L;    // 窗口内 红包消息 条数
+long PERF_NORM_SUM_NS = 0L;    // 窗口内 普通消息 累计 onHandleMsg 耗时 (ns)
+long PERF_NORM_MAX_NS = 0L;    // 窗口内 普通消息 最大单条耗时 (ns)
+long PERF_NORM_N      = 0L;    // 窗口内 普通消息 条数
+long PERF_SPIKE_NS    = 50000000L; // spike 阈值 = 50ms = 50_000_000ns (>此值算一次 spike)
+long PERF_SPIKE_N     = 0L;    // 窗口内 spike 总数 (>阈值的条数)
+long PERF_SPIKE_RP_N  = 0L;    // 窗口内 spike 且是红包消息 的条数 (关键判据)
+long PERF_SPIKE_NORM_N= 0L;    // 窗口内 spike 且是普通消息 的条数 (关键判据)
+// onHandleMsgBody 把 "本条是否被当红包处理" 写进这个标记, 供 wrapper 在 finally 里按 A/B 分类计时。
+// 默认 false; body 入口处由 wrapper 清, body 内确认红包后置 true。
+boolean PERF_LAST_RP  = false;
+// (可选 §4) rpExtractTitle 耗时单独累加。v1.6.3: extract 已移到后台 worker(hbProcess), 此计时现在 worker 线程累加,
+//   不再计入 onHandleMsg 热路径 — 故热路径 rp_msg 耗时应大幅下降, rp_extract_* 仍可观测提取耗时但不再反噬热路径。
+long PERF_EXTRACT_SUM_NS = 0L; // 窗口内 rpExtractTitle 累计耗时 (ns, v1.6.3 后台 worker 侧)
+long PERF_EXTRACT_MAX_NS = 0L; // 窗口内 rpExtractTitle 最大单次耗时 (ns)
+long PERF_EXTRACT_N      = 0L; // 窗口内 rpExtractTitle 调用次数
+
+// v1.3.0 §17: 统计本地 SQLite (rp_record, 一红包一行)。库与 rp.log 同目录 (GroupAdmin 同级目录建库已验证可行)。(线上 @431-436)
+String RP_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/redpacket_stats.db";
+// v1.11.0 §25: GroupAdmin 库 (只读查 speak.last_speak, 与 RP 库同级目录)。
+String GA_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdmin/groupadmin.db";
+android.database.sqlite.SQLiteDatabase RP_DB = null;   // 连接单例 (懒打开)
+Object RP_DB_LOCK = new Object();                       // 打开连接串行化 (防并发各 open 一次泄漏)
+
+// ==================== UI/包常量 (线上 @438-444) ====================
+String UI_RECEIVE = "LuckyMoneyNewReceiveUI";
+String UI_DETAIL  = "LuckyMoneyNewDetailUI";
+String LM_PKG = "com.tencent.mm.plugin.luckymoney";
+int HB_MSG_TYPE = 436207665;
+
+// detail 入口文案 (已领完才有这种"可点"入口)
+String[] DETAIL_TEXTS = {"看看大家的手气", "查看领取详情"};
+
+// ==================== 通用日志 helper (纯工具, 线上 @4093-4111 逐字) ====================
+// 后台线程追加写 rp.log (绝不在热路径同步写盘)。
+void hbBgLog(final String content) {
+    try {
+        new Thread() {
+            public void run() {
+                try {
+                    java.io.FileWriter fw = new java.io.FileWriter(HB_LOG, true);
+                    try { fw.write(content); fw.write("\n"); } finally { fw.close(); }
+                } catch (Throwable t) {
+                    try { log("RedPacketStats bg write fail: " + t); } catch (Throwable t2) {}
+                }
+            }
+        }.start();
+    } catch (Throwable t) {}
+}
+
+String hbNow() {
+    try { return new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date()); }
+    catch (Throwable t) { return "?"; }
+}

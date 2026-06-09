@@ -1,0 +1,74 @@
+// L1 单测 (P3-b T3): redpacket_worker 的纯字符串函数 hbGetElement / rpExtractTitle (XML→title)。
+//   逐字保真线上 plugins/redpacket-stats/main.java hbGetElement(@1895) / rpExtractTitle(@1872)。
+//   这两个是纯函数 (DocumentBuilder XML 解析, 无 DB/反射/UI/线程), 可本地坐实解析正确。
+// 依赖: hbBgLog/hbNow (生产在 device_base.bsh; rpExtractTitle 内会调 hbBgLog 记字段名/长度)。
+//   device_base.bsh 顶层有 android.database.sqlite.SQLiteDatabase 类型声明, 本地无 android 运行时无法 source(整片);
+//   本 L1 测只验纯字符串函数, 仅需 hbBgLog/hbNow → 以 test-local stub 提供 (吞掉日志副作用), 不 source device_base。
+//   (装配体的真依赖完整性由 check.sh 的去 final 全文解析门保证, 见 check.sh [2/3]。)
+// 运行 cwd = merged/。
+source("tests/_harness.bsh");
+
+// test-local stub: 生产 hbBgLog 启后台线程写 HB_LOG(本地路径不存在); 测试吞掉, 不写盘不抛。
+void hbBgLog(String s) { /* swallow in test */ }
+String hbNow() { return "00:00:00"; }
+
+source("src/app/redpacket_worker.bsh");        // 被测: hbGetElement/rpExtractTitle (其余函数体不在本测调用路径上)
+
+// 微信红包消息典型 content 形如 "wxid_xxx:\n<msg>...<wcpayinfo>...<sendertitle>...</sendertitle>...</wcpayinfo></msg>"。
+// hbGetElement 先去掉首行 "<前缀>:\n" 再解析。
+
+// ---- 1: hbGetElement 取 wcpayinfo 下的 sendertitle ----
+String c1 = "wxid_abc:\n<msg><appmsg><wcpayinfo>"
+    + "<sendertitle>恭喜发财</sendertitle>"
+    + "<nativeurl>wxpay://xxx</nativeurl>"
+    + "</wcpayinfo></appmsg></msg>";
+check("1 hbGetElement 取 sendertitle", "恭喜发财".equals(hbGetElement(c1, "wcpayinfo", "sendertitle")));
+check("1 hbGetElement 取 nativeurl", "wxpay://xxx".equals(hbGetElement(c1, "wcpayinfo", "nativeurl")));
+check("1 hbGetElement 不存在的 tag → null", hbGetElement(c1, "wcpayinfo", "exclusive_recv_username") == null);
+
+// ---- 2: rpExtractTitle 候选优先级: sendertitle 优先 ----
+check("2 rpExtractTitle 取 sendertitle (首选)", "恭喜发财".equals(rpExtractTitle(c1)));
+
+// ---- 3: sendertitle 空 → 回退 receivertitle ----
+String c3 = "wxid_abc:\n<msg><wcpayinfo>"
+    + "<sendertitle></sendertitle>"
+    + "<receivertitle>新年快乐</receivertitle>"
+    + "</wcpayinfo></msg>";
+check("3 sendertitle 空 → 回退 receivertitle", "新年快乐".equals(rpExtractTitle(c3)));
+
+// ---- 4: 仅 scenetext → 取 scenetext (sendertitle/receivertitle 缺) ----
+String c4 = "wxid_abc:\n<msg><wcpayinfo><scenetext>场景文案</scenetext></wcpayinfo></msg>";
+check("4 仅 scenetext → 取 scenetext", "场景文案".equals(rpExtractTitle(c4)));
+
+// ---- 5: 仅 des → 取 des (末位候选) ----
+String c5 = "wxid_abc:\n<msg><wcpayinfo><des>描述兜底</des></wcpayinfo></msg>";
+check("5 仅 des → 取 des", "描述兜底".equals(rpExtractTitle(c5)));
+
+// ---- 6: 全候选缺 → 空串 ----
+String c6 = "wxid_abc:\n<msg><wcpayinfo><other>x</other></wcpayinfo></msg>";
+check("6 全候选缺 → 空串", "".equals(rpExtractTitle(c6)));
+
+// ---- 7: null content → 空串 (安全降级) ----
+check("7 null content → 空串", "".equals(rpExtractTitle(null)));
+check("7 null content → hbGetElement null", hbGetElement(null, "wcpayinfo", "sendertitle") == null);
+
+// ---- 8: 候选值带前后空白 → trim 后返回 (rpExtractTitle 内 trim) ----
+String c8 = "wxid_abc:\n<msg><wcpayinfo><sendertitle>  带空白  </sendertitle></wcpayinfo></msg>";
+check("8 候选 trim 后返回", "带空白".equals(rpExtractTitle(c8)));
+
+// ---- 9: sendertitle 纯空白 → 视作空, 回退下一候选 ----
+String c9 = "wxid_abc:\n<msg><wcpayinfo>"
+    + "<sendertitle>   </sendertitle>"
+    + "<receivertitle>回退值</receivertitle>"
+    + "</wcpayinfo></msg>";
+check("9 sendertitle 纯空白 → 回退 receivertitle", "回退值".equals(rpExtractTitle(c9)));
+
+// ---- 10: 畸形 XML → hbGetElement 安全返 null, rpExtractTitle 安全返空串 (不抛) ----
+String c10 = "wxid_abc:\n<msg><wcpayinfo><sendertitle>未闭合";
+boolean noThrow = true;
+String r10 = null;
+try { r10 = rpExtractTitle(c10); } catch (Throwable t) { noThrow = false; }
+check("10 畸形 XML 不抛", noThrow);
+check("10 畸形 XML → 空串", "".equals(r10));
+
+done();

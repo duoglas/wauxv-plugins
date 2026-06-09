@@ -1,48 +1,37 @@
-# PLAN — 合并工程 P2（RedPacketStats 进骨架 + 迁移设计）
+# PLAN — 合并工程 P3-b（设备 seam 移植，纯本地产出 + L3 解析 + 代码审查，零真机）
 
-## 关键现实约束（决定 P2 怎么拆）
-设计文档把 P2 写成"redpacket 领域+测试 + config union 迁移 + 停旧插件 + 真机"。但：
-- 停旧 RP 插件 + config 迁移 = 最终 cutover，只有合并插件真能跑红包（依赖设备反射检测/领取者抽取/UI自动化 + P3 伸手党直连）后才能做。
-- 现在停旧插件会直接让红包瘫掉（merged/ 还没部署、反射层还没接）。
-- 沿用纪律：merged/ 不碰线上插件，直到最终 cutover。
+## 上游状态
+- ✅ P3-a 完成（commit 7e06970）：redpacket_app.bsh 领域装配 + 伸手党 in-process 直连 doWarn，check.sh 17/17 绿。
+- 本期 = P3-b：把线上 `plugins/redpacket-stats/main.java` 的**设备层**逐字保真移植进 merged app/hooks，
+  接掉 P2-a/P3-a 留的 seam（commands LEAF、`_msgGet` 反射缝、isGroupEnabled、RECV 端口、sendQuote）。
+- **零真机**：设备层本地测不了（反射/无障碍 UI/worker/Job/真发送）。本地验收上限 = L3 装配体 bsh 解析 EXIT=0 + 独立 Code Review 逐字保真 + 热路径复杂度审（C-PERF-01/03）。真机留 P3-c。
 
-→ P2 拆两段：能本地测的红包领域逻辑现在抽（纯本地、零真机）；不可逆 cutover 现在只设计、不执行，留到 P3 之后合并插件功能完整时再带独立 PLAN 执行。
+## 铁律（贯穿每个任务）
+1. **逐字保真**：以线上 main.java 为唯一事实源，移植不重写；行为零改动，只换载体（拼接式单文件→模块）。
+2. **热路径零 O(N)**（C-PERF-01/03）：合并后红包检测与 GA 群管在**同一 onHandleMsg**，互斥分支；热路径只做廉价 type/含 `<nativeurl>` 判定 + 入队，重活全在 worker。getString 必走内存缓存（FUSE IO 教训）。
+3. **降级红线不绕过**：伸手党 无快照/失败/无此人 = SKIP，绝不误踢（P3-a 已立，P3-b 接调度不得破坏）。
+4. 每任务完成即 `./build.sh` + 装配体去 final 全文 bsh 解析 EXIT=0（beanshell-parser-stricter 教训），check.sh 保持全绿。
 
-## P2-a（现在做，纯本地，零真机，check.sh 全绿）：红包领域逻辑抽进 merged/
-线上 plugins/redpacket-stats/main.java（4111 行）里可领域化（纯逻辑 + StoragePort 驱动）的部分抽进 merged/src/domain/redpacket.bsh（+ 必要时拆 redpacket_store）。反射/UI/worker/调度留设备 seam，不在本期。
+## 任务拆解（每个 ≤ 独立可 L3 验证；按依赖序）
 
-### 切片（每片 L1/L2 + 红→绿 mutation，check.sh 绿）
-- P2-a1 红包存储：redpacket_stats 表 schema + 录入/查询（rpRecordStats 核心 + 当日聚合）走 StoragePort；L2 sqlite-jdbc 真库测。
-- P2-a2 分档逻辑：getTiers/getTiersByType（per-group 1-10 档、普通vs定制回退）、按金额选档、阈值/动作渲染（含 v1.6.0a "未设档不泄漏"）；config 驱动，L1。
-- P2-a3 达标/排除/定制判定：拼手气vs均分（只判拼手气）、达标(>阈值)、getExcludeList 排除、rpIsCustom(title 包含关键字)；纯逻辑 L1。
-- P2-a4 导出组装：rpBuildGroupedMsgs（按群分条组装多行）、当日统计聚合、转发对象按群路由(cfgExportTargetFor 回退全局)；L2(存储)+L1(组装)。
-- 配置访问器（cfgRetry/cfgDailyHour/cfgExportTarget/cfgCustom* 等）按需抽，走 HOST 端口。
+- **T1 设备基座 + 反射工具**：移植 UI 常量(UI_RECEIVE 等)/hbBgLog/hbNow/反射辅助/去重 key/perf 埋点缝到新 `app/device_*.bsh`（或并入 hooks 基座段）。done：模块解析 EXIT=0。
+- **T2 检测热路径合一**：onHandleMsgBody 红包分支（廉价判定→入队 raw content，dedup k:talker:sender:msgid）并入合并 hooks 的 onHandleMsg，与 GA 群管互斥分支；接掉 `_msgGet` 反射缝。done：装配体解析 EXIT=0 + 热路径复杂度审无 O(N)。
+- **T3 worker + Job 调度/重试**：单飞 tick(看门狗 30s/dueAt 出队)、hbProcess(专属早退/nativeurl/rpExtractTitle 回填 job)、三段重试阶梯/jitter/JOB_DETECTMS 承载 packetMs。done：解析 EXIT=0 + 审查对齐线上 §15/§4。
+- **T4 UI 自动化**：NewReceiveUI/NewDetailUI onResume 路由（有界查找详情入口/performClick/finish/重试/封面连带 finish）。done：解析 EXIT=0 + 审查对齐 §1。
+- **T5 反射领取者 → RECV 端口 + 伸手党调度接线**：hbDetailExtract/hbExtractTriple(d/f/n 首选+抗版本兜底) 实现 P3-a 的 `RECV` 生产适配器；接 freeloaderRunForPacket 的 T_snap=packetMs+G 延迟拍照调度 + G 夹取 + 拍照终结竞态#24 + l3Flush in-process。done：解析 EXIT=0 + 降级红线 mutation 不破坏 + 审查。
+- **T6 发送**：hbTierAndSend 接 domain tiers/qualify(已抽) + sendQuoteMsg 引用条 + @条 sendText + 随机语气/限频/间隔延迟；接掉 host_android sendQuote 占位。done：解析 EXIT=0 + 审查对齐 §22.6。
+- **T7 设置 UI 并入**：RP showConfigDialog + 子页(Basic/NormalTiers/Custom/Delay/Exclude/Forward/伸手党) 并入合并 dialogs（与 GA dialogs 共存），rp_ 文字命令接 commands LEAF 路由。done：解析 EXIT=0 + 审查对齐 §23/§24/§25。
+- **T8 onLoad 合一 + seam 收口**：GA 端口接线 + l3FlushLoop + RP worker tick 启动 + 旧毫秒键清理 + 冷启动日志；接掉 commands 占位 `_cmdGroupEnabled` ↔ hooks isGroupEnabled 同源（P1-d 标的必盯缝）。done：装配体解析 EXIT=0 + check.sh 全绿。
+- **T9 验收（Layer 3/4）**：build → 装配体去 final 全文解析 EXIT=0；独立 Code Reviewer Agent 对照线上逐字保真，重点热路径(C-PERF-01/03)+伸手党降级红线+seam 同源，输出 PASS/FAIL；高风险段(热路径合一)走 Santa 双审。done：0 CRITICAL。
 
-### 明确留设备 seam（本期不抽，占位/TODO 指向线上行号）
-红包检测(onHandleMsg type 判定)、worker 队列(hbProcess)、领取者反射抽取(hbDetailExtract/NewDetailUI/NewReceiveUI)、无障碍 UI 自动化、Job/重试/delay 调度、sendText 真发。最终设备集成期接。
+## ⚠️ 真机不可逆动作：本期一个都不碰
+P3-b 全程纯本地产出 + 解析 + 审查。adb push / 改 per-group 配置 / 真机发红包 / 伸手党触发 doWarn 全部留 P3-c（届时另开 PLAN + 用户在场 scrcpy + Santa 双审 + 灰度单测试群破"测试须先 cutover"死结）。
 
-### P2-a 验收
-merged/check.sh GREEN（build + bsh 解析 EXIT=0 + 所有 L1/L2）；红包领域逐字保真线上（分档/达标/排除/定制/导出 SQL）；Security grep 干净。无任何真机动作。
+## 产出边界（YAGNI）
+- 本期只到设备 seam 移植 + L3 解析 + 代码审查。
+- 不在本期：P3-c 灰度真机 E2E、P2-b 最终 cutover。
 
-## P2-b（现在只设计，不执行）：最终 cutover 方案
-写成可执行脚本 + 回滚预案，留到 P3 之后合并插件功能完整时执行：
-1. config union 迁移：RedPacketStats/config.prop 并入合并插件目录 config.prop（rp_ 前缀零冲突=等价 union）。一次性、脚本化、先备份。
-2. DB 接入：合并插件按绝对路径同时开 groupadmin.db + redpacket_stats.db（或迁 redpacket_stats.db 进合并目录）。数据不动。
-3. 停旧 RedPacketStats 插件（防红包双重处理）。
-4. 回滚：保留两旧插件目录 + config 备份；出问题切回。
-
-## ⚠️ 真机不可逆动作清单（本 P2 PLAN 内一个都不执行，全部留最终 cutover 另开 PLAN 确认）
-- 改/并入合并插件 config.prop（config union）
-- 停用线上 RedPacketStats 插件
-- 部署合并 main.java 到真机、迁移 redpacket_stats.db
-→ 只在 P3 完成、合并插件端到端可跑红包后，带独立 PLAN + 真机 Santa 双审执行。
-
-## 本期产出边界（YAGNI）
-- 只抽 P2-a 红包领域逻辑 + 测试（纯本地）。
-- P2-b 只产出迁移脚本/cutover 文档，不执行。
-- freeloader→doWarn 直连是 P3，不在本期（判定逻辑已就位）。
-
-## 待确认
-1. 同意 P2 这样拆（P2-a 现在抽红包领域+测试纯本地；cutover 留 P3 后执行）？
-2. P2-a 四片一口气做，还是先做某片？
-3. 合并插件最终落哪个目录：复用 GroupAdmin/ 还是新建 GroupAdminPlus/？（影响 P2-b cutover，现在定方向即可，不执行）
+## 已确认决策（2026-06-09）
+1. ✅ 同意 9 任务拆法与顺序（T1→T8 移植、T9 验收）。
+2. ✅ 设备层用**多模块拆分**：新建 `app/device_detect.bsh`/`device_worker.bsh`/`device_ui.bsh`/`device_recv.bsh`（与方案 B"不要单一巨型"一致，便于分任务审查）。
+3. ✅ session 接力：**每 2-3 任务一个 commit 节点**，到 ~400K tokens 主动开新 session（规避长 session tool-call 退化，CLAUDE.md 教训）。

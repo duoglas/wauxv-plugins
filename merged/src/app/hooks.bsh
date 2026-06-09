@@ -177,19 +177,28 @@ List    _msgGetAtUserList(Object msg) { return null; }    // @2150 msg.getAtUser
 //   反射/XML 解析留 P2 (仅 !isText 动作分支才调, 见 C-PERF-01: 普通文本不付此成本)。
 String  _msgGetQuoteTarget(Object msg) { return null; }   // @2460 getQuoteMsg().getSendTalker()
 String  _msgGetQuoteTitle(Object msg)  { return null; }   // @2438-2455 引用 appmsg <title> 文本
+// RP 检测用的两个反射取值缝 (线上 RedPacketStats @1237 msg.getType() / @1262 msg.getMsgId())。
+//   占位返回 0 (= 非红包 type / msgid 0), 让解析门通过 + 调用骨架成立; P2 接 WAuxiliary 反射, L4 真机验。
+int  _msgGetType(Object msg)  { return 0; }    // @1237 ((Number)msg.getType()).intValue() — 红包 type==HB_MSG_TYPE
+long _msgGetMsgId(Object msg) { return 0L; }   // @1262 ((Number)msg.getMsgId()).longValue() — 原红包本地 msgId (供引用)
 
-// 性能埋点缝 (观察性, 无副作用): 线上 @2095-2101 nanoTime 累加进窗口 + 阈值落盘。
-//   骨架置无副作用占位 (P2 接宿主 perf 计数/落盘, L4 真机验); 热路径不付任何文件 IO 成本。
-void _perfRecordOhm(long durNs) { }
+// perf 落盘 (线上 RedPacketStats perfFlush @4035: 聚合 PERF_* 窗口 → 后台写 perf.log)。
+//   ★ P3-b T3 已实现真实落盘: 定义移至 app/redpacket_worker.bsh (worker tick 驱动落盘 + 热路径兜底)。
+//   此处原占位 `void perfFlush(){}` 已移除以避免装配体双重定义 — 本片不再声明 perfFlush, 直接复用 worker 片的实现。
+//   (热路径 onHandleMsg 的兜底 perfFlush 调用仍在下方 wrapper finally; 落盘为后台 FileWriter, 不付热路径 IO 成本。)
 
 // ============================================================
-// onHandleMsg — 性能埋点包装层 (线上 @2086 逐字, T1 / C-PERF-04)。
-// 包装层只测本次 onHandleMsg 总耗时 (观察性缝), 把消息处理委托给 onHandleMsgBody。
-// 埋点全程 try/catch, 任何异常都不影响消息处理 (热路径优先)。
+// onHandleMsg — 性能埋点包装层 (合并版: GA @2086 + RP @1165-1202 的 A/B 分类计时合一, C-PERF-04)。
+// 包装层只测本次 onHandleMsg 总耗时, 把消息处理委托给 onHandleMsgBody。整段 try/catch, 埋点出错绝不影响消息。
+// 合并: 纳入 RP 的 A/B 分类计时 (PERF_LAST_RP 标记 + 红包/普通分类累加 + spike 归因 + 兜底 perfFlush), 逐字对齐线上 RP @1165-1202。
+//   PERF_* 全套在 device_base.bsh (T1) 声明; PERF_LAST_RP 进入前清, onHandleMsgBody 内确认红包 (rpDetectAndEnqueue 命中启用) 才置 true。
+//   只 nanoTime + 顶层整型累加, 绝不在热路径加 IO/log/反射; 兜底 perfFlush 仅窗口异常膨胀时调 (占位无 IO, 真实落盘 T3)。
 // ============================================================
 void onHandleMsg(Object msg) {
-    long _perfStart = 0;
+    long _perfStart = 0L;
     boolean _perfOn = false;
+    // 每条进入前清红包标记 (线上 @1169); body 内确认本条是红包 (命中检测+启用) 才置 true。
+    try { PERF_LAST_RP = false; } catch (Throwable t) {}
     try { _perfStart = System.nanoTime(); _perfOn = true; } catch (Throwable t) { _perfOn = false; }
     try {
         onHandleMsgBody(msg);
@@ -197,63 +206,112 @@ void onHandleMsg(Object msg) {
         if (_perfOn) {
             try {
                 long dur = System.nanoTime() - _perfStart;
-                _perfRecordOhm(dur);   // 观察性缝: 累加窗口计数 + 阈值落盘 (P2 接, 热路径零文件 IO)
+                PERF_N++;
+                PERF_SUM_NS += dur;
+                if (dur > PERF_MAX_NS) PERF_MAX_NS = dur;
+                // 按 A(红包)/B(普通) 分类累加 sum/max/count, 并标记 spike (>阈值) (线上 @1180-1196)。
+                boolean wasRp = false;
+                try { wasRp = PERF_LAST_RP; } catch (Throwable t) { wasRp = false; }
+                if (wasRp) {
+                    PERF_RP_N++;
+                    PERF_RP_SUM_NS += dur;
+                    if (dur > PERF_RP_MAX_NS) PERF_RP_MAX_NS = dur;
+                } else {
+                    PERF_NORM_N++;
+                    PERF_NORM_SUM_NS += dur;
+                    if (dur > PERF_NORM_MAX_NS) PERF_NORM_MAX_NS = dur;
+                }
+                if (dur > PERF_SPIKE_NS) {
+                    PERF_SPIKE_N++;
+                    if (wasRp) PERF_SPIKE_RP_N++;
+                    else PERF_SPIKE_NORM_N++;
+                }
+                // 兜底: 窗口异常膨胀 (worker 长时间没跑) 时才在热路径 flush 一次, 防内存计数溢出/数据失真 (线上 @1198)。
+                if (PERF_N >= (long) PERF_FLUSH_EVERY * 50L) perfFlush();
             } catch (Throwable t) { /* 埋点出错绝不影响消息 */ }
         }
     }
 }
 
 // ============================================================
-// onHandleMsgBody — 采集 + 提取 + 路由 (线上 @2107 逐字结构)。
-// 调用顺序 (与线上一致, 保真红线):
-//   1. 群聊闸门 (最廉价): 非群聊早退 (@2115)。
-//   2. isText 二分取 content: 文本直接取; 非文本且无可读文本 → 先采集(recordSpeak)再早退 (@2117-2143)。
-//      ★ 采集在路由前 (线上如此): 非文本早退点的 recordSpeak (@2138) 与主路径的 recordSpeak (@2217) 互斥。
-//   3. 提取 groupId/sender/atList (@2148-2150) — 经反射缝 _msgGetXxx。
-//   4. 路由: 把提取出的字段交给 commands.routeCommand 分发 (@2158-2469 那段逐字已在 commands.bsh)。
-//      ★ 注意: 主路径"潜水追踪"那次采集 recordSpeak(@2217, 在 isGroupEnabled 闸门之后、命令分发之前)
-//        已在 commands.bsh::routeCommand 内 (@2222-2224 占位真调), 故此处不重复调, 由 routeCommand 承载,
-//        保持线上"采集在 isGroupEnabled 闸门后、命令重逻辑前"的相对位置不变。
-// 热路径 O(1): 采集只调 recordSpeak (内存入队); routeCommand 先廉价判断早退, 命中前缀才进重逻辑。
+// onHandleMsgBody — 合并版: 一条消息同时过 GA (群管采集+路由) 与 RP (红包检测+入队), 互不破坏。
+//   GA 源 = 线上 GroupAdmin onHandleMsgBody @2107。 RP 源 = 线上 RedPacketStats onHandleMsgBody @1204-1320 红包检测分支。
+//
+// ★控制流设计 (为什么这个顺序既保 GA 又保 RP):
+//   1. 群聊闸门 (GA+RP 共需, 最廉价): 非群聊一律不处理 (GA @2115 / RP @1207)。
+//   2. 反射取值一次 (groupId/sender/rawContent/type/msgid/atList): GA 与 RP 共享同一次反射, 不重复取 (省热路径成本)。
+//      rawContent = 原始未 trim 的 content; RP 检测要的就是原始串 (含 <nativeurl> XML), 不能用 GA trim 后的。
+//   3. ★RP 检测分支先跑 (rpDetectAndEnqueue): 必须在 GA 的"非文本+空 content 早退"之前。
+//      原因: 红包是非文本消息 (type==HB_MSG_TYPE, content 常为空 或 含 nativeurl XML)。若先走 GA 的早退,
+//      RP 永远收不到红包。RP 检测 = type 比较 / content.indexOf (O(1)) → rpIsGroupEnabled (RP 缓存, O(1))
+//      → 廉价去重 (OPENED) → 入队 (重活全在 worker)。RP 检测【不 return】, 落回 GA 继续 (见第 4 步红线)。
+//      排除命令 (bot 自发 + @ + "红包排除") 命中才 return 消费 (那是设置动作, 不是聊天消息, GA 无需记)。
+//   4. ★发包人 recordSpeak 保留点 (正确性红线): RP 检测后【不 return】, 继续走 GA 原逻辑。
+//      红包是非文本+空 content → 落到 GA 的"非文本且无可读文本"分支 → recordSpeak(发包人) (GA @2128-2141)。
+//      => 红包消息既被 RP 入队 (RP 行为), 又让发包人被 GA 记一次 speak (GA v1.18.0 "发红包=活动" 红线)。
+//      二者不二选一: RP 不吞 GA 采集, GA 不吞 RP 入队。唯一例外 = 排除命令 (bot 自发设置动作), 此时 return 不记不路由。
+//   5. GA isText 二分 + 路由: 与线上 GroupAdmin 完全一致 (commands.routeCommand 承载主路径 recordSpeak @2217)。
+//
+// 热路径 O(1): RP 检测 (type/indexOf/缓存查/去重/入队≤50) + GA 采集 (recordSpeak 内存写) + routeCommand (廉价早退);
+//   全程零 XML 解析、零未缓存 getString (rpIsGroupEnabled/isGroupEnabled 都走内存缓存)、整段 try/catch 不连坐。
 // ============================================================
 void onHandleMsgBody(Object msg) {
-    // 1. 群聊闸门最廉价, 先判 (非群聊一律不处理) (@2115)。
+    // 1. 群聊闸门最廉价, 先判 (GA @2115 / RP @1207)。
     if (!_msgIsChatroom(msg)) return;
 
-    // 2. isText 二分取 content (@2117-2143)。普通文本零额外成本; 非文本才回看 getContent 判空。
+    // 2. 反射取值一次 (GA+RP 共享)。整段隔离到反射缝, 取值失败按各缝占位语义 (不连坐)。
+    String groupId = _msgGetTalker(msg);       // @2148 / RP @1210
+    String sender  = _msgGetSendTalker(msg);   // @2149 / RP @1211
+    String rawContent = _msgGetContent(msg);   // RP @1212: 原始未 trim (RP 检测要原始 XML 串)
+    List   atList  = _msgGetAtUserList(msg);   // @2150 / RP @1226
+
+    // 3. ★RP 红包检测分支 (必须在 GA 非文本早退之前; 见控制流红线 #3)。
+    //    isLoginSelf 由这里按需算 (仅当 content 含"红包排除" 才需要; 普通消息短路在 rpDetect 内, 不每条调 getLoginWxid)。
+    //    —— 但 getLoginWxid 也是 FUSE 读, 故 isLoginSelf 只在 content 命中"红包排除"时才真算, 普通消息传 false 不付成本。
+    boolean isLoginSelf = false;
+    try {
+        if (rawContent != null && rawContent.indexOf("红包排除") >= 0 && sender != null) {
+            isLoginSelf = sender.equals(HOST.getLoginWxid());
+        }
+    } catch (Throwable t) { isLoginSelf = false; }
+    int  rpType  = _msgGetType(msg);    // RP @1237 (占位 0; 真机反射后红包=HB_MSG_TYPE)
+    long rpMsgid = _msgGetMsgId(msg);   // RP @1262 (占位 0; 真机反射取原红包本地 msgId)
+    boolean rpConsumed = false;
+    try {
+        // rpConsumed=true 仅当 = 排除命令被消费 (bot 自发设置动作); 检测到红包入队仍返 false (红包消息要让 GA 记发包人)。
+        rpConsumed = rpDetectAndEnqueue(groupId, sender, rawContent, rpType, rpMsgid, atList, isLoginSelf);
+    } catch (Throwable t) { rpConsumed = false; }
+    if (rpConsumed) return;   // 排除命令: 已 toast 消费, 不当聊天消息 (GA 不记不路由, 与线上 RP @1229 return 一致)。
+
+    // 4. GA isText 二分取 content (@2117-2143)。普通文本零额外成本; 非文本才回看 content 判空。
     boolean isTextMsg = _msgIsText(msg);
     String content;
     if (isTextMsg) {
-        content = _msgGetContent(msg);
+        content = rawContent;
     } else {
-        content = _msgGetContent(msg);
+        content = rawContent;
         if (content == null || content.trim().isEmpty()) {
-            // 非文本且无可读文本 (图片/表情/语音/红包/文件等): 在早退前先采集一次发言活动 (@2128-2141),
-            // 否则只发非文本消息的人 last_speak 永空被 #潜水 误判。热路径红线: 只调 _msgGetTalker/
-            // _msgGetSendTalker/isGroupEnabled(缓存)/recordSpeak(O(1) 内存写), 绝不解析 XML; 整段 try/catch。
+            // ★非文本且无可读文本 (图片/表情/语音/红包/文件等): 在早退前先采集一次发言活动 (@2128-2141)。
+            //   红包消息正落此分支 → 发包人 last_speak 推进 (GA v1.18.0 "发红包=活动" 红线; RP 已在第 3 步入队)。
+            //   热路径红线: 只调 _msgGetTalker(已取)/_msgGetSendTalker(已取)/isGroupEnabled(缓存)/recordSpeak(O(1) 内存写),
+            //   绝不解析 XML; 整段 try/catch。groupId/sender 复用第 2 步反射取值, 不重复反射。
             try {
-                String _aGid = _msgGetTalker(msg);
-                String _aSnd = _msgGetSendTalker(msg);
-                if (_aSnd != null && !_aSnd.isEmpty() && isGroupEnabled(_aGid)) {
-                    recordSpeak(_aGid, _aSnd);
+                if (sender != null && !sender.isEmpty() && isGroupEnabled(groupId)) {
+                    recordSpeak(groupId, sender);
                 }
             } catch (Throwable _aErr) {}
-            return;   // 非文本且无可读文本 → 采集后不再处理
+            return;   // 非文本且无可读文本 → 采集后不再处理 (GA 路由仅对文本/引用 appmsg)
         }
     }
     if (content == null) return;
     content = content.trim();
     if (content.isEmpty()) return;
 
-    // 3. 提取群消息字段 (@2148-2150) — 经反射缝。
-    String groupId = _msgGetTalker(msg);
-    String sender  = _msgGetSendTalker(msg);
-    List   atList  = _msgGetAtUserList(msg);
     // 引用回复字段 (W2): 仅 !isText 动作分支会用, routeCommand 内按 isTextMsg 二分决定是否消费。
     String quoteTarget = _msgGetQuoteTarget(msg);
     String quoteTitle  = _msgGetQuoteTitle(msg);
 
-    // 4. 路由 (@2158-2469 那段逐字已在 commands.bsh)。routeCommand 内含:
+    // 5. GA 路由 (@2158-2469 那段逐字已在 commands.bsh)。routeCommand 内含:
     //    群管开关命令 → isGroupEnabled 闸门 → 潜水追踪采集 recordSpeak(@2217) → 命令前置授权 → 各命令分发。
     //    返回 true=已消费; false=非命令普通文本 (线上落到普通消息出口, 此处无后续处理)。
     routeCommand(groupId, sender, content, isTextMsg, atList, quoteTarget, quoteTitle);

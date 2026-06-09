@@ -1,0 +1,200 @@
+// ============================================================
+// app/redpacket_detect — RP 红包检测热路径辅助 (P3-b T2)。
+// 逐字保真移植自线上 plugins/redpacket-stats/main.java v1.11.5 的"热路径会用到"的薄函数:
+//   · 本群启用判定 (RP 自己的, 走 RP_ENABLED_CACHE 内存缓存; 线上 isGroupEnabled @992 + rpLoadEnabledCache @976)
+//       —— 命名独立为 rpIsGroupEnabled, 不与 GA 的 isGroupEnabled (membership/dialogs 侧) 撞名。
+//       ★ seam: isGroupEnabled 同源收口是 T8 的事; 本片只保证 RP 用 RP 的开关 (rp_enabled_groups), 不误用 GA 的 (enabled_groups)。
+//   · cfgDelay (线上 @834: 首次延迟秒, 经 rpCfgLong→K_DELAY/DEF_DELAY)
+//   · cfgFreeloaderOn (线上 @840: 伸手党开关; ★T2 不在热路径调它 — v1.11.5 已把它移进检测时快照后台线程,
+//       而合并版 P3-a 已把伸手党快照改为 in-process T_snap 拍照, 检测分支不拍快照不读此开关。带过来仅供 T5 用。)
+//   · rpEnqueue / rpQueueSize (线上 @1638/@1635: 队列入队/读长, 持 RP_QUEUE 锁)
+//   · rpHandleExcludeCmd —— 真实实现属 T7, 本片置 seam/leaf 占位 (参照 hooks.bsh _msgGetXxx / commands.bsh LEAF 写法)。
+//
+// 依赖 (manifest 在本片之前拼入):
+//   device_base.bsh   : OPENED / RP_QUEUE / RP_QUEUE_MAX / JOB_* 槽常量 / IN_FLIGHT / CUR_JOB / DONE / hbBgLog / hbNow / hbJitter
+//   redpacket_tiers.bsh: rpNormGroupId (=trim, RP 键名保真; 不用 membership 复杂版) + rpCfgInt/rpCfgStr 风格
+//   core 端口 STORAGE/HOST/CLOCK (本片用 HOST.getString)
+//
+// ★键名保真红线: RP 配置键一律走 rpNormGroupId (= trim), 与线上 RedPacketStats normGroupId(@964) 一致,
+//   绝不用 membership.bsh 的复杂版 normGroupId, 否则键名漂移读不到线上已有配置。
+// ============================================================
+
+// ---- RP 配置键 + 默认 (逐字保真线上 @261/@275/@278/@318) ----
+//   ★ 这些键属 RP 设备层; GroupAdmin 同名键不同 (GA 用 enabled_groups, RP 用 rp_enabled_groups) → 两闸门独立。
+String RP_K_ENABLED            = "rp_enabled_groups";   // 线上 K_ENABLED @261 (≠ GA enabled_groups)
+String RP_K_DELAY              = "rp_first_sec";        // 线上 K_DELAY @275
+long   RP_DEF_DELAY            = 120L;                  // 线上 DEF_DELAY @318 (首次延迟 120s)
+String RP_K_FREELOADER_ON_PREFIX = "rp_freeloader_on_"; // 线上 K_FREELOADER_ON_PREFIX @278 (默认关)
+
+// ---- cfgLong helper (线上 cfgLong @857 逐字: 空串/异常→默认; 走 HOST 端口) ----
+long rpCfgLong(String key, long def) {
+    try { String s = HOST.getString(key, ""); if (s == null || s.isEmpty()) return def; return Long.parseLong(s.trim()); }
+    catch (Throwable t) { return def; }
+}
+
+// 首次延迟秒 (线上 cfgDelay @834)。
+long cfgDelay() { return rpCfgLong(RP_K_DELAY, RP_DEF_DELAY); }
+
+// 伸手党开关 (线上 cfgFreeloaderOn @840)。★T2 热路径不调; 带过来供 T5 检测时快照/判定调度用。
+//   未缓存 getString = FUSE IO ~26ms (waux-getstring-fuse-io-cache-hotpath / C-PERF-01/03), 故只许后台线程调。
+boolean cfgFreeloaderOn(String gid) {
+    try { return "1".equals(HOST.getString(RP_K_FREELOADER_ON_PREFIX + rpNormGroupId(gid), "")); }
+    catch (Throwable t) { return false; }
+}
+
+// ==================== RP 本群启用 内存缓存 (线上 @966-1008 逐字, v1.6.4) ====================
+// [C-PERF-01/03] 消除红包消息热路径最后一处 per-红包 FUSE 读 (~26ms): rp_enabled_groups 不每条红包都 getString。
+// 命名独立 rpIsGroupEnabled, 不与 GA isGroupEnabled 撞名 (合并装配体里两者同名会撞)。
+// 缓存出错 → 回退直接读 getString (宁可慢不可错: 这是红包在本群是否处理的总闸门)。
+// 归一口径与 RP 线上完全一致 = rpNormGroupId (=trim)。TTL 60s 兜底外部 adb 改 config.prop。
+java.util.HashSet RP_ENABLED_CACHE = null;   // 已启用群 id 集合 (rpNormGroupId 后); null=尚未加载
+long RP_ENABLED_CACHE_TS = 0L;               // 上次加载毫秒
+long RP_ENABLED_TTL_MS   = 60000L;           // 缓存 TTL: 外部改 config.prop 最多此时长后生效
+
+// RP 已启用群 CSV → List (线上 getEnabledGroups @991, 走 RP 自己的键)。
+java.util.List rpGetEnabledGroups() { return parseCsv(HOST.getString(RP_K_ENABLED, "")); }
+
+// 从 config.prop 读 RP_K_ENABLED, 全量 norm 后原子替换缓存。失败保留旧缓存只 log (线上 rpLoadEnabledCache @976)。
+void rpLoadEnabledCache() {
+    try {
+        java.util.List l = rpGetEnabledGroups();
+        java.util.HashSet ns = new java.util.HashSet();
+        for (int i = 0; i < l.size(); i++) {
+            String g = rpNormGroupId((String) l.get(i));
+            if (!g.isEmpty()) ns.add(g);
+        }
+        RP_ENABLED_CACHE = ns;                 // 原子替换
+        RP_ENABLED_CACHE_TS = CLOCK.now();
+    } catch (Throwable t) {
+        try { log("rpLoadEnabledCache failed (keep old cache): " + t); } catch (Throwable t2) {}
+    }
+}
+
+// RP 本群启用判定 (线上 isGroupEnabled @992)。热路径调: 命中缓存 = O(1) 内存查, 不碰 FUSE。
+boolean rpIsGroupEnabled(String groupId) {
+    String g = rpNormGroupId(groupId);
+    if (g.isEmpty()) return false;
+    try {
+        long now = CLOCK.now();
+        if (RP_ENABLED_CACHE == null || (now - RP_ENABLED_CACHE_TS) > RP_ENABLED_TTL_MS) {
+            rpLoadEnabledCache();
+        }
+        if (RP_ENABLED_CACHE != null) return RP_ENABLED_CACHE.contains(g);
+    } catch (Throwable t) {
+        try { log("rpIsGroupEnabled cache error, fallback to direct read: " + t); } catch (Throwable t2) {}
+    }
+    // 回退: 缓存出错时直接读 (保证正确性, 与线上 @1004-1007 一致)。
+    java.util.List l = rpGetEnabledGroups();
+    for (int i = 0; i < l.size(); i++) if (g.equals(rpNormGroupId((String) l.get(i)))) return true;
+    return false;
+}
+
+// ==================== 队列入队/读长 (线上 @1635/@1638 逐字) ====================
+// CUR_JOB 的去重 key (线上 curKey @1632)。CUR_JOB 为空返回 null。
+String rpCurKey() {
+    try { Object[] j = CUR_JOB; if (j == null) return null; return (String) j[JOB_KEY]; } catch (Throwable t) { return null; }
+}
+int rpQueueSize() { synchronized (RP_QUEUE) { return RP_QUEUE.size(); } }
+
+// 入队 (§15.2 线上 @1638): 按 key 去重 (在队/在飞/已完成都不重入); 满 RP_QUEUE_MAX 丢最旧。
+void rpEnqueue(Object[] job) {
+    try {
+        if (job == null) return;
+        String key = (String) job[JOB_KEY];
+        synchronized (RP_QUEUE) {
+            // 去重: 已在队
+            for (int i = 0; i < RP_QUEUE.size(); i++) {
+                Object[] q = (Object[]) RP_QUEUE.get(i);
+                if (q != null && key != null && key.equals((String) q[JOB_KEY])) {
+                    hbBgLog("[RP] " + hbNow() + " enqueue dedup: key already queued, skip.");
+                    return;
+                }
+            }
+            // 去重: 在飞
+            try { if (IN_FLIGHT && key != null && key.equals(rpCurKey())) { hbBgLog("[RP] " + hbNow() + " enqueue dedup: key in-flight, skip."); return; } } catch (Throwable t) {}
+            // 去重: 已完成
+            try { if (key != null && DONE.contains(key)) { hbBgLog("[RP] " + hbNow() + " enqueue dedup: key already done, skip."); return; } } catch (Throwable t) {}
+            // 上限: 丢最旧
+            if (RP_QUEUE.size() >= RP_QUEUE_MAX) {
+                try { RP_QUEUE.remove(0); } catch (Throwable t) {}
+                hbBgLog("[RP] " + hbNow() + " enqueue: queue full (max=" + RP_QUEUE_MAX + "), dropped oldest job.");
+            }
+            RP_QUEUE.add(job);
+        }
+    } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " enqueue err: " + t); }
+}
+
+// ==================== 排除名单 @ 增删命令 seam (线上 rpHandleExcludeCmd @1122) ====================
+// ★真实实现属 T7 (排除名单 @ 增删 + toast)。本片置 leaf 占位 (参照 commands.bsh LEAF / hooks.bsh _msgGetXxx)。
+//   返回 true=已处理(调用方 return 消费, 不当红包/不发群回执); false=不是排除命令(继续走红包检测)。
+//   占位恒返 false (= 不消费), 让解析门通过 + 调用骨架成立; T7 接真实实现。
+boolean rpHandleExcludeCmd(String groupId, String content, java.util.List atList) { return false; }
+
+// ==================== 红包检测 + 入队 (线上 onHandleMsgBody @1234-1320 红包检测分支) ====================
+// 由 hooks.onHandleMsgBody 在 GA 采集/路由之外并行调用 (一条消息同时过 GA 与 RP, 互不破坏)。
+// 入参 (反射缝抽象成入参, 与 GA 路径共享同一次反射取值; 反射在 hooks 占位):
+//   groupId = _msgGetTalker, sender = _msgGetSendTalker, content = _msgGetContent (原始, 可空, 未 trim),
+//   type    = _msgGetType (红包消息 type==HB_MSG_TYPE), msgid = _msgGetMsgId, atList = _msgGetAtUserList,
+//   isLoginSelf = (sender.equals(HOST.getLoginWxid())) —— 由 hooks 算好传入, 避免普通消息每条调 getLoginWxid (FUSE 读)。
+// 返回: true = 本条已被排除命令消费 (调用方据此可决定是否还要让 GA 继续) — 但本片设计上仍让 GA 采集发包人,
+//        故调用方只用此返回值做日志/分类, 不据此吞掉 GA 采集 (见 hooks 注释)。检测到红包入队也返 false (非"消费", 红包消息仍要 GA 记发包人 last_speak)。
+// 热路径 O(1): 检测=type 比较 / content.indexOf; 启用=rpIsGroupEnabled(缓存); 入队=O(队长≤50) 内存; 全程零 XML 解析 (重活在 worker T3)。
+// ★刻意未搬: v1.11.5 检测时刻快照线程 (线上 @1281-1318) — 合并版伸手党快照改 in-process T_snap 拍照 (T5), 检测分支到 rpEnqueue+log 即止。
+boolean rpDetectAndEnqueue(String groupId, String sender, String content, int type,
+                           long msgid, java.util.List atList, boolean isLoginSelf) {
+    try {
+        // ---- (1b) 排除名单 @ 增删 (线上 @1218-1232): 廉价短路顺序 = 先 content.indexOf("红包排除") 再 isLoginSelf ----
+        //   普通消息绝大多数不含"红包排除", 立即短路; 不再每条调 getLoginWxid (isLoginSelf 已由 hooks 按需算)。
+        try {
+            if (content != null && content.indexOf("红包排除") >= 0 && isLoginSelf) {
+                if (atList != null && !atList.isEmpty()) {
+                    boolean handled = rpHandleExcludeCmd(groupId, content, atList);
+                    if (handled) return true;   // 已消费 (排除命令), 不当红包
+                }
+            }
+        } catch (Throwable t) {}
+
+        // ---- (2) 红包检测 (廉价: type 或 字符串包含) (线上 @1234-1244) ----
+        boolean isHb = false;
+        if (type == HB_MSG_TYPE) isHb = true;
+        if (!isHb) {
+            if (content == null) return false;
+            if (content.indexOf("<nativeurl>") < 0) return false;
+            isHb = true;
+        }
+        if (content == null) return false;
+
+        // ---- (3) 本群启用闸门: 没启用直接 return (不开页/不排 delay) (线上 @1247) ----
+        //   ★ 用 RP 自己的 rpIsGroupEnabled (rp_enabled_groups, RP_ENABLED_CACHE), 与 GA 群管闸门独立。
+        if (!rpIsGroupEnabled(groupId)) return false;
+
+        // v1.6.2: 至此本条已确认 = 候选红包消息且本群启用 → 标记供 wrapper finally A/B 分类计时 (线上 @1251)。
+        try { PERF_LAST_RP = true; } catch (Throwable t) {}
+
+        // ---- (4) C-PERF-03: 热路径只做最廉价的判定 + 入队原始数据 (线上 @1253-1280) ----
+        //   不在热路径解析 nativeurl/exclusive/title (重活全在 worker hbProcess, T3)。
+        //   去重 key 廉价 k:talker:sender:msgid (无 XML parse)。原始 content 随 Job 携带 (JOB_CONTENT)。
+        String sender0 = sender; if (sender0 == null) sender0 = groupId;
+        String fTalker = groupId;
+        String fKey = "k:" + fTalker + ":" + sender0 + ":" + msgid;
+        if (!OPENED.add(fKey)) return false;   // 廉价去重: 同一红包 msgid 唯一, 不重复入队
+
+        // v1.1.0 §15.2: 生产者只入队, 不再 per-红包 delay (线上 @1270-1276)。
+        long delaySec = cfgDelay();
+        long delayMs = hbJitter((long) (delaySec * 1000L * 0.75), (long) (delaySec * 1000L * 0.5));   // ±25% 抖动, 去零方差
+        // v1.11.2 §25: 记红包检测时刻 (≈红包发出时刻) 作伸手党判定全员统一基准。已算好 long, O(1) (C-PERF-01)。
+        long detectMs = CLOCK.now();
+        long dueAt = detectMs + delayMs;
+        // Job = { key, talker, sender, msgid, dueAt, attempt=0, title(留空 worker填), content(原始), isCustom(FALSE worker填), detectMs } (线上 @1279)。
+        Object[] job = new Object[]{ fKey, fTalker, sender0, Long.valueOf(msgid), Long.valueOf(dueAt),
+                                     Integer.valueOf(0), "", content, Boolean.FALSE, Long.valueOf(detectMs) };
+        rpEnqueue(job);
+        // ★刻意未搬: v1.11.5 检测时刻快照线程 (线上 @1281-1318)。合并版伸手党快照改 in-process T_snap 拍照 (T5)。
+        hbBgLog("[RP] " + hbNow() + " redpacket candidate in enabled group (type=" + type
+            + "). enqueued raw (dueAt=now+" + (delayMs / 1000L) + "s, cfg=" + delaySec + "s, jittered, attempt=0). queue size=" + rpQueueSize() + ". (extract/exclusive deferred to worker)");
+        return false;   // 红包入队≠消费: 红包消息仍要让 GA 记发包人 last_speak (见 hooks 注释)
+    } catch (Throwable t) {
+        try { log("RedPacketStats rpDetectAndEnqueue err: " + t); } catch (Throwable t2) {}
+        return false;
+    }
+}
