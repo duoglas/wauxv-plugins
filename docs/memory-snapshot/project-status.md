@@ -9,6 +9,16 @@ metadata:
 
 **截至 2026-06-09。换机器/新 session 先看这条接上工作。**
 
+## 大工程进行中:GroupAdmin + RedPacketStats 合并(方案 B + 强制本地测试)
+用户要把红包统计合并进群管,成**一个**插件、直接共享数据/逻辑(伸手党→直接 doWarn,免读库/发命令往返)。约束:不要单一巨型 main.java,**领域模型设计 + 所有功能必须本地单测+集成测试**。
+- **方案 B**(定):源码按领域分模块 + `build.sh` 拼接成单一 main.java(WAuxiliary 运行时=单文件 BeanShell,弱 OO 跑不了真 class 领域模型,故领域模型放源码层、构建期拼接)。
+- **可测性**:端口与适配器(HostPort/StoragePort/Clock),领域只依赖端口;生产接 android、测试接 fake/**sqlite-jdbc 真库**。洞察:**BeanShell 本机也能执行**(同设备解释器),+ sqlite-jdbc 跑同一份 SQL → 能本地抓 `min/max(NULL,x)` 类 bug。
+- **测试金字塔**:L1 单测(领域 vs fakes,纯 bsh)/ L2 集成(模块+sqlite-jdbc 真库+fake 宿主)/ L3 装配体 bsh 解析 / L4 真机(只剩 WeChat 反射/sendText/scrcpy)。
+- **设计文档**:`docs/superpowers/specs/2026-06-09-merge-groupadmin-redpacket-design.md`(架构+测试+迁移+分期 P0-P3)。
+- **config 事实(已核实)**:config.prop **按插件隔离**,RP 全 `rp_` 前缀与 GA 键零冲突 → 合并 config 可 union;合并后须停旧 RP 插件防红包双重处理。见 [[waux-config-per-plugin-isolated]]。
+- **✅ P0 完成(2026-06-09, commit 8c3e89c, `merged/` 不碰线上)**:build.sh + 端口/适配器 + 本地 runner + check.sh 门禁 + 证明缝 `speak_store` UPSERT;突变验证 red→green(去 coalesce 两测全红→还原全绿,真能抓那个咬过两次的 NULL bug);sqlite-jdbc 用 **3.36.0.3**(3.43+ 硬依赖 slf4j);bsh.Interpreter 异常仍 exit 0 → runner 查 TEST_OK 哨兵。`cd merged && tools/fetch-deps.sh && ./check.sh`。
+- **下一步 P1**:GroupAdmin 逐领域(membership/speak/warning + commands/hooks/dialogs)进骨架 + L1/L2 测试 + 真机零回归。然后 P2(RP 进骨架+config union 迁移+停旧插件)、P3(freeloader→doWarn 直连)。
+
 ## 后续项(伸手党收尾时浮现)——均已完成 ✅
 1. ✅ **#潜水 新成员豁免改固定 1 天**:GA v1.20.0 已做(`LURK_NEWMEMBER_EXEMPT_MS`)。
 2. ✅ **GroupAdmin 主动补全员 first_seen 基线**:GA v1.20.0 已做(onLoad 对所有已启用群补 + coalesce 防 NULL)。
