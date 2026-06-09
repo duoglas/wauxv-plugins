@@ -1,4 +1,5 @@
-// GroupAdmin v1.19.0 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.19.1 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+//   - v1.19.1: 警告防误踢 — 自动来源警告(伸手党等, reason 非空)额外豁免管理员/群主/原生群主 (canActOn 对 owner→admin 不挡, 潜水管理抢红包不再被自动流程累计→踢出); 手动 `@TA 警告` 行为不变 (SPEC §4.4)
 //   - v1.19.0: 警告带理由 — `@TA 警告 <理由>` 解析并透传; doWarn 通知末尾拼 " · 理由"; 自动来源(理由非空)对豁免对象(权限不足/白名单)静默跳过, 不发报错 (手动警告行为不变) (SPEC 警告系统)
 //   - v1.18.0: 活动判定=任意消息类型 — 非文本消息(图片/表情/语音/红包/文件等)也计入发言活动, 修复只发非文本消息者被 #潜水 误判潜水 (SPEC §3/§6.10 活动采集前置)
 //   - v1.17.2: 踢人安全 — @所有人(notify@all)不能踢 (@路径踢/请动作前置守卫 _isAtAll)
@@ -1935,7 +1936,7 @@ void onLoad() {
         String _owner;
         try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
         if (_owner == null) _owner = "(login pending)";
-        log("GroupAdmin v1.19.0 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
+        log("GroupAdmin v1.19.1 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
     } catch (Throwable t) {
         try { log("GroupAdmin v1.17.0 onLoad log block err: " + t); } catch (Throwable t2) {}
     }
@@ -1957,7 +1958,7 @@ void onLoad() {
                     int added = initFirstSeenBaseline(g);
                     if (added > 0) { touched++; totalAdded += added; }
                 }
-                log("GroupAdmin v1.19.0 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+                log("GroupAdmin v1.19.1 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
                 // _probeGroupInfoAPI();
             }
         });
@@ -2699,6 +2700,8 @@ void doWarn(String groupId, String sender, String target) { doWarn(groupId, send
 // v1.19.0: reason 非空 = 自动来源(带理由) → 对豁免对象(权限/白名单)静默跳过, 不发报错; 通知文案末尾拼 " · 理由"
 void doWarn(String groupId, String sender, String target, String reason) {
     boolean auto = (reason != null && !reason.trim().isEmpty());
+    // v1.19.1: 自动来源(伸手党等)不警告管理员/群主/原生群主 (canActOn 对 owner→admin 不挡, 须显式豁免, 防误踢管理)。手动警告(auto=false)不受影响, 仍可警告管理员。
+    if (auto && (isAdminInGroup(groupId, target) || isOwner(target) || isNativeOwner(groupId, target))) return;
     if (!canActOn(groupId, sender, target)) { if (!auto) sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
     // v1.12: 白名单(本群+全局)免警告
     if (isWhitelistAny(groupId, target)) {
