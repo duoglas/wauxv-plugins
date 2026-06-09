@@ -374,9 +374,9 @@ void afterCoverNoDetail() {
 // seam 占位 (leaf): 真实实现在后续任务接, 解析门只解析语法 + 调用骨架成立。占位返回值非真实语义。
 // ============================================================
 // ★UI seam rpOpenCover / rpFinishCover 已由 T4 (app/device_ui.bsh) 接真实实现 → 本片 leaf 占位移除, 避免装配体双重定义。
-// ★发送 (T6): 线上 rpDailySend @2530 每日统计"组装+发送" (rpDb/rpReadRow/getDailyGroups/rpBuildGroupedMsgs/sendText, 后台线程)。
-//   占位无副作用; T6 接真实组装+发送 (其中 rpBuildGroupedMsgs 已在 domain/redpacket_export.bsh 抽好, T6 直接调)。
-void rpDailySend(long windowStart, long windowEnd, boolean manual) { }
+// ★发送 (T6 已接): 线上 rpDailySend @2530 每日统计"组装+发送" 真实实现移至 app/redpacket_send.bsh
+//   (窗口查询走 domain rpQueryWindow/STORAGE; 组装走 domain rpBuildGroupedMsgs; 发送走 HOST.sendText 按群路由)。
+//   rpDailyCheck @181 调它; 装配体唯一定义点在 redpacket_send.bsh, 此处不再占位 (避免双重定义)。
 
 // ============================================================
 // rpDailyCheck 日期闸门依赖 — 纯逻辑 (Calendar/SimpleDateFormat + HOST KV), 非 seam, 本片逐字保真移植。

@@ -33,11 +33,18 @@ Object makeAndroidHost() {
     }
     // 发文本到群会话: 直接转发 WAuxiliary 内置 sendText。
     void sendText(String grp, String msg) { _hostSendText(grp, msg); }
-    // 引用条: 引用原红包消息发群规文本 (GA/RP main.java:1721 rpSendQuote)。
-    //   TODO(P3-b): 占位转发 _hostSendQuote(=WAuxiliary sendQuoteMsg)。生产应复刻 rpSendQuote 健壮性:
-    //   msgid<=0 或 sendQuoteMsg 抛异常 → 回退 sendText(同一文本, 不带引用), 绝不漏发 (main.java:1720-1736)。
-    //   本期骨架不接 WAuxiliary 运行时, 仅 bsh 解析门禁; L4 真机验证引用真生效。
-    void sendQuote(String grp, long msgid, String text) { _hostSendQuote(grp, msgid, text); }
+    // 引用条: 引用原红包消息发群规文本 (复刻线上 rpSendQuote 健壮性, main.java:1720-1736 逐字)。
+    //   msgid>0 → 优先 sendQuoteMsg 引用原红包; 抛异常 → 回退 sendText(同一文本, 不带引用)。
+    //   msgid<=0 → 直接 sendText。绝不因引用失败漏发 (达标≥1 必发一条群规)。
+    //   日志: 端口层保持无依赖(不调 device hbBgLog), 诊断由调用方 hbTierAndSend 承载; 行为=只换载体, 保真。
+    void sendQuote(String grp, long msgid, String text) {
+        if (grp == null || text == null || text.length() == 0) return;
+        if (msgid > 0L) {
+            try { _hostSendQuote(grp, msgid, text); return; }
+            catch (Throwable t) { /* 引用失败 → 落到下面回退 sendText, 绝不漏发 */ }
+        }
+        try { _hostSendText(grp, text); } catch (Throwable t) {}
+    }
     // 取可读名: GA main.java:1917 lookupName (群名片>备注>昵称>getFriendName>"未知")。
     //   TODO(P2): 占位返回 wxid。真实实现走 WAuxiliary 名片/昵称查询，P2 移植 L4 验。
     String lookupName(String wxid, String grp) { return wxid; }

@@ -1,97 +1,50 @@
 {
-  "iteration": "merge-P0-modular-build-and-test-foundation",
-  "date": "2026-06-09",
-  "summary_one_line": "合并项目 P0 地基：源码分模块 + build.sh 拼接 → main.java + 端口/适配器 + 本地 bsh 测试 runner(含 sqlite-jdbc 真库)，用 speak-store UPSERT 缝做 red→green 打通全链路。先出设计文档待用户过目。",
+  "iteration": "merge-P3b-T6-send-layer",
+  "date": "2026-06-10",
+  "summary_one_line": "P3-b T6 发送层移植：把线上 RedPacketStats §22.6 的发送逻辑(写库 rpRecordStats + hbTierAndSend 引用群规条/@条/随机语气/限频/间隔延迟 + rpSendQuote 健壮回退 + 每日定时 rpDailySend)逐字保真接进 merged，消掉 rpDeliverReceivers/rpDailySend/host sendQuote 三处 seam。纯本地：装配体解析 EXIT=0 + check.sh 全绿 + 独立代码审查；零真机。",
   "user_confirmed": true,
   "requirements": [
-    { "id": "R1", "priority": "must", "text": "设计文档(架构=端口与适配器 + 测试金字塔 + 分期 P0-P3)写入 docs/superpowers/specs/ 并提交；onboarding/README 记录工具(bsh-2.0b6.jar、sqlite-jdbc 来源)。用户过目后再建基建。" },
-    { "id": "R2", "priority": "must", "text": "核实并记录 WAuxiliary getString/putString 的 config store 是否全宿主共享(决定 P2 迁移工作量)；记入设计文档/记忆。" },
-    { "id": "R3", "priority": "must", "text": "仓库模块化结构 + build.sh：按声明顺序拼接 src 模块 + 选定生产适配器 → 单一可部署 main.java；产物过现有 bsh 离线解析(去 final EXIT=0)。" },
-    { "id": "R4", "priority": "must", "text": "端口骨架 HostPort/StoragePort/Clock，各有生产(android/System)与测试(fake/sqlite-jdbc/假时钟)适配器；build 选生产集、test 选测试集。" },
-    { "id": "R5", "priority": "must", "text": "本地测试 runner(run-tests.sh 跑 tests/*.bsh，失败非零退出)+ check.sh = build→bsh解析→单测→集成。证明缝=speak-store last_speak/first_seen UPSERT 抽成 StoragePort 模块，单测(fake)+集成(sqlite-jdbc 真库)断言 coalesce-NULL 语义，对旧 SQL red、对 coalesce SQL green。" }
+    { "id": "R1", "priority": "must", "text": "实现 rpDeliverReceivers(device_recv.bsh:444 当前空 leaf)：写库 rpRecordStats + 发送，接 P3-a 已抽的 redpacket_tiers/qualify domain 与 rpProcessReceivers，逐字保真线上 §22.6 hbTierAndSend(分档/qualifiers/引用群规条/@条/随机语气/限频/间隔延迟) + rpSendQuote 健壮回退。" },
+    { "id": "R2", "priority": "must", "text": "实现 rpDailySend(redpacket_worker.bsh:181 seam)：每日定时统计 组装(rpBuildGroupedMsgs 按群)+ 发送(转发对象按群 rp_export_target_<gid> 回退全局)，逐字保真线上 §24 转发对象按群路由。" },
+    { "id": "R3", "priority": "must", "text": "host_android 的 sendQuote 占位 → 真实实现(引用原红包 msgid 发引用条，msgid<=0 回退 sendText)，与 redpacket_app.bsh sendQuote 入参契约对齐。" },
+    { "id": "R4", "priority": "must", "text": "热路径零回归(C-PERF-01/03)：发送层全在 worker/后台反射线程，绝不进 onHandleMsg；getString 走内存缓存(FUSE IO 教训)。" },
+    { "id": "R5", "priority": "must", "text": "跨模块运行期依赖手工核实(beanshell 解析门只查语法不查符号解析的教训)：rpRecordStats/rpBuildGroupedMsgs/tierOf/rpIsEqualSplit/sendText/sendQuote 等被调函数在装配体中真存在且 arity 对；uniq -d 查装配体无误重复定义。" }
   ],
   "design": {
-    "summary": "P0 只搭地基+证明链路可行，不迁业务。端口与适配器把所有外部依赖(宿主 KV/发消息/成员表、SQLite、时钟)收敛成可替换缝；领域逻辑只依赖端口。build.sh 按 manifest 顺序 cat 源模块 + 选定适配器拼成 main.java。测试用 bsh-2.0b6.jar 本地执行 .bsh 测试脚本(与设备同解释器=高保真)，StoragePort 测试适配器用 sqlite-jdbc 跑真 SQLite(本地复现 max/min(NULL,x) 类 bug)。证明缝选 speak-store UPSERT：既打通 build+runner+jdbc 全链路，又把 v1.19.2/v1.20.0 的 coalesce 修复变成本地回归测试。",
+    "summary": "T6 是设备 seam 移植的发送片：T5 已把反射领取者→RECV 端口 + 伸手党 in-process 调度做完，本片接掉它留的 rpDeliverReceivers leaf（写库+发送）。发送富逻辑(分档 tierOf/达标 qualifiers/引用群规条 rulePrefix/@条/随机语气/限频/间隔延迟/rpSendQuote 健壮回退)逐字保真线上 §22.6；每日定时 rpDailySend 逐字保真 §24 转发对象按群。零重写，只换载体。",
     "risk_points": [
-      { "id": "RISK1", "text": "拼接产物与手写单文件行为须一致：build.sh 拼接顺序(全局变量/函数声明)错会导致 BeanShell 未定义引用；产物必须过 bsh 解析 + 后续真机加载验证。P0 不部署业务，仅产物解析门禁。" },
-      { "id": "RISK2", "text": "本地测试保真度：bsh 本地执行与设备 WAuxiliary 同解释器，差异仅在被 mock 的宿主/Android API；StoragePort 用 sqlite-jdbc 与 android SQLite 的 SQL 方言须一致(UPSERT/coalesce 标准 SQL，两端一致)。" },
-      { "id": "RISK3", "text": "P0 不改动现有线上两个插件(GroupAdmin/RedPacketStats 照常运行)；地基在新目录独立推进，零触碰生产部署，避免影响在用群管/红包。" }
+      { "id": "RISK1", "text": "逐字保真风险：发送层涉及随机语气/限频/间隔延迟/分条 MAX_CHARS，任何阈值/顺序偏差都改变线上行为。以线上 main.java 为唯一事实源逐行对照。" },
+      { "id": "RISK2", "text": "符号解析缺口：bsh 解析门只查语法，跨模块缺失函数(如 rpRecordStats/rpBuildGroupedMsgs)仍 EXIT=0 且测试不覆盖设备热路径函数→静默断裂。须手工 grep 核实跨模块依赖真存在 + uniq -d 查重复定义。" },
+      { "id": "RISK3", "text": "热路径污染：发送层若误接进 onHandleMsg 或在热路径读 getString(FUSE IO)会回归 C-PERF-01。发送必须全在 worker/反射后台线程。" }
     ]
   },
   "traffic_flows": [
-    { "id": "F1", "text": "构建路径：src 模块(manifest 顺序) + 生产适配器 → build.sh cat → main.java → bsh 解析门禁。" },
-    { "id": "F2", "text": "测试路径：src 模块 + 测试适配器(fake host / sqlite-jdbc / 假时钟) → bsh 本地执行 tests/*.bsh → 断言 → 聚合 PASS/FAIL。" }
+    { "id": "F1", "text": "判定后发送：device_recv hbDetailExtract → rpDeliverReceivers(job,receivers,isCustom) → rpRecordStats 写库 + hbTierAndSend(分档/qualifiers/规条/@/语气/限频/间隔) + rpSendQuote(回退 sendText)。" },
+    { "id": "F2", "text": "每日定时：worker tick → rpDailyCheck(日期闸门) → rpDailySend(组装 rpBuildGroupedMsgs + 转发对象按群路由 + 分条发送)。" }
   ],
   "test_plan": [
-    {
-      "id": "T1",
-      "scenario": "证明缝 单测(fake StoragePort)：speak-store upsertFirstSeen/upsertLastSpeak 对内存 fake 的行为。",
-      "assertions": [
-        "对已有更早 first_seen 取 min 不被覆盖；缺失行被插入",
-        "对 NULL first_seen 行(coalesce 语义) → 被设为新值"
-      ],
-      "negative_or_boundary": true,
-      "negative_case": "若实现退回 min(NULL,x) 语义致 NULL 留 NULL，单测须 red。",
-      "covers": ["R5"],
-      "risks": ["RISK2"],
-      "traffic_flows": ["F2"]
-    },
-    {
-      "id": "T2",
-      "scenario": "证明缝 集成(真 sqlite-jdbc 库)：跑实际 UPSERT SQL。",
-      "assertions": [
-        "coalesce SQL：NULL→now、更早值保留、无行插入 三例全绿",
-        "旧 SQL(min 无 coalesce)：NULL 行测试 red(复现历史 bug，证明测试有效)"
-      ],
-      "negative_or_boundary": true,
-      "negative_case": "集成测试对旧 SQL 不 red = 测试没真连库/没断到点，FAIL。",
-      "covers": ["R5"],
-      "risks": ["RISK2"],
-      "traffic_flows": ["F2"]
-    },
-    {
-      "id": "T3",
-      "scenario": "build.sh 拼接产物可解析。",
-      "assertions": [
-        "build.sh 输出单一 main.java，按 manifest 顺序拼接含选定生产适配器",
-        "产物经 bsh.Parser 去 final 解析 EXIT=0"
-      ],
-      "negative_or_boundary": true,
-      "negative_case": "拼接顺序错致未定义引用/解析失败 → check.sh red。",
-      "covers": ["R3", "R4"],
-      "risks": ["RISK1"],
-      "traffic_flows": ["F1"]
-    },
-    {
-      "id": "T4",
-      "scenario": "交付物/事实核实 + 不触碰线上插件(验证检查，非 bsh 单测)。",
-      "assertions": [
-        "设计文档存在于 docs/superpowers/specs/ 且含架构+测试金字塔+分期；config store 共享性事实已记录(设计文档/记忆)",
-        "git diff --name-only 显示 P0 期间 plugins/group-admin/main.java 与 plugins/redpacket-stats/main.java 零改动(线上不受影响)"
-      ],
-      "negative_or_boundary": true,
-      "negative_case": "P0 改动了任一线上插件 main.java，或设计文档/config 事实缺失 → FAIL。",
-      "covers": ["R1", "R2"],
-      "risks": ["RISK3"],
-      "traffic_flows": ["F1", "F2"]
-    }
+    { "id": "T1", "scenario": "装配体 build + 去 final 全文 bsh 解析 EXIT=0。", "assertions": ["build.sh 拼入 device_recv/worker/host_android 新逻辑后 out/main.java 解析 EXIT=0"], "negative_or_boundary": true, "negative_case": "语法错/未闭合 → 解析非零，check.sh red。", "covers": ["R1","R2","R3"], "risks": ["RISK1"], "traffic_flows": ["F1","F2"] },
+    { "id": "T2", "scenario": "check.sh 保持全绿(现有 18+ 测试零回归)。", "assertions": ["现有单测/集成全部仍绿，T6 不破坏 domain/app 已立测试"], "negative_or_boundary": true, "negative_case": "T6 改动若误动 domain tiers/qualify 或 speak/freeloader 链路致任一现有测试由绿转红 → 回归，回修不交付。", "covers": ["R1","R2","R3"], "risks": ["RISK2"], "traffic_flows": ["F1","F2"] },
+    { "id": "T3", "scenario": "跨模块依赖手工核实 + 重复定义查重。", "assertions": ["rpDeliverReceivers/rpDailySend 调用的每个跨模块函数在装配体真存在且 arity 对","uniq -d 装配体函数名无误重复定义(有意 arity 重载除外)"], "negative_or_boundary": true, "negative_case": "缺失函数/误重复定义 → 标记 FAIL 不交付。", "covers": ["R5"], "risks": ["RISK2"], "traffic_flows": ["F1","F2"] },
+    { "id": "T4", "scenario": "独立 Code Review 逐字保真 + 热路径复杂度审。", "assertions": ["独立 Reviewer 对照线上 §22.6/§24 逐行核发送层保真，输出 PASS/FAIL","确认发送层全在 worker/后台线程，onHandleMsg 热路径零新增 O(N)/FUSE IO"], "negative_or_boundary": true, "negative_case": "与线上行为偏差/热路径污染 → CRITICAL，回修。", "covers": ["R1","R2","R4"], "risks": ["RISK1","RISK3"], "traffic_flows": ["F1","F2"] }
   ],
   "acceptance": [
-    { "id": "A1", "text": "设计文档提交 + config store 事实核实记录(用户过目确认) + P0 不触碰线上插件。", "must_have_evidence": true, "tests": ["T3", "T4"], "covers": ["R1", "R2"] },
-    { "id": "A2", "text": "build+端口+runner 地基跑通：证明缝 单测+集成 red→green，check.sh 全绿。", "must_have_evidence": true, "tests": ["T1", "T2", "T3"], "covers": ["R3", "R4", "R5"] }
+    { "id": "A1", "text": "rpDeliverReceivers/rpDailySend/sendQuote 三 seam 全接真实实现，逐字保真线上 §22.6/§24，装配体解析 EXIT=0 + check.sh 全绿。", "must_have_evidence": true, "tests": ["T1","T2","T3"], "covers": ["R1","R2","R3","R5"] },
+    { "id": "A2", "text": "独立 Code Review 0 CRITICAL，热路径零回归。", "must_have_evidence": true, "tests": ["T4"], "covers": ["R4"] }
   ],
   "tasks": [
-    { "id": "W0", "stage": "EXECUTE", "title": "上设备核实 config store 共享性(只读诊断) + 写设计文档 docs/superpowers/specs/ + 暂停待用户过目", "covers": ["R1", "R2"], "risk": "low" },
-    { "id": "W1", "stage": "EXECUTE", "title": "建仓库模块结构 + build.sh(manifest 拼接) + 端口骨架/适配器", "covers": ["R3", "R4"], "risk": "medium" },
-    { "id": "W2", "stage": "EXECUTE", "title": "test runner + sqlite-jdbc + 证明缝 speak-store + 单测/集成 red→green + check.sh", "covers": ["R5"], "risk": "medium" }
+    { "id": "W1", "stage": "EXECUTE", "title": "读线上 §22.6 发送层源(hbTierAndSend/rpSendQuote/sendText @条/随机语气/限频/间隔延迟)+ §24 rpDailySend 源 + 现有 rpProcessReceivers/domain tiers/qualify 接口，定位逐字保真锚点", "covers": ["R1","R2"], "risk": "low" },
+    { "id": "W2", "stage": "EXECUTE", "title": "实现 rpDeliverReceivers(写库 rpRecordStats + hbTierAndSend 发送富逻辑 + rpSendQuote 健壮回退)逐字保真，接 domain tiers/qualify", "covers": ["R1","R4"], "risk": "medium" },
+    { "id": "W3", "stage": "EXECUTE", "title": "实现 rpDailySend(每日定时组装+转发对象按群路由)+ host_android sendQuote 真实实现", "covers": ["R2","R3","R4"], "risk": "medium" },
+    { "id": "W4", "stage": "VERIFY", "title": "build + 去 final 全文解析 EXIT=0 + check.sh 全绿 + 跨模块依赖手工 grep 核实 + uniq -d 查重", "covers": ["R5"], "risk": "low" },
+    { "id": "W5", "stage": "REVIEW", "title": "独立 Code Reviewer Agent 对照线上 §22.6/§24 逐字保真 + 热路径复杂度审，输出 PASS/FAIL", "covers": ["R1","R2","R4"], "risk": "low" }
   ],
   "irreversible_actions": [
-    "P0 不部署、不触碰线上 GroupAdmin/RedPacketStats(照常运行)；仅在仓库新增 build/test 基建文件",
-    "fetch sqlite-jdbc(一次性网络下载到本地 tools/，记入 README)"
+    "本期零真机：无 adb push / 无改 per-group 配置 / 无真机发红包。全部真机动作留 P3-c(另开 PLAN + 用户在场 scrcpy + Santa 双审)。"
   ],
   "out_of_scope": [
-    "P1+ 业务迁移(GroupAdmin/RedPacketStats 进骨架)——P0 只搭地基 + 一个证明缝",
-    "freeloader→doWarn 直连(P3)"
+    "T7 设置 UI 并入 / T8 onLoad 合一 + seam 收口 / T9 验收(留后续任务)",
+    "P3-c 灰度真机 E2E / P2-b 最终 cutover"
   ],
-  "delivery": "P0 交付：设计文档(待用户过目)+ config store 核实 + 模块化 build + 端口/适配器 + 本地 bsh 测试 runner(sqlite-jdbc 真库)+ speak-store 证明缝 red→green。不动线上插件。"
+  "delivery": "P3-b T6 交付：发送层三 seam(rpDeliverReceivers/rpDailySend/host sendQuote)接真实实现，逐字保真线上 §22.6/§24，装配体解析 EXIT=0 + check.sh 全绿 + 独立 Code Review 0 CRITICAL。零真机。"
 }

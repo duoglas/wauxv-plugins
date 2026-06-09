@@ -62,6 +62,30 @@ java.util.List rpQueryToday(String date) {
     return STORAGE.queryRows(RP_QUERY_TODAY_SQL, new Object[]{ date });
 }
 
+// 每日定时窗口查询(线上 rpDailySend @2560-2562 逐字: ts∈[windowStart,windowEnd) 且 grp IN(每日定时群))。
+//   动态拼 grp IN(?,?,...) 占位符; 列序/WHERE/ORDER BY 与 rpQueryToday 同(便于 rpBuildGroupedMsgs 复用)。
+//   绑定: 1=windowStart(Long) 2=windowEnd(Long) 3..=各群 id(String, RP normGroupId=trim, 对齐线上 @2557)。
+//   groupIds 空 → 返回空 List(无群可查; 调用方据此走心跳分支)。返回列序同 rpQueryToday。
+RP_QUERY_WINDOW_SQL_PREFIX =
+    "SELECT ts,sender_name,title,qualified_count,qualifiers,group_name,grp "
+    + "FROM rp_record WHERE ts>=? AND ts<? AND grp IN (";
+RP_QUERY_WINDOW_SQL_SUFFIX = ") ORDER BY grp ASC, ts ASC";
+java.util.List rpQueryWindow(long windowStart, long windowEnd, java.util.List groupIds) {
+    if (groupIds == null || groupIds.isEmpty()) return new java.util.ArrayList();
+    StringBuilder ph = new StringBuilder();
+    Object[] binds = new Object[groupIds.size() + 2];
+    binds[0] = new Long(windowStart);
+    binds[1] = new Long(windowEnd);
+    for (int i = 0; i < groupIds.size(); i++) {
+        if (i > 0) ph.append(",");
+        ph.append("?");
+        String g = (String) groupIds.get(i);
+        binds[i + 2] = (g == null) ? "" : g.trim();   // 线上 normGroupId(RP)=trim @2557 逐字
+    }
+    String sql = RP_QUERY_WINDOW_SQL_PREFIX + ph.toString() + RP_QUERY_WINDOW_SQL_SUFFIX;
+    return STORAGE.queryRows(sql, binds);
+}
+
 // 当日按群聚合(领域层, 与线上一致)。
 // 线上无 SQL 级 GROUP BY/sum/count — 聚合在 Java 层: rpExportToday 取回当日行后, rpBuildGroupedMsgs 用
 // LinkedHashMap 按 grp 列分组(@2372-2380, SQL 已 ORDER BY grp 故顺序稳定)。此处等价复刻该分组,

@@ -1,0 +1,84 @@
+// ============================================================
+// L2 集成 (P3-b T6): domain rpQueryWindow — 每日定时窗口查询。
+//   sqlite-jdbc 真库 (rp_record): 坐实 ts∈[windowStart,windowEnd) + grp IN(每日定时群) 过滤 + ORDER BY grp,ts + Long 绑定 + trim 规范化。
+//   逐字对齐线上 rpDailySend rawQuery (main.java:2560-2562)。
+// 运行 cwd = merged/。
+// ============================================================
+import java.sql.*;
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");        // HOST(fake) — rpQueryWindow 不用, 仅满足模块装载
+source("tests/fakes/storage_jdbc.bsh");
+source("src/domain/membership.bsh");        // normGroupId/parseCsv/joinCsv
+source("src/domain/redpacket_store.bsh");   // rpRecord/rpQueryWindow/RP_CREATE_SQL (被测)
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(RP_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+String GA = "ga@chatroom";   // 在每日定时群
+String GB = "gb@chatroom";   // 在每日定时群
+String GC = "gc@chatroom";   // 不在每日定时群 (应被 grp IN 过滤掉)
+String DATE = "2026-06-10";
+long WS = 2000L;   // 窗口起 [WS, WE)
+long WE = 5000L;
+
+// 录入: rpRecord(key,date,ts,grp,groupName,senderWxid,senderName,title,qualifiedCount,qualifiers)
+rpRecord("k_before", DATE, 1999L, GA, "群A", "ws", "发A", "t_before", 1L, "n|6|1");   // ts < WS → 窗口外
+rpRecord("k_a1",     DATE, 2000L, GA, "群A", "ws", "发A", "t_a1",     1L, "n|6|1");   // ts == WS → 含 (>=)
+rpRecord("k_a2",     DATE, 4999L, GA, "群A", "ws", "发A", "t_a2",     2L, "n|6|1;m|9|1"); // ts < WE → 含
+rpRecord("k_b1",     DATE, 3000L, GB, "群B", "ws", "发B", "t_b1",     1L, "n|6|1");   // GB 窗口内
+rpRecord("k_end",    DATE, 5000L, GA, "群A", "ws", "发A", "t_end",    1L, "n|6|1");   // ts == WE → 不含 (< 严格)
+rpRecord("k_c1",     DATE, 3500L, GC, "群C", "ws", "发C", "t_c1",     1L, "n|6|1");   // GC 不在每日群 → 过滤
+
+// 每日定时群 = [GA, GB] (GC 故意不含)。
+java.util.List daily = new java.util.ArrayList();
+daily.add(GA); daily.add(GB);
+
+java.util.List rows = rpQueryWindow(WS, WE, daily);
+
+// ---- 场景 1: 过滤正确 — 只 GA 的 a1/a2 + GB 的 b1 (3 行); before/end/GC 全排除。----
+check("1 窗口+群过滤 → 3 行", rows.size() == 3);
+boolean hasBefore = false, hasEnd = false, hasC = false, hasA1 = false, hasA2 = false, hasB1 = false;
+for (int i = 0; i < rows.size(); i++) {
+    Object[] r = (Object[]) rows.get(i);
+    String ti = (String) r[2];   // title 列 (列序 [2])
+    if ("t_before".equals(ti)) hasBefore = true;
+    if ("t_end".equals(ti)) hasEnd = true;
+    if ("t_c1".equals(ti)) hasC = true;
+    if ("t_a1".equals(ti)) hasA1 = true;
+    if ("t_a2".equals(ti)) hasA2 = true;
+    if ("t_b1".equals(ti)) hasB1 = true;
+}
+check("1 含 a1 (ts==WS, >= 边界含)", hasA1);
+check("1 含 a2 (ts<WE)", hasA2);
+check("1 含 b1 (GB 窗口内)", hasB1);
+check("1 排除 before (ts<WS)", !hasBefore);
+check("1 排除 end (ts==WE, < 严格不含)", !hasEnd);
+check("1 排除 C (GC 不在每日群)", !hasC);
+
+// ---- 场景 2: ORDER BY grp ASC, ts ASC — GA 的 a1(2000) 在 a2(4999) 前; GA 整体在 GB 前 (grp 'ga'<'gb')。----
+Object[] r0 = (Object[]) rows.get(0);
+Object[] r1 = (Object[]) rows.get(1);
+Object[] r2 = (Object[]) rows.get(2);
+check("2 第1行 = GA a1 (grp 升序 + ts 升序)", "t_a1".equals(r0[2]));
+check("2 第2行 = GA a2", "t_a2".equals(r1[2]));
+check("2 第3行 = GB b1", "t_b1".equals(r2[2]));
+check("2 列序 [0]ts 为 Long", r0[0] instanceof Long && ((Long) r0[0]).longValue() == 2000L);
+check("2 列序 [6]grp", "ga@chatroom".equals(r0[6]));
+check("2 列序 [3]qualified_count Long", ((Long) r1[3]).longValue() == 2L);
+
+// ---- 场景 3: trim 规范化 — 每日群 id 带空格仍命中 (线上 normGroupId=trim @2557)。----
+java.util.List dailySpaced = new java.util.ArrayList();
+dailySpaced.add("  ga@chatroom  ");   // 带前后空格
+java.util.List rowsTrim = rpQueryWindow(WS, WE, dailySpaced);
+check("3 群 id 带空格 trim 后仍命中 GA (a1+a2 = 2 行)", rowsTrim.size() == 2);
+
+// ---- 场景 4: 空群列表 → 空结果 (无群可查, 调用方走心跳分支)。----
+check("4 空每日群 → 空结果", rpQueryWindow(WS, WE, new java.util.ArrayList()).isEmpty());
+check("4 null 每日群 → 空结果", rpQueryWindow(WS, WE, null).isEmpty());
+
+// ---- 场景 5 (边界): 窗口内无任何记录 → 空 (心跳触发条件)。----
+check("5 窗口 [10000,20000) 无记录 → 空", rpQueryWindow(10000L, 20000L, daily).isEmpty());
+
+conn.close();
+done();

@@ -438,7 +438,6 @@ void hbDetailExtract(Object root, String key) {
     }
 }
 
-// ★T6 seam (leaf): 写库(rpRecordStats) + 发送(hbTierAndSend 引用群规条/@条/随机语气/限频/间隔延迟 + rpSendQuote 健壮回退)。
-//   T6 接 rpProcessReceivers(P3-a 已实现: 均分门/达标/写库/最小发送) + 发送 richness + groupName(rpGroupName)/rulePrefix(cfgRulePrefix) 接线。
-//   T5 仅保证反射 + 伸手党判定 + 状态机; 占位无副作用 (本地暂不写库/发送, 不影响伸手党判定的可测性)。
-void rpDeliverReceivers(Object[] job, java.util.List receivers, boolean isCustom) { }
+// ★T6 已接: rpDeliverReceivers(写库 rpRecordStats + 发送 hbTierAndSend 引用群规条/@条/随机语气/限频/间隔延迟)
+//   真实实现移至 app/redpacket_send.bsh (发送层逐字保真线上 §22.6/§16; 引用条健壮回退收口到 core/host_android.sendQuote)。
+//   本片 hbDetailExtract @421 调它; 装配体唯一定义点在 redpacket_send.bsh, 此处不再占位 (避免双重定义)。

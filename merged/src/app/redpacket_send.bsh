@@ -1,0 +1,372 @@
+// ============================================================
+// app/redpacket_send — RedPacketStats 设备层【发送层】(P3-b T6)。
+// 逐字保真移植自线上 plugins/redpacket-stats/main.java v1.11.5 §22.6/§16/§24:
+//   · rpRecordStats   (@2217): 写一行统计 (达标计算复用 domain rpComputeQualified; 群名/发包名经反射; 落库走 STORAGE 端口)。
+//   · hbTierAndSend   (@2970/@2972): 分档 + 发两条提醒 (引用群规条 + @条; 限频/随机语气/间隔延迟)。
+//   · appendTierLine  (@3102) / pickConnector (@923) / pickActionPhrase (@938): @条逐档随机语气 (Math.random)。
+//   · rpGroupName     (@2184) / rpSenderName (@2202): 反射取群名/发包人群昵称 (host 注入, leaf)。
+//   · rpDeliverReceivers: T5 留的设备 seam (device_recv.bsh hbDetailExtract @421 调) — 写库 + 发送, 逐字对齐线上 @2739/@2814。
+//   · getDailyGroups  (@1077) / rpDailySend (@2530): 每日定时统计组装+发送 (转发对象按群路由)。
+//
+// ★合并适配 (行为零改, 只换载体):
+//   · 真发送换端口: 线上 rpSendQuote(@1721, 引用+健壮回退) → HOST.sendQuote (回退已收口到 core/host_android.sendQuote);
+//                  线上 rpSendAt(@1740, 真@)/sendText → HOST.sendText。
+//   · 写库换端口: 线上 rpDb()/SQLiteStatement → STORAGE 端口 (domain rpRecord; 达标序列化复用 domain rpComputeQualified, 与线上 @2229-2248 逐字同源)。
+//   · 每日窗口查询: 线上 rpDb().rawQuery(ts 范围 + grp IN) → domain rpQueryWindow(走 STORAGE.queryRows)。
+//
+// ★逐字保真红线 (不许改):
+//   · 写库选档用 getTiers(普通档, 线上 @2224) — 与 hbTierAndSend 的 getTiersByType(按类型, 线上 @2993) 刻意非对称 (线上原样, 不在 T6 修)。
+//   · 限频 cfgMsgGap (RP_LAST_MSG, 两条算一次)、>at上限改无@汇总 notice、随机语气、两条间隔 cfgTwoMsgGap 延迟、分条 MAX_CHARS — 阈值/顺序逐字。
+//   · 引用条达标≥1 必发; msgid<=0/异常回退 sendText (端口内); @条始终真@; 绝不因引用失败漏@。
+//
+// 依赖 (manifest 在装配体内, 运行期单命名空间全部已定义; 解析门只解析语法):
+//   device_base.bsh : RP_LAST_MSG / JOB_* 槽常量 / hbBgLog / hbNow
+//   domain/redpacket_tiers.bsh   : getTiers/getTiersByType/tierOf/renderTierRuleLine/rpNormGroupId/rpCfgInt/rpCfgStr
+//   domain/redpacket_qualify.bsh : rpComputeQualified/getExcludeList
+//   domain/redpacket_store.bsh   : rpRecord/rpQueryWindow
+//   domain/redpacket_export.bsh  : rpBuildGroupedMsgs/cfgExportTargetFor/rpCfgExportTarget
+//   redpacket_detect.bsh         : rpCfgLong
+//   membership.bsh               : normGroupId/parseCsv
+//   全局端口 HOST/STORAGE; 宿主注入 (leaf, 本地无): delay / getGroupList / getFriendDisplayName / getFriendNickName / log
+//
+// ★C-PERF-01/03: 本片全在后台 worker / 后台反射线程 / 每日定时后台线程 — 绝不进 onHandleMsg 热路径。
+//   getString 读 (cfg*) 在后台线程, 不反噬热路径 (FUSE IO 教训)。
+// ============================================================
+
+// ==================== 发送层配置键/默认 (线上 @276-324 逐字) ====================
+String K_AT_LIMIT = "rp_at_limit";                       // @276
+int    DEF_AT_LIMIT = 10;                                // @322: 达标总人数 > 此值 → 改发无@汇总 notice
+String K_MSG_GAP = "rp_msg_min_gap_sec";                 // @288: 同群两条红包提醒最小间隔(秒)
+long   DEF_MSG_GAP = 30L;                                // @323
+String K_TWO_MSG_GAP = "rp_two_msg_gap_sec";             // @289 §16: 引用条与@条之间延迟(秒)
+long   DEF_TWO_MSG_GAP = 3L;                             // @324
+String K_RULE_PREFIX = "rp_rule_prefix";                 // @308
+String DEF_RULE_PREFIX = "领红包请遵守群规执行";          // @309
+String K_CUSTOM_RULE_PREFIX_PREFIX = "rp_custom_rule_prefix_";  // @311 §22.6 per-group 定制群规前缀
+String DEF_CUSTOM_RULE_PREFIX = "定制包请按要求执行";     // @312
+// 随机连接词/语气 (线上 @315/@317 逐字; pickConnector/pickActionPhrase 用)。{X}=阈值 {A}=动作核心。
+String[] DEF_CONNECTORS = new String[] { "超过{X}元，", "过{X}元，", "过{X}，", "{X}元以上，", "领超{X}元，" };
+String[] DEF_ACTION_PHRASES = new String[] { "{A}", "快点{A}啊", "记得{A}哦", "需要{A}", "该{A}了", "麻烦{A}一下" };
+// 每日定时群 (线上 @294): 开了每日定时的群 (CSV groupId), 与红包统计开关独立。
+String K_DAILY_GROUPS = "rp_daily_groups";
+
+// ==================== 发送层 cfg 读 (线上 @838-873 逐字; 经 merged rpCfgInt/rpCfgLong/rpCfgStr) ====================
+int  cfgAtLimit()   { return rpCfgInt(K_AT_LIMIT, DEF_AT_LIMIT); }            // @838
+long cfgMsgGap()    { return rpCfgLong(K_MSG_GAP, DEF_MSG_GAP); }            // @850
+long cfgTwoMsgGap() { return rpCfgLong(K_TWO_MSG_GAP, DEF_TWO_MSG_GAP); }    // @851 §16
+String cfgRulePrefix() { return rpCfgStr(K_RULE_PREFIX, DEF_RULE_PREFIX); } // @865
+// 定制群规前缀 per-group (线上 @867/@868; 键用 RP normGroupId=trim → rpNormGroupId 保真)。空回退默认。
+String customRulePrefixKey(String groupId) { return K_CUSTOM_RULE_PREFIX_PREFIX + rpNormGroupId(groupId); }
+String cfgCustomRulePrefix(String groupId) {
+    try {
+        String s = HOST.getString(customRulePrefixKey(groupId), "");
+        if (s == null || s.trim().isEmpty()) return DEF_CUSTOM_RULE_PREFIX;
+        return s;
+    } catch (Throwable t) { return DEF_CUSTOM_RULE_PREFIX; }
+}
+
+// ==================== 随机语气 (线上 @920-949 逐字; 去机器指纹) ====================
+// 只随机"连接词"(金额与动作之间措辞); 阈值/动作/前缀不参与随机。从 DEF_CONNECTORS 随机挑, 填 {X}=阈值。
+String pickConnector(int threshold) {
+    try {
+        String[] arr = DEF_CONNECTORS;
+        if (arr == null || arr.length == 0) return "超过" + threshold + "元，";
+        int idx = (int) (Math.random() * (double) arr.length);
+        if (idx < 0) idx = 0; if (idx >= arr.length) idx = arr.length - 1;
+        String c = arr[idx];
+        if (c == null || c.isEmpty()) return "超过" + threshold + "元，";
+        return c.replace("{X}", String.valueOf(threshold));
+    } catch (Throwable t) { return "超过" + threshold + "元，"; }
+}
+// 只随机"动作语气包裹"(动作核心词周围措辞); 动作核心原文不变。从 DEF_ACTION_PHRASES 随机挑, 填 {A}=动作核心。
+String pickActionPhrase(String actionCore) {
+    String core = (actionCore == null) ? "" : actionCore;
+    try {
+        String[] arr = DEF_ACTION_PHRASES;
+        if (arr == null || arr.length == 0) return core;
+        int idx = (int) (Math.random() * (double) arr.length);
+        if (idx < 0) idx = 0; if (idx >= arr.length) idx = arr.length - 1;
+        String p = arr[idx];
+        if (p == null || p.isEmpty()) return core;
+        return p.replace("{A}", core);
+    } catch (Throwable t) { return core; }
+}
+
+// @条单档行 (线上 @3102 逐字): {@这些人}{随机连接词(填阈值)}{随机语气包裹(填动作原文)}。
+//   动作未设(占位"未设")/空 → @文本只保留阈值连接词(去尾逗号), 不带动作语气, 不发"未设"二字 (v1.6.0a)。
+void appendTierLine(StringBuilder sb, List wxids, int threshold, String text) {
+    for (int i = 0; i < wxids.size(); i++) sb.append("[AtWx=").append((String) wxids.get(i)).append("]");
+    String _t = (text == null) ? "" : text.trim();
+    if (_t.isEmpty() || "未设".equals(_t)) {
+        String conn = pickConnector(threshold);
+        if (conn != null) {
+            while (conn.length() > 0) {
+                char last = conn.charAt(conn.length() - 1);
+                if (last == '，' || last == ',' || last == ' ') conn = conn.substring(0, conn.length() - 1);
+                else break;
+            }
+        } else conn = "超过" + threshold + "元";
+        sb.append(" ").append(conn);
+        return;
+    }
+    sb.append(" ").append(pickConnector(threshold)).append(pickActionPhrase(text));
+}
+
+// ==================== 反射取名 (线上 @2184/@2202 逐字; host 注入, leaf — 仅后台反射线程调) ====================
+// 取当前群名 (取不到留空串)。getGroupList()/getRoomId/getName = WAuxiliary 注入。
+String rpGroupName(String talker) {
+    try {
+        if (talker == null || talker.isEmpty()) return "";
+        List groups = getGroupList();
+        if (groups == null) return "";
+        for (int i = 0; i < groups.size(); i++) {
+            Object info = groups.get(i);
+            if (info == null) continue;
+            String rid = null;
+            try { Object r = info.getClass().getMethod("getRoomId").invoke(info); if (r != null) rid = r.toString(); } catch (Throwable t) {}
+            if (rid == null || !rid.equals(talker)) continue;
+            try { Object n = info.getClass().getMethod("getName").invoke(info); if (n != null) { String nm = n.toString().trim(); if (!nm.isEmpty()) return nm; } } catch (Throwable t) {}
+            break;
+        }
+    } catch (Throwable t) {}
+    return "";
+}
+// 取发包人【群昵称】优先 (群名片/群昵称 → 微信昵称 → wxid 原值)。getFriendDisplayName/getFriendNickName = WAuxiliary 注入。
+String rpSenderName(String wxid, String groupId) {
+    if (wxid == null || wxid.isEmpty()) return "";
+    if (groupId != null && !groupId.isEmpty()) {
+        try { String n = getFriendDisplayName(wxid, groupId); if (n != null && !n.trim().isEmpty()) return n.trim(); } catch (Throwable t) {}
+    }
+    try { String n = getFriendNickName(wxid); if (n != null && !n.trim().isEmpty()) return n.trim(); } catch (Throwable t) {}
+    return wxid;
+}
+
+// ==================== 写库 (线上 rpRecordStats @2217 逐字; 达标复用 domain, 落库走 STORAGE) ====================
+// 仅后台反射线程调 (写库点, 非热路径)。整段 try/catch 可降级, 失败只 log 计数。
+//   达标 = 金额(分) > 档1阈值×100, 已剔本群排除名单 (与发送 §6 同口径)。达标>=1 才写; 0 不写 (线上 @2250)。
+//   ★选档用 getTiers(普通档, 线上 @2224) — 与 hbTierAndSend 的 getTiersByType 刻意非对称 (线上原样)。
+//   qualified_count/qualifiers 全量不截断 (at 上限只影响发不发@, 不影响记录, §17.2)。
+void rpRecordStats(String key, String talker, String senderWxid, String title, List receivers) {
+    try {
+        if (key == null || key.isEmpty()) { hbBgLog("[RP] " + hbNow() + " stats-db: skip (key empty)."); return; }
+        if (receivers == null || receivers.isEmpty()) return;
+
+        List tiers = getTiers(talker);   // 线上 @2224: 普通档 (非 getTiersByType)
+        int lowThr = ((Integer) ((Object[]) tiers.get(0))[0]).intValue();
+        List excl = getExcludeList(talker);
+        // 达标判定 + qualifiers 序列化 (复用 domain rpComputeQualified, 与线上 @2229-2248 逐字同源)。
+        Object[] q = rpComputeQualified(tiers, excl, receivers);
+        int qualified = ((Integer) q[0]).intValue();
+        String qualifiers = (String) q[1];
+
+        if (qualified == 0) {
+            hbBgLog("[RP] " + hbNow() + " stats-db: 0 qualified (>" + lowThr + "元), not recorded.");
+            return;
+        }
+
+        String senderName = rpSenderName(senderWxid, talker);   // 线上 @2259
+        String groupName = rpGroupName(talker);                 // 线上 @2262
+        if (groupName == null) groupName = "";
+        hbBgLog("[RP] " + hbNow() + " stats group_name len=" + groupName.length());   // 脱敏: 只记长度
+
+        String date = rpToday();
+        long ts = System.currentTimeMillis();
+        String titleVal = (title == null) ? "" : title;
+        hbBgLog("[RP] " + hbNow() + " stats title: writing record, title len=" + titleVal.length() + " (原文不记).");
+
+        // 落库走 STORAGE 端口 (domain rpRecord; 线上 INSERT OR REPLACE @2279 逐字, key 主键幂等)。
+        try {
+            rpRecord(key, date, ts, (talker == null) ? "" : talker, groupName,
+                     (senderWxid == null) ? "" : senderWxid, senderName, titleVal, (long) qualified, qualifiers);
+        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " stats-db: insert fail (degrade): " + t); return; }
+
+        hbBgLog("[RP] " + hbNow() + " stats-db: recorded 1 row (date=" + date + ", qualified=" + qualified + "). details NOT logged (privacy).");
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " stats-db: rpRecordStats err (degrade): " + t);
+    }
+}
+
+// ==================== 分档 + 发两条提醒 (线上 hbTierAndSend @2970/@2972 逐字) ====================
+// msgid = 原红包本地 msgId (供引用条引用原红包)。v1.1.4 §16: 引用群规条(无@) + @条(sendText 真@)。
+//   ★发送换端口: rpSendQuote → HOST.sendQuote (健壮回退在端口内); rpSendAt/sendText → HOST.sendText。
+void hbTierAndSend(String talker, long msgid, List receivers) { hbTierAndSend(talker, msgid, receivers, false); }
+void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) {
+    try {
+        // ---- §13.3: 同群 @ 限频。两条提醒间隔 < cfgMsgGap 则跳过本次 (分档前就判)。----
+        long gapMs = cfgMsgGap() * 1000L;
+        if (gapMs > 0L && talker != null) {
+            Object lastObj = RP_LAST_MSG.get(talker);
+            if (lastObj != null) {
+                long last = ((Long) lastObj).longValue();
+                long since = System.currentTimeMillis() - last;
+                if (since < gapMs) {
+                    hbBgLog("[RP] " + hbNow() + " rate-limit: same-group last msg " + (since / 1000L) + "s ago < gap "
+                        + cfgMsgGap() + "s. skip this reminder.");
+                    return;
+                }
+            }
+        }
+
+        // §22.3: 档表来源按包类型切换 (定制读 rp_tiers_custom 未配回退普通; 普通走 getTiers)。
+        List tiers = getTiersByType(talker, isCustom);
+        int nTier = tiers.size();
+        int lowThr = ((Integer) ((Object[]) tiers.get(0))[0]).intValue();   // 最低档阈值(元)
+
+        // §12: 分档前剔除本群排除名单 (不@、不计入达标总人数 → 影响 >上限 判定)。
+        List excl = getExcludeList(talker);
+        int excludedHit = 0;
+
+        // 每档一个 wxid 列表 (index 0 = 档1 最低)。
+        List groups = new java.util.ArrayList();
+        for (int gi = 0; gi < nTier; gi++) groups.add(new java.util.ArrayList());
+
+        for (int i = 0; i < receivers.size(); i++) {
+            Object[] r = (Object[]) receivers.get(i);
+            long cent = ((Long) r[1]).longValue();
+            String wxid = (String) r[2];
+            if (wxid == null || wxid.isEmpty()) continue;   // @ 需要 wxid
+            boolean skip = false;
+            for (int j = 0; j < excl.size(); j++) { if (wxid.equals(((String) excl.get(j)).trim())) { skip = true; break; } }
+            if (skip) { excludedHit++; continue; }
+            int tn = tierOf(tiers, cent);   // 严格大于, 归最高满足档 (1-based)
+            if (tn >= 1) ((List) groups.get(tn - 1)).add(wxid);
+        }
+
+        // 达标总人数 = 各档之和 (已剔排除名单)。
+        int totalQualified = 0;
+        for (int gi = 0; gi < nTier; gi++) totalQualified += ((List) groups.get(gi)).size();
+
+        if (totalQualified == 0) {
+            hbBgLog("[RP] " + hbNow() + " tier: nobody qualified (>" + lowThr + "元, excluded=" + excludedHit + "). no message sent. (" + nTier + " tiers)");
+            return;
+        }
+
+        int atLimit = cfgAtLimit();
+
+        // §16: 第一条(引用群规) → 隔 cfgTwoMsgGap 秒 → 第二条(@)。
+        //   群规第一条 = N 档循环 (列全档, 无随机, 「，过{阈值}元{动作}」, 未设/空跳过动作); 定制包前缀切换。
+        //   复用 domain renderTierRuleLine (线上 @3036-3045 逐字抽出)。
+        String rule = renderTierRuleLine(isCustom ? cfgCustomRulePrefix(talker) : cfgRulePrefix(), tiers);
+
+        // 第一条 (引用群规条): 达标≥1 必发。引用原红包, msgid<=0/异常回退 sendText (端口内健壮性)。
+        HOST.sendQuote(talker, msgid, rule);
+
+        // 第二条 (msg2): 都带【查包】前缀(定制 →【查包】定制包)、都隔 gap 秒延迟。
+        //   ≤at上限 → 【查包】+ 逐档随机@文本 (真@, 仅非空档); >at上限 → 【查包】汇总 notice (无@纯文字)。
+        String checkPrefix = isCustom ? "【查包】定制包" : "【查包】";
+        String msg2 = null;
+        if (totalQualified > atLimit) {
+            msg2 = checkPrefix + "本次过" + lowThr + "元共" + totalQualified + "人，人数较多不逐一提醒，请大家自觉。";
+            hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " > at_limit=" + atLimit
+                + " (excluded=" + excludedHit + ") -> 1.N-tier quoted group-rule (sent now), 2.【查包】summary notice (NO @, delayed " + cfgTwoMsgGap() + "s). tiers=" + nTier + ".");
+        } else {
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (int gi = 0; gi < nTier; gi++) {
+                List g = (List) groups.get(gi);
+                if (g.isEmpty()) continue;
+                Object[] te = (Object[]) tiers.get(gi);
+                if (!first) sb.append("\n");
+                appendTierLine(sb, g, ((Integer) te[0]).intValue(), (String) te[1]);
+                first = false;
+            }
+            String atText = sb.toString();
+            if (atText.length() > 0) msg2 = checkPrefix + atText;
+            hbBgLog("[RP] " + hbNow() + " tier: qualified=" + totalQualified + " <= at_limit=" + atLimit
+                + " (excluded=" + excludedHit + ") -> 1.N-tier quoted group-rule (sent now), 2.【查包】+@msg via sendText (delayed " + cfgTwoMsgGap() + "s for ordering). tiers=" + nTier + ".");
+        }
+
+        // §16: 第二条统一"第一条后隔 cfgTwoMsgGap 秒发"的同一机制 (final 捕获进闭包, fire-and-forget, 不进在飞锁)。
+        if (msg2 != null && msg2.length() > 0) {
+            final String fMsg2 = msg2;
+            final String fTalker = talker;
+            long twoGapMs = cfgTwoMsgGap() * 1000L;
+            if (twoGapMs < 0L) twoGapMs = 0L;
+            delay((int) twoGapMs, new Runnable() {
+                public void run() {
+                    try { HOST.sendText(fTalker, fMsg2); }   // §16: @条真@; notice 纯文字也走 sendText。引用条已单发, 延迟保序。
+                    catch (Throwable t2) { hbBgLog("[RP] " + hbNow() + " delayed 2nd msg send err: " + t2); }
+                }
+            });
+        }
+
+        // §13.3: 本次提醒(整体)发出后更新本群上次发送时间 (限频; 两条算一次)。
+        if (talker != null) RP_LAST_MSG.put(talker, Long.valueOf(System.currentTimeMillis()));
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " tier+send err: " + t);
+    }
+}
+
+// ==================== T5 设备 seam: 写库 + 发送 (线上 hbDetailExtract @2739/@2814 逐字顺序) ====================
+// 由 device_recv.hbDetailExtract (P+~125s 反射详情页, 后台反射线程) 在伸手党判定后、关页前调入 (T5 结构, device_recv.bsh:421)。
+//   ① rpRecordStats 写库 (整段 try/catch 降级, 失败不卡关页/不发提醒); ② talker 非空 → hbTierAndSend 发两条提醒。
+//   均分跳过/反射取领取者/伸手党判定/关页/DONE/in-flight = device_recv 关注点, 本片不碰。
+void rpDeliverReceivers(Object[] job, java.util.List receivers, boolean isCustom) {
+    if (job == null) return;
+    String key = (String) job[JOB_KEY];
+    String talker = (String) job[JOB_TALKER];
+    String senderWxid = null;
+    try { senderWxid = (String) job[JOB_SENDER]; } catch (Throwable t) { senderWxid = null; }
+    String title = null;
+    try { title = (String) job[JOB_TITLE]; } catch (Throwable t) { title = null; }
+    long msgid = 0L;
+    try { if (job[JOB_MSGID] != null) msgid = ((Long) job[JOB_MSGID]).longValue(); } catch (Throwable t) { msgid = 0L; }
+
+    // ① 写库 (线上 @2739; 整段独立 try/catch 降级, 不抛)。
+    try { rpRecordStats(key, talker, senderWxid, title, receivers); }
+    catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " stats-db: write threw (ignored, degrade): " + t); }
+
+    // ② 分档 + 发提醒 (线上 @2814; talker 非空才发)。
+    if (talker != null) hbTierAndSend(talker, msgid, receivers, isCustom);
+    else hbBgLog("[RP] " + hbNow() + " detail: talker null, cannot send.");
+}
+
+// ==================== 每日定时统计 组装+发送 (线上 getDailyGroups @1077 / rpDailySend @2530 逐字) ====================
+// 开了每日定时的群 (CSV)。读 K_DAILY_GROUPS。
+java.util.List getDailyGroups() { return parseCsv(HOST.getString(K_DAILY_GROUPS, "")); }
+
+// 每日发送 (worker rpDailyCheck @181 调): 查 rp_record 中 ts∈[windowStart,windowEnd) 且 grp∈每日定时群, 按群一条多行, 按群路由转发目标。
+//   无记录 → 发一条全局心跳。整段后台线程 + try/catch 可降级。manual=true 时 header 标手动测试。
+//   ★合并适配: 窗口查询走 domain rpQueryWindow(STORAGE 端口, 线上 rawQuery ts范围+grp IN @2560 逐字), 组装走 domain rpBuildGroupedMsgs。
+void rpDailySend(final long windowStart, final long windowEnd, final boolean manual) {
+    new Thread() {
+        public void run() {
+            try {
+                java.util.List dailyGroups = getDailyGroups();
+                java.text.SimpleDateFormat mdhm = new java.text.SimpleDateFormat("MM-dd HH:mm");
+                String winStr = mdhm.format(new java.util.Date(windowStart)) + " ~ " + mdhm.format(new java.util.Date(windowEnd));
+                String headerPrefix = "📊 " + (manual ? "每日红包统计[手动测试] (" : "每日红包统计 (") + winStr + ")";
+
+                java.util.List rows = new java.util.ArrayList();   // List<Object[]>
+                if (dailyGroups.isEmpty()) {
+                    hbBgLog("[RP] " + hbNow() + " daily-send: no daily groups, send heartbeat only.");
+                } else {
+                    try { rows = rpQueryWindow(windowStart, windowEnd, dailyGroups); }   // STORAGE 窗口查询 (打不开/异常 → 心跳)
+                    catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send: window query fail, heartbeat only: " + t); rows = new java.util.ArrayList(); }
+                }
+
+                // 组装 + 发送 (§24.4)。有记录 → 按群路由 cfgExportTargetFor(grp); 全窗口无记录 → 一条全局心跳 (cfgExportTarget)。
+                int sent = 0;
+                if (rows.isEmpty()) {
+                    String def = rpCfgExportTarget();
+                    if (def != null && !def.trim().isEmpty()) {
+                        try { HOST.sendText(def.trim(), headerPrefix + "\n(过去24h无达标红包)"); sent = 1; } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send heartbeat sendText err: " + t); }
+                    } else { hbBgLog("[RP] " + hbNow() + " daily-send: no global target for heartbeat, skip."); }
+                } else {
+                    java.util.List msgs = rpBuildGroupedMsgs(rows, headerPrefix);   // List<Object[]{grp, msg}>
+                    for (int i = 0; i < msgs.size(); i++) {
+                        try {
+                            Object[] gm = (Object[]) msgs.get(i);
+                            String grp = (String) gm[0];
+                            String msg = (String) gm[1];
+                            HOST.sendText(cfgExportTargetFor(grp), msg);
+                            sent++;
+                        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send sendText err: " + t); }
+                    }
+                }
+                hbBgLog("[RP] " + hbNow() + " daily-send: sent " + sent + " msg (per-group routed), rows=" + rows.size()
+                    + ", groups=" + dailyGroups.size() + ", manual=" + manual + ". content NOT logged.");
+            } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send thread err: " + t); }
+        }
+    }.start();
+}
