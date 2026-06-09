@@ -1,4 +1,5 @@
-// GroupAdmin v1.19.1 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.19.2 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+//   - v1.19.2: [严重修复] recordSpeak flush 的 UPSERT last_speak=max(last_speak,excluded) 在 last_speak 为 NULL 时 SQLite max(NULL,x)=NULL → 先建基线再发言者永远卡 NULL(发言统计/潜水/伸手党失真)。改 max(coalesce(last_speak,excluded),excluded) 兜底。
 //   - v1.19.1: 警告防误踢 — 自动来源警告(伸手党等, reason 非空)额外豁免管理员/群主/原生群主 (canActOn 对 owner→admin 不挡, 潜水管理抢红包不再被自动流程累计→踢出); 手动 `@TA 警告` 行为不变 (SPEC §4.4)
 //   - v1.19.0: 警告带理由 — `@TA 警告 <理由>` 解析并透传; doWarn 通知末尾拼 " · 理由"; 自动来源(理由非空)对豁免对象(权限不足/白名单)静默跳过, 不发报错 (手动警告行为不变) (SPEC 警告系统)
 //   - v1.18.0: 活动判定=任意消息类型 — 非文本消息(图片/表情/语音/红包/文件等)也计入发言活动, 修复只发非文本消息者被 #潜水 误判潜水 (SPEC §3/§6.10 活动采集前置)
@@ -427,9 +428,11 @@ void l3Flush() {
             db.beginTransaction();
             try {
                 // last_speak: ON CONFLICT 取 max (单调, 不会改旧). first_seen 一并以增量 ts 初值, 冲突时取 min。
+                // v1.19.2 修复: 旧版 max(last_speak,excluded) 在 last_speak 为 NULL 时, SQLite 标量 max(NULL,x)=NULL →
+                //   先被建基线(last_speak=NULL)再发言的人永远卡 NULL(发言统计/潜水/伸手党全失真)。改用 coalesce 兜底 NULL(对齐 first_seen 写法)。
                 android.database.sqlite.SQLiteStatement upLs = db.compileStatement(
                     "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,?,?) "
-                    + "ON CONFLICT(grp,wxid) DO UPDATE SET last_speak=max(last_speak,excluded.last_speak), "
+                    + "ON CONFLICT(grp,wxid) DO UPDATE SET last_speak=max(coalesce(last_speak,excluded.last_speak),excluded.last_speak), "
                     + "first_seen=min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)");
                 // first_seen 候选: 单独 UPSERT, 冲突时 first_seen 取 min (绝不改晚), 不动 last_speak。
                 android.database.sqlite.SQLiteStatement upFs = db.compileStatement(
@@ -1936,7 +1939,7 @@ void onLoad() {
         String _owner;
         try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
         if (_owner == null) _owner = "(login pending)";
-        log("GroupAdmin v1.19.1 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
+        log("GroupAdmin v1.19.2 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
     } catch (Throwable t) {
         try { log("GroupAdmin v1.17.0 onLoad log block err: " + t); } catch (Throwable t2) {}
     }
@@ -1958,7 +1961,7 @@ void onLoad() {
                     int added = initFirstSeenBaseline(g);
                     if (added > 0) { touched++; totalAdded += added; }
                 }
-                log("GroupAdmin v1.19.1 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+                log("GroupAdmin v1.19.2 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
                 // _probeGroupInfoAPI();
             }
         });
