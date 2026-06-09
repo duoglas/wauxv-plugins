@@ -1,123 +1,129 @@
 {
-  "iteration": "redpacket-freeloader-finalize-v1.11.3",
+  "iteration": "groupadmin-lurk-exempt-and-baseline-v1.20.0",
   "date": "2026-06-09",
-  "summary_one_line": "把伸手党治理从真机 DRY-RUN 调试态收尾为真发送：全局开关时刻宽限 + 复用红包排除名单豁免 + 默认关。",
+  "summary_one_line": "GroupAdmin v1.20.0：#潜水 新成员豁免改固定 1 天 + onLoad 主动补全员 first_seen 基线（堵伸手党漏检）+ l3UpsertFirstSeen coalesce 防 NULL。",
   "user_confirmed": true,
   "requirements": [
-    { "id": "R1", "priority": "must", "text": "删除 DRY-RUN/GFDBG 调试态，恢复真发送群管警告命令 [AtWx=w] 警告 N分钟内未发言（§25.2），后台 fire-and-forget 线程 + cap 10 + sleep 800ms 保持。" },
-    { "id": "R2", "priority": "must", "text": "复用红包提醒排除名单 getExcludeList(talker) 做豁免：领取者 wxid 在排除名单内则跳过不判。" },
-    { "id": "R3", "priority": "must", "text": "全局开关时刻宽限：新增 per-group 键 rp_freeloader_since_<gid>，在开关 OFF→ON 时写当前时刻；判定时若红包检测时刻 packetMs 在 since+winMs 内 → 整包跳过（全员豁免）。" },
-    { "id": "R4", "priority": "must", "text": "宽限期过后，所有领取者（含新进群者）按 last_speak 判定，伸手党不使用 first_seen 做额外豁免（与潜水区分）。" },
-    { "id": "R5", "priority": "must", "text": "隐私：判定/警告日志不落昵称、不落完整 wxid 明文（仅尾4 + 计数/状态）。" }
+    { "id": "R1", "priority": "must", "text": "#潜水 新成员豁免由 days 窗口改为固定 1 天（新增常量 LURK_NEWMEMBER_EXEMPT_MS）：豁免判定 fst>now-1天；活跃判定 lst>cutoff(=now-days) 不变；冷启动提示『请等待 N 天』改『请等待 1 天』。" },
+    { "id": "R2", "priority": "must", "text": "onLoad 延迟基线块对所有已启用群都跑 initFirstSeenBaseline（幂等，只补缺失成员），不再只对 l3CountFirstSeen==0 的群补——堵『入群从不发言者无 speak 行 → 伸手党 rpQueryLastSpeak 返 -1 漏检』窄缝。" },
+    { "id": "R3", "priority": "must", "text": "修 l3UpsertFirstSeen 的 UPSERT min(first_seen,excluded.first_seen) → min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)，防已有 first_seen=NULL 行补不进（对齐 v1.19.2 last_speak coalesce 教训）。" },
+    { "id": "R4", "priority": "must", "text": "版本 bump v1.20.0（顶部注释 + onLoad 日志 + info.prop）+ SPEC 更新；不回归其他 #潜水/管理/热路径逻辑。" }
   ],
   "design": {
-    "summary": "判定整段仍在 hbDetailExtract 后台反射线程内、拼手气过滤之后。改两处：(1) 新增 cfgFreeloaderSince 读 rp_freeloader_since_<gid>，命令『伸手党 开』与 Dialog toggle 在 OFF→ON 时 putString 当前 System.currentTimeMillis()；(2) 判定块先做全局宽限闸门（since<=0 或 packetMs-since<winMs → 整包跳过），通过后起后台线程逐人：排除名单豁免 → rpQueryLastSpeak（-1跳过/0=NULL判/<thr判）→ 真 sendText 警告 + cap + sleep。rpQueryLastSpeak 不改，onHandleMsg 热路径零改（since 写入只在命令/Dialog 非热路径）。",
+    "summary": "改三处 GroupAdmin：(1) doShowInactive 把豁免 cutoff 与潜水 cutoff 拆开——豁免用固定 1 天常量，活跃仍用 days；冷启动文案同步。(2) onLoad 5s 延迟块去掉 l3CountFirstSeen>0 的 skip，对每个已启用群都调 initFirstSeenBaseline（幂等 upsert，min 不覆盖更早，返回新增数）。(3) l3UpsertFirstSeen 的 UPSERT 用 coalesce 兜底 NULL。全部非热路径（命令/onLoad）。#潜水 仍是手动列表不自动踢；admin/owner/protected 豁免不变。",
     "risk_points": [
-      { "id": "RISK1", "text": "破坏性上游：警告累计最终触发群管踢人。安全网必须严格，任何取不到的信号（since<=0 / packetMs<=0 / ls<0）一律跳过，误判方向偏向漏判（宁可漏判不可误警）。" },
-      { "id": "RISK2", "text": "热路径/线程安全：判定必须全程后台 fire-and-forget 线程，闭包变量全 final，不占 IN_FLIGHT 单飞锁；since 写入只在命令/Dialog 路径，onHandleMsg 零改。" },
-      { "id": "RISK3", "text": "数据可信度/自愈期：last_speak 仍大量 NULL（刚修 v1.19.2 + 重置），30min 全局宽限盖不住多小时自愈期；必须默认关 + 文档提示建议自愈后或测试群再开。" }
+      { "id": "RISK1", "text": "#潜水 名单语义变化：豁免缩短到 1 天 → 列出更多人（进群 1~N 天内从没发言的也上榜）。必须保证活跃者（窗口内发过言）不被误列、判定方向正确。" },
+      { "id": "RISK2", "text": "onLoad 正确性/成本：幂等补基线不能覆盖更早 first_seen（min 语义），不能拖慢加载（5s 延迟块、非热路径）；coalesce 修复不能引入回归（NULL 行才走 coalesce，正常行不变）。" },
+      { "id": "RISK3", "text": "破坏性间接：#潜水 是管理员踢人前置参考，错误名单可能导致误踢。admin/owner/native-owner/protected 豁免必须保持不变。" }
     ]
   },
   "traffic_flows": [
-    { "id": "F1", "text": "红包详情后台判定路径：hbDetailExtract → 普通/均分过滤后(仅拼手气) → rpRecordStats 后 → 全局宽限闸门 → 后台线程逐领取者判定 → sendText 警告命令。" },
-    { "id": "F2", "text": "开关写入路径：命令『伸手党 开』(onClickSendBtn) / Dialog 子页 toggle 保存 → OFF→ON 时 putString rp_freeloader_since_<gid> = now。" }
+    { "id": "F1", "text": "#潜水 命令路径：doShowInactive → l3Flush → l3QueryLastSpeak/FirstSeen → 逐成员（机器人/admin/owner/protected 跳过 → 豁免 fst>now-1天 → 活跃 lst>cutoff → 否则潜水）→ 名单。" },
+    { "id": "F2", "text": "onLoad 基线补全路径：onLoad 5s delay → l3MigrateCsvToDb → 遍历 getEnabledGroups → initFirstSeenBaseline → l3UpsertFirstSeen（INSERT 缺失成员 first_seen=now / 冲突 min coalesce）。" }
   ],
   "test_plan": [
     {
       "id": "T1",
-      "scenario": "全局宽限边界：刚开开关后窗口内有人抢拼手气包。",
+      "scenario": "#潜水 豁免边界：成员 A 进群 2 天从未发言、成员 B 进群 12 小时从未发言，跑 #潜水 7。",
       "assertions": [
-        "since 写入成功且为当前时刻量级",
-        "packetMs-since<winMs 时整包跳过，rp.log 记 within activation grace，零 sendText 警告"
+        "A（fst=2天前 < now-1天）→ 列入潜水名单",
+        "B（fst=12小时前 > now-1天）→ 仍豁免，计入『新成员在豁免期』不列"
       ],
       "negative_or_boundary": true,
-      "negative_case": "刚好等于 winMs 边界应判（不再豁免）；窗口内不得发任何警告，发了即 FAIL。",
-      "covers": ["R3"],
-      "risks": ["RISK1", "RISK3"],
+      "negative_case": "B（<1天）被列入潜水即 FAIL（误把豁免期新成员当潜水）。",
+      "covers": ["R1"],
+      "risks": ["RISK1"],
       "traffic_flows": ["F1"]
     },
     {
       "id": "T2",
-      "scenario": "宽限过后判定：since 早于 packetMs-winMs，两类领取者（last_speak NULL / 窗口内发过言）各抢一次。",
+      "scenario": "#潜水 活跃/管理豁免不回归：窗口内发过言者、admin、owner、protected 各一例。",
       "assertions": [
-        "last_speak==NULL（从未发言）→ 发 [AtWx] 警告 N分钟内未发言",
-        "窗口内发过言（ls>=thr）→ 不发警告"
+        "窗口内发过言（lst>cutoff）→ 不列",
+        "admin/owner/native-owner/protected → 不列"
       ],
       "negative_or_boundary": true,
-      "negative_case": "窗口内刚发过言者被警告即 FAIL（误警告方向）。",
-      "covers": ["R1", "R4"],
-      "risks": ["RISK1"],
+      "negative_case": "活跃者或管理员被列入潜水即 FAIL。",
+      "covers": ["R1"],
+      "risks": ["RISK1", "RISK3"],
       "traffic_flows": ["F1"]
     },
     {
       "id": "T3",
-      "scenario": "排除名单豁免：把某领取者加入红包排除名单后抢包。",
+      "scenario": "onLoad 补基线：已启用且已有基线的群里，存在无 speak 行的当前成员。",
       "assertions": [
-        "该 wxid 在 getExcludeList 内 → 跳过，不发警告（即使应判）",
-        "非排除名单同场景者仍按规则判（对照）"
+        "onLoad 后该成员被补 first_seen=now（DB 出现其行）",
+        "已有更早 first_seen 的成员不被覆盖（min 语义）"
       ],
       "negative_or_boundary": true,
-      "negative_case": "排除名单内成员被警告即 FAIL。",
-      "covers": ["R2"],
-      "risks": ["RISK1"],
-      "traffic_flows": ["F1"]
+      "negative_case": "已有更早 first_seen 被改晚成 now 即 FAIL（破坏单调）。",
+      "covers": ["R2", "R3"],
+      "risks": ["RISK2"],
+      "traffic_flows": ["F2"]
     },
     {
       "id": "T4",
-      "scenario": "开关 OFF→ON 写 since：命令与 Dialog 两入口开启；已 ON 重复开。",
+      "scenario": "coalesce 修复：构造 first_seen=NULL 的已有行，跑补基线。",
       "assertions": [
-        "OFF→ON 后 rp_freeloader_since_<gid> 写入当前时刻",
-        "已 ON 状态再开/重存不重置 since"
+        "first_seen=NULL 的行被设为 now（不再卡 NULL）",
+        "first_seen 已有非空值的行仍取 min 不被改晚"
       ],
       "negative_or_boundary": true,
-      "negative_case": "已 ON 重存把 since 重置（重新给 30min 宽限）即 FAIL。",
+      "negative_case": "NULL 行补基线后仍为 NULL 即 FAIL（min(NULL,x)=NULL 老 bug 未修）。",
       "covers": ["R3"],
       "risks": ["RISK2"],
       "traffic_flows": ["F2"]
     },
     {
       "id": "T5",
-      "scenario": "隐私 + 安全网：判定日志脱敏；缺信号路径。",
+      "scenario": "版本一致 + 加载。",
       "assertions": [
-        "grep rp.log/源码 无昵称、无完整 wxid 明文（仅尾4/计数）",
-        "since<=0 / packetMs<=0 / rpQueryLastSpeak<0 任一 → 跳过该路径"
+        "bsh.Parser 去 final 全文解析 EXIT=0",
+        "真机干净加载 v1.20.0，LSPosed 无 eval/parse 异常；顶部注释/onLoad 日志/info.prop 三处版本一致"
       ],
       "negative_or_boundary": true,
-      "negative_case": "安全网缺信号却仍发警告即 FAIL。",
-      "covers": ["R5", "R4"],
-      "risks": ["RISK1", "RISK2", "RISK3"],
+      "negative_case": "加载报解析异常或版本不一致即 FAIL。",
+      "covers": ["R4"],
+      "risks": ["RISK3"],
       "traffic_flows": ["F1", "F2"]
     }
   ],
   "acceptance": [
     {
       "id": "A1",
-      "text": "伸手党判定逻辑正确：全局宽限内全员豁免；宽限后按 last_speak 判；排除名单豁免；安全网严格。bsh 解析 PARSE_OK，真机干净加载无解析异常。",
+      "text": "#潜水 豁免=固定 1 天，活跃/管理豁免不回归。",
       "must_have_evidence": true,
-      "tests": ["T1", "T2", "T3", "T4"],
-      "covers": ["R1", "R2", "R3", "R4"]
+      "tests": ["T1", "T2"],
+      "covers": ["R1"]
     },
     {
       "id": "A2",
-      "text": "隐私达标：日志脱敏，grep 无昵称/完整 wxid/敏感串。",
+      "text": "onLoad 全启用群幂等补基线 + coalesce 防 NULL，不覆盖更早 first_seen。",
+      "must_have_evidence": true,
+      "tests": ["T3", "T4"],
+      "covers": ["R2", "R3"]
+    },
+    {
+      "id": "A3",
+      "text": "版本三处一致 + 真机干净加载。",
       "must_have_evidence": true,
       "tests": ["T5"],
-      "covers": ["R5"]
+      "covers": ["R4"]
     }
   ],
   "tasks": [
-    { "id": "W1", "stage": "EXECUTE", "title": "SPEC §25.9 增补（全局开关时刻宽限 + 排除名单豁免）+ 版本 bump v1.11.3", "covers": ["R1", "R2", "R3"], "risk": "low" },
-    { "id": "W2", "stage": "EXECUTE", "title": "新增 K_FREELOADER_SINCE_PREFIX + cfgFreeloaderSince；命令『伸手党 开』与 Dialog toggle 在 OFF→ON 写 since", "covers": ["R3"], "risk": "low" },
-    { "id": "W3", "stage": "EXECUTE", "title": "重写判定块：删 GFDBG/DRY-RUN、全局宽限闸门、恢复真发送 + 排除名单豁免 + cap + sleep、日志脱敏", "covers": ["R1", "R2", "R4", "R5"], "risk": "high" },
-    { "id": "W4", "stage": "VERIFY", "title": "bsh 解析 PARSE_OK → 部署 → 干净加载 → 行为/安全网/隐私核对 + Santa 双审", "covers": ["R1", "R2", "R3", "R4", "R5"], "risk": "high" }
+    { "id": "W1", "stage": "EXECUTE", "title": "doShowInactive 豁免拆固定 1 天 + 常量 + 冷启动文案", "covers": ["R1"], "risk": "medium" },
+    { "id": "W2", "stage": "EXECUTE", "title": "onLoad 对所有已启用群补基线 + l3UpsertFirstSeen coalesce 修复", "covers": ["R2", "R3"], "risk": "medium" },
+    { "id": "W3", "stage": "EXECUTE", "title": "版本 bump v1.20.0 + SPEC 更新", "covers": ["R4"], "risk": "low" },
+    { "id": "W4", "stage": "VERIFY", "title": "bsh 解析 → 部署 → 干净加载 → 补基线 DB 核对 + Santa 审", "covers": ["R1", "R2", "R3", "R4"], "risk": "medium" }
   ],
   "irreversible_actions": [
-    "部署 RedPacketStats 插件到真机（可回滚：留底 main.java；功能默认关）",
-    "本功能启用后警告累计最终会触发群管踢人——本轮保持默认关，不启用，不踢任何人"
+    "部署 GroupAdmin 插件到真机（可回滚：留底 main.java）",
+    "onLoad 会向 groupadmin.db 补 first_seen 行（幂等、单调 min、不删不改晚，影响可控）"
   ],
   "out_of_scope": [
-    "GroupAdmin #潜水 新成员豁免改 1 天（另一插件，单独确认后处理）",
-    "GroupAdmin 主动为全体成员补 first_seen 基线（关闭从不发言者无行的窄缺口）——单独增强"
+    "伸手党功能本身（上一轮 RP v1.11.3 已收尾）",
+    "#潜水 自动踢人（仍是手动列表）"
   ],
-  "delivery": "仅改 RedPacketStats 插件 + 部署 + 保持默认关（rp_freeloader_on_<gid> 默认空）。不动 denylist、不刷模块、不批量操作。启用由用户在测试群手动『伸手党 开』。"
+  "delivery": "改 GroupAdmin 插件 + 部署 + bump v1.20.0。#潜水 仍手动列表不自动踢；不动 denylist、不刷模块、不批量踢人。"
 }

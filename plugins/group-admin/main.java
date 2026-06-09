@@ -1,4 +1,5 @@
-// GroupAdmin v1.19.2 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+// GroupAdmin v1.20.0 - 群管理: 踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局配置 / 三层权限
+//   - v1.20.0: (1) #潜水 新成员豁免改固定 1 天(LURK_NEWMEMBER_EXEMPT_MS, 与潜水窗口 days 解耦: 豁免 fst>now-1天, 活跃仍 lst>now-days天); 冷启动文案改"豁免1天"。(2) onLoad 对所有已启用群都补 first_seen 基线(去掉 l3CountFirstSeen>0 skip, 幂等只补缺失成员), 堵"入群从不发言者无 speak 行→伸手党漏检"窄缝。(3) l3UpsertFirstSeen UPSERT min(first_seen,excluded)→min(coalesce(...),excluded) 防 NULL 行补不进(对齐 v1.19.2)。#潜水 仍手动列表不自动踢。
 //   - v1.19.2: [严重修复] recordSpeak flush 的 UPSERT last_speak=max(last_speak,excluded) 在 last_speak 为 NULL 时 SQLite max(NULL,x)=NULL → 先建基线再发言者永远卡 NULL(发言统计/潜水/伸手党失真)。改 max(coalesce(last_speak,excluded),excluded) 兜底。
 //   - v1.19.1: 警告防误踢 — 自动来源警告(伸手党等, reason 非空)额外豁免管理员/群主/原生群主 (canActOn 对 owner→admin 不挡, 潜水管理抢红包不再被自动流程累计→踢出); 手动 `@TA 警告` 行为不变 (SPEC §4.4)
 //   - v1.19.0: 警告带理由 — `@TA 警告 <理由>` 解析并透传; doWarn 通知末尾拼 " · 理由"; 自动来源(理由非空)对豁免对象(权限不足/白名单)静默跳过, 不发报错 (手动警告行为不变) (SPEC 警告系统)
@@ -258,7 +259,9 @@ int l3UpsertFirstSeen(String groupId, List wxids, long ts) {
             try {
                 android.database.sqlite.SQLiteStatement st = db.compileStatement(
                     "INSERT INTO speak(grp,wxid,last_speak,first_seen) VALUES(?,?,NULL,?) "
-                    + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=min(first_seen,excluded.first_seen)");
+                    // v1.20.0: coalesce 兜底 NULL (对齐 v1.19.2 last_speak 教训: SQLite min(NULL,x)=NULL,
+                    //   否则 first_seen 已为 NULL 的行(如 force-rebuild 后)永远补不进, 取 min 仍取旧的更早值不被覆盖)。
+                    + "ON CONFLICT(grp,wxid) DO UPDATE SET first_seen=min(coalesce(first_seen,excluded.first_seen),excluded.first_seen)");
                 try {
                     for (int i = 0; i < wxids.size(); i++) {
                         String w = (String) wxids.get(i);
@@ -1441,6 +1444,9 @@ void _probeGroupInfoAPI() {
 }
 void setProtected(String groupId, List p) { putString("protected_" + groupId, joinCsv(p)); }
 
+// v1.20.0: #潜水 新成员豁免改固定 1 天 (与潜水窗口 days 解耦)。进群不足 1 天的成员豁免, 潜水判定窗口仍用 days。
+long LURK_NEWMEMBER_EXEMPT_MS = 86400000L;   // 1 天
+
 void doShowInactive(String groupId, String content) {
     String[] tk = content.split("[\\s\\u2005\\u00A0]+");
     int days = 7;
@@ -1457,7 +1463,8 @@ void doShowInactive(String groupId, String content) {
     try { l3Flush(); } catch (Throwable t) { log("doShowInactive l3Flush fail: " + t); }
 
     long now = System.currentTimeMillis();
-    long cutoff = now - (long) days * 86400000L;
+    long cutoff = now - (long) days * 86400000L;        // 潜水(活跃)判定窗口
+    long exemptCutoff = now - LURK_NEWMEMBER_EXEMPT_MS;  // v1.20.0: 新成员豁免固定 1 天 (与 days 解耦)
     // T2′: lsg_/fsg_ 从 SQLite 查 (flush 已把内存增量提交进 DB)。
     Map ls = l3QueryLastSpeak(groupId);
     Map fs = l3QueryFirstSeen(groupId);
@@ -1473,7 +1480,7 @@ void doShowInactive(String groupId, String content) {
     String botWxid = getLoginWxid();
 
     if (coldStart) {
-        sendText(groupId, "📊 已建立潜水基线 (共 " + members.size() + " 人)\n请等待 " + days + " 天后再发 #潜水 " + days);
+        sendText(groupId, "📊 已建立潜水基线 (共 " + members.size() + " 人)\n新成员豁免 1 天, 请等待 1 天后再发 #潜水 " + days);
         return;
     }
 
@@ -1494,7 +1501,7 @@ void doShowInactive(String groupId, String content) {
             newJoinSkip++;
             continue;
         }
-        if (fst.longValue() > cutoff) { newJoinSkip++; continue; }  // 新成员豁免
+        if (fst.longValue() > exemptCutoff) { newJoinSkip++; continue; }  // v1.20.0: 新成员豁免固定 1 天
 
         Long lst = (Long) ls.get(w);
         if (lst != null && lst.longValue() > cutoff) continue;     // 期内说过话
@@ -1939,9 +1946,9 @@ void onLoad() {
         String _owner;
         try { _owner = getLoginWxid(); } catch (Throwable t) { _owner = "(login pending)"; }
         if (_owner == null) _owner = "(login pending)";
-        log("GroupAdmin v1.19.2 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
+        log("GroupAdmin v1.20.0 loading, owner=" + _owner + ", enabled groups=" + enabled.size());
     } catch (Throwable t) {
-        try { log("GroupAdmin v1.17.0 onLoad log block err: " + t); } catch (Throwable t2) {}
+        try { log("GroupAdmin v1.20.0 onLoad log block err: " + t); } catch (Throwable t2) {}
     }
 
     // [C-PLUGIN-05] 延迟基线调度块: 本身不依赖 getLoginWxid; 单独 try/catch 互不连坐。
@@ -1957,11 +1964,12 @@ void onLoad() {
                 int totalAdded = 0;
                 for (int i = 0; i < groups.size(); i++) {
                     String g = (String) groups.get(i);
-                    if (l3CountFirstSeen(g) > 0) continue;   // T2′: 已有基线 (DB 查), 跳过
+                    // v1.20.0: 对所有已启用群都补基线 (去掉 l3CountFirstSeen>0 的 skip), 堵『入群从不发言者无 speak 行 →
+                    //   伸手党 rpQueryLastSpeak 返 -1 漏检』窄缝。initFirstSeenBaseline 幂等 (只补缺失成员, 冲突取 min 不覆盖更早)。
                     int added = initFirstSeenBaseline(g);
                     if (added > 0) { touched++; totalAdded += added; }
                 }
-                log("GroupAdmin v1.19.2 baseline check: 已启用群 " + groups.size() + ", 新建基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+                log("GroupAdmin v1.20.0 baseline check: 已启用群 " + groups.size() + ", 补基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
                 // _probeGroupInfoAPI();
             }
         });

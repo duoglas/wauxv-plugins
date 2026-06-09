@@ -6,7 +6,12 @@
 ## 1. 概述
 
 - 名称：GroupAdmin（群管理）
-- 当前版本：v1.19.0（`main.java`，BeanShell；T1 埋点 + T2 内存缓冲 + T2′ SQLite 落盘；v1.19.0 警告带理由 + 自动来源对豁免对象静默；v1.18.0 非文本消息也计入发言活动）
+- 当前版本：v1.20.0（`main.java`，BeanShell；T1 埋点 + T2 内存缓冲 + T2′ SQLite 落盘；v1.20.0 #潜水新成员豁免固定1天+onLoad补全员基线+coalesce防NULL；v1.19.2 last_speak NULL coalesce 修复；v1.19.0 警告带理由；v1.18.0 非文本消息也计入发言活动）
+
+> **v1.20.0 #潜水 豁免/基线变更**：
+> - **新成员豁免改固定 1 天（`LURK_NEWMEMBER_EXEMPT_MS`，与潜水窗口 `days` 解耦）**：`doShowInactive` 里豁免判定由 `first_seen > now-days天` 改为 `first_seen > now-1天`；活跃判定仍 `last_speak > now-days天`。语义：`#潜水 7` 会列出「进群超过 1 天 且 7 天内没发言」的人（原为「进群超过 7 天」）→ 名单更全。冷启动文案改「新成员豁免 1 天」。**#潜水 仍是手动列表（L2），不自动踢**；`#踢潜水` 由管理员据名单决定。admin/owner/native-owner/protected 豁免不变。
+> - **onLoad 主动补全员 `first_seen` 基线**：5s 延迟块对**所有已启用群**都跑 `initFirstSeenBaseline`（去掉 `l3CountFirstSeen>0` 的 skip；幂等，只补缺失成员，冲突取 min 不覆盖更早）。堵「入群从不发言者无 speak 行 → 红包伸手党 `rpQueryLastSpeak` 返 -1 漏检」的窄缝。
+> - **`l3UpsertFirstSeen` coalesce 防 NULL**：UPSERT `first_seen=min(first_seen,excluded)` → `min(coalesce(first_seen,excluded),excluded)`，防已有 `first_seen=NULL` 行（如 `rebuildBaselineForce` 清空后）因 `min(NULL,x)=NULL` 永远补不进（对齐 v1.19.2 `last_speak` 教训）。
 - 宿主：WAuxiliary（`me.hd.wauxv`），通过 `onHandleMsg` 等回调 hook 微信 `com.tencent.mm`
 - 职责：群消息驱动的群管理——踢人 / 黑名单 / 警告 / 潜水清理 / 白名单 / 全局名单 / 三层权限
 - 部署目标：真机 `…/WAuxiliary/Plugin/GroupAdmin/main.java`
