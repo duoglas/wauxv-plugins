@@ -118,10 +118,11 @@ Object _mkNoopLeaf() {
 }
 LEAF = _mkNoopLeaf();   // 默认无副作用占位; 测试/生产可整体 swap (字段调用时解析)。
 
-// 群启用闸门缝 (线上 isGroupEnabled @1681; 反射/配置读取留 app/hooks)。
-// 测试可经键 ge_<gid> 编程 (host_fake KV); 占位实现读该键, 与线上"按群配置"语义对齐, P2 接真实实现。
+// 群启用闸门 (线上 isGroupEnabled @1681)。W6: 委托真实闸门 isGroupEnabled (enable_state.bsh:56,
+// 带 TTL 60s 内存缓存, miss/异常回退直读), 与热路径 onHandleMsgBody 用的 isGroupEnabled 同源,
+// 消除占位 ge_ 键与真实闸门不一致。函数名 _cmdGroupEnabled 保留 (调用点 routeCommand 不动)。
 boolean _cmdGroupEnabled(String groupId) {
-    return "1".equals(HOST.getString("ge_" + groupId, "0"));
+    return isGroupEnabled(groupId);
 }
 
 // 严格模式闸门缝 (线上 isStrictMode @776)。

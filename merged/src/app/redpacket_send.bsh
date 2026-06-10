@@ -49,6 +49,7 @@ String[] DEF_CONNECTORS = new String[] { "超过{X}元，", "过{X}元，", "过
 String[] DEF_ACTION_PHRASES = new String[] { "{A}", "快点{A}啊", "记得{A}哦", "需要{A}", "该{A}了", "麻烦{A}一下" };
 // 每日定时群 (线上 @294): 开了每日定时的群 (CSV groupId), 与红包统计开关独立。
 String K_DAILY_GROUPS = "rp_daily_groups";
+String K_DAILY_MIGRATED = "rp_daily_migrated";    // 一次性迁移 flag: 首次加载把 daily_groups 初始化=当前 enabled_groups (线上 @295 逐字)
 
 // ==================== 发送层 cfg 读 (线上 @838-873 逐字; 经 merged rpCfgInt/rpCfgLong/rpCfgStr) ====================
 int  cfgAtLimit()   { return rpCfgInt(K_AT_LIMIT, DEF_AT_LIMIT); }            // @838
@@ -348,6 +349,26 @@ void disableDailyGroup(String groupId) {
     boolean changed = false;
     for (int i = l.size() - 1; i >= 0; i--) if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
     if (changed) HOST.putString(K_DAILY_GROUPS, joinCsv(l));
+}
+
+// 一次性迁移 (线上 rpDailyMigrateOnce @295 逐字; onLoad 调一次):
+//   首次加载把 rp_daily_groups 初始化 = 当前 rp_enabled_groups, flag 置位后不再跑。
+//   键同源: getString/putString→HOST.; getEnabledGroups→rpGetEnabledGroups (读 RP_K_ENABLED=rp_enabled_groups,
+//   绝不用 GA getEnabledGroups); normGroupId→rpNormGroupId (RP 键名保真版=trim); enableDailyGroup/hbBgLog/hbNow 直用。
+void rpDailyMigrateOnce() {
+    try {
+        String flag = HOST.getString(K_DAILY_MIGRATED, "");
+        if (flag != null && flag.equals("1")) return;   // 已迁移
+        List enabled = rpGetEnabledGroups();
+        for (int i = 0; i < enabled.size(); i++) {
+            String g = rpNormGroupId((String) enabled.get(i));
+            if (!g.isEmpty()) enableDailyGroup(g);
+        }
+        HOST.putString(K_DAILY_MIGRATED, "1");
+        hbBgLog("[RP] " + hbNow() + " daily-migrate: initialized rp_daily_groups from rp_enabled_groups (" + enabled.size() + " groups). one-time, flag set.");
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " daily-migrate err: " + t);
+    }
 }
 
 // 每日发送 (worker rpDailyCheck @181 调): 查 rp_record 中 ts∈[windowStart,windowEnd) 且 grp∈每日定时群, 按群一条多行, 按群路由转发目标。

@@ -15,6 +15,11 @@ source("src/domain/warning.bsh");
 FAKE_RECORDED = new java.util.ArrayList();   // Object[]{groupId, wxid}
 void recordSpeak(String groupId, String wxid) { FAKE_RECORDED.add(new Object[]{ groupId, wxid }); }
 
+// ---- isGroupEnabled 闸门 stub (W6: commands._cmdGroupEnabled 改为委托真实闸门 isGroupEnabled;
+//      该真实定义在 app/enable_state.bsh, 不在本单测加载范围内。本测经 ge_<gid> 键编程启用,
+//      故以读同款 ge_ 键的 stub 提供 isGroupEnabled, 保持本测"路由分派真值表"意图不变。) ----
+boolean isGroupEnabled(String groupId) { return "1".equals(HOST.getString("ge_" + groupId, "0")); }
+
 source("src/app/commands.bsh");
 
 // ---- 动作叶子端口 LEAF: 换入 recording fake (与 host_fake 换 HOST 同模式; 对象字段调用时解析) ----

@@ -58,8 +58,9 @@ int rebuildBaselineForce(String groupId) {
     return initFirstSeenBaseline(groupId);
 }
 
-// ---- onClickSendBtn: bot 输入框触发 ----
-boolean onClickSendBtn(String text) {
+// ---- gaOnClickSendBtn: bot 输入框触发 (W6: 由 onClickSendBtn 改名, 函数体一字未动;
+//      统一入口 onClickSendBtn(GA 先 RP 后) 收口在 app/hooks.bsh) ----
+boolean gaOnClickSendBtn(String text) {
     if (text == null) return false;
     // v1.12: 加 `群管` / `#群管` 两个短触发词
     if (text.equals("群管") || text.equals("#群管") ||
