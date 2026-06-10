@@ -58,8 +58,9 @@ void delWarnList(String groupId, String wxid) {
     if (l.remove(wxid)) HOST.putString("wl_" + groupId, joinCsv(l));
 }
 
-// ---- 机器人群管权限态 (@674): "none"=无群管权限 ----
+// ---- 机器人群管权限态 (@674/@675): "none"=无群管权限; "unknown"=没操作过; "admin"=已确认有权 ----
 String botPrivState(String groupId) { return HOST.getString("bp_" + groupId, "unknown"); }
+void   setBotPriv(String groupId, String state) { HOST.putString("bp_" + groupId, state); }
 
 // ---- doWarn 核心 (@2710 三参转调 + @2712 四参), 逐字保真 ----
 void doWarn(String groupId, String sender, String target) { doWarn(groupId, sender, target, null); }

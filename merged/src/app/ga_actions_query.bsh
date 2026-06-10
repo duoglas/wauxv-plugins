@@ -1,0 +1,271 @@
+// ============================================================
+// app/ga_actions_query — GroupAdmin 组 A 动作: 查询/列表展示 + 群状态/群列表/角色探测诊断。
+// 逐字保真移植自线上 plugins/group-admin/main.java, 行为零改动, 只换载体 + 端口改写。
+//
+// 对应线上锚点 (函数实际边界为准):
+//   showHelp            @2850-2872  群管帮助/帮助 群管
+//   showBlacklist       @2874-2887  黑名单 (带 1-based 序号【NN】)
+//   showAdmins          @2889-2915  管理员 (群主段 + 管理员段 + 时效标签)；入口 purgeExpiredAdmins
+//   showWarnList        @2917-2927  警告名单
+//   showProtected       @1647-1654  保护名单
+//   showWhitelist       @3822-3831  本群白名单
+//   showGlobalBlacklist @3894-3903  全局黑名单
+//   showGlobalWhitelist @3918-3927  全局白名单
+//   doWarnDetail        @3834-3863  警告详情 (含 最近警告/操作人/剩余)
+//   doCheckBotPriv      @1621-1626  #群权限自检: 清 bot 群管权限缓存
+//   logEnabledGroupNames@595-612    群管群列表 → 写 plugin.log (反射 getGroupList/getRoomId/getName)
+//   _logNativeRoleProbe @1383-1390  原生角色探测 (bot 自发"群管设置/配置"时)
+//   groupStatus         内联 @2187-2196 (onHandleMsgBody 内) → 本文件包成独立函数 void groupStatus(grp,sender)
+//   safeGroupDebug      @577-580    + logGroupEnabledDebug @582-593 (groupStatus 诊断依赖, 逐字搬入)
+//
+// 依赖 (manifest 在本片之前拼入):
+//   domain/membership.bsh : getBlacklist/getGlobalBlacklist/getProtected/getOwners/getAdmins/
+//                           isAdminInGroup/isOwner/getWhitelist/getGlobalWhitelist/
+//                           adminExpiryLabel/purgeExpiredAdmins/normGroupId/parseCsv
+//   domain/warning.bsh    : getWarn/getWarnKick/getWarnList/botPrivState/setBotPriv
+//   app/enable_state.bsh  : getEnabledGroups/isGroupEnabled
+//   core 端口 HOST/CLOCK  : HOST.getString/sendText/getLoginWxid/lookupName/detectNativeOwner ; CLOCK.now()
+//   WAuxiliary 注入内置 (本地无运行时, 解析门只解析语法; 同 redpacket_send.bsh:120 范式):
+//     log(...) / getGroupList()->List + getRoomId/getName 反射 / getLoginAlias()->String
+//
+// 端口改写 (只改这些, 其它逐字):
+//   getString(k,def)                       → HOST.getString(k,def)
+//   sendText(grp, text)                    → HOST.sendText(grp, text)  (回执发原会话 groupId)
+//   getLoginWxid()                         → HOST.getLoginWxid()
+//   lookupName(wxid, grp)                  → HOST.lookupName(wxid, grp)
+//   System.currentTimeMillis()             → CLOCK.now()
+//   _detectNativeOwner(grp)                → HOST.detectNativeOwner(grp)  (反射缝, 契约同: 返回 owner wxid|null)
+//   保留为内置直调 (非端口): log / getGroupList / getRoomId/getName 反射 / getLoginAlias
+//
+// 保真红线: 文案/分支/序号格式/时间换算阈值 (60/1440 分钟) 逐字, 不臆造/不增删语义 (YAGNI + 保真)。
+// 本文件只产出 do* 组 A 真实函数; 不接 LEAF 桥 (commands.bsh 的 _mkNoopLeaf 占位留 W6)。
+// ============================================================
+
+// ---- 群状态诊断: 群启用态调试 (@577-593, 逐字) ----
+String safeGroupDebug(String groupId) {
+    String s = normGroupId(groupId);
+    return "len=" + s.length() + ",hash=" + Integer.toHexString(s.hashCode());
+}
+void logGroupEnabledDebug(String groupId) {
+    try {
+        String g = normGroupId(groupId);
+        List l = getEnabledGroups();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < l.size(); i++) {
+            if (i > 0) sb.append(";");
+            sb.append(safeGroupDebug((String) l.get(i)));
+        }
+        log("group-enabled debug: current=" + safeGroupDebug(g) + ", enabledCount=" + l.size() + ", enabled=" + sb.toString() + ", match=" + isGroupEnabled(g));
+    } catch (Exception e) { log("group-enabled debug err: " + e.getClass().getName()); }
+}
+
+// ---- 群管群列表 → 写 plugin.log (@595-612, 逐字; getGroupList/getRoomId/getName = WAuxiliary 注入) ----
+void logEnabledGroupNames() {
+    try {
+        List enabled = getEnabledGroups();
+        List groups = getGroupList();
+        log("group-list probe: enabledCount=" + enabled.size() + ", groupListCount=" + (groups == null ? 0 : groups.size()));
+        if (groups == null) return;
+        for (int i = 0; i < groups.size(); i++) {
+            Object info = groups.get(i);
+            String rid = "";
+            String name = "";
+            try { Object r = info.getClass().getMethod("getRoomId").invoke(info); if (r != null) rid = r.toString(); } catch (Exception e) {}
+            try { Object n = info.getClass().getMethod("getName").invoke(info); if (n != null) name = n.toString(); } catch (Exception e) {}
+            if (isGroupEnabled(rid) || name.indexOf("群A") >= 0 || name.indexOf("备用") >= 0 || name.indexOf("养群") >= 0 || name.indexOf("学院") >= 0) {
+                log("group-list probe: roomId=" + rid + ", enabled=" + isGroupEnabled(rid) + ", name=" + name);
+            }
+        }
+    } catch (Exception e) { log("group-list probe err: " + e.getClass().getName() + ": " + e.getMessage()); }
+}
+
+// ---- 原生角色探测诊断 (@1383-1390); _detectNativeOwner → HOST.detectNativeOwner (反射缝, 契约同) ----
+void _logNativeRoleProbe(String groupId) {
+    try {
+        String owner = HOST.detectNativeOwner(groupId);
+        log("native-role probe: ownerAuto=" + (owner != null && !owner.isEmpty()));
+    } catch (Exception e) {
+        log("native-role probe err: " + e.getClass().getName() + ": " + e.getMessage());
+    }
+}
+
+// ---- 群管状态 (线上 onHandleMsgBody 内联 @2187-2196 → 包成独立函数, 逐字搬内联体) ----
+void groupStatus(String groupId, String sender) {
+    _logNativeRoleProbe(groupId);
+    logGroupEnabledDebug(groupId);
+    if (!isAdminInGroup(groupId, sender)) return;
+    if (isGroupEnabled(groupId)) {
+        HOST.sendText(groupId, "🟢 本群 GroupAdmin 已启用");
+    } else {
+        HOST.sendText(groupId, "🔴 本群 GroupAdmin 未启用\n群主发 '开启群管' 激活");
+    }
+}
+
+// ---- 帮助 (@2850-2872) ----
+void showHelp(String groupId) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("📋 GroupAdmin v1.16.1\n");
+    sb.append("作者: 早哥\n");
+    sb.append("━━━━━━━━━━━\n");
+    sb.append("【日常】\n");
+    sb.append("@TA 踢          移出群聊\n");
+    sb.append("添加黑名单 @TA  加黑名单 + 踢 (可@多人)\n");
+    sb.append("去除黑名单 @TA  解除黑名单 (可@多人)\n");
+    sb.append("去除黑名单【N】 按黑名单序号解除\n");
+    sb.append("@TA 警告     累计 ").append(getWarnKick(groupId)).append(" 次自动踢\n");
+    sb.append("@TA 清零     警告归零\n");
+    sb.append("@TA 白名单   免警告 + 免进群检测\n");
+    sb.append("@TA 保护     潜水豁免\n");
+    sb.append("#潜水 7      列出 7 天没说话的人\n\n");
+    sb.append("【查询】\n");
+    sb.append("黑名单 (带序号) / 白名单 / 管理员\n");
+    sb.append("警告名单 / 保护名单\n\n");
+    sb.append("💡 发 \"群管\" 弹本群配置面板\n");
+    sb.append("(含全局配置 / 严格模式 / 警告详情\n");
+    sb.append(" / wxid 操作 等更多高级项)");
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 黑名单 (@2874-2887, 带 1-based 序号【NN】) ----
+void showBlacklist(String groupId) {
+    List bl = getBlacklist(groupId);
+    if (bl.isEmpty()) { HOST.sendText(groupId, "📋 本群黑名单空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🚫 黑名单 (").append(bl.size()).append("):\n");
+    // v1.16: 每项前加 1-based 序号【NN】, 配合 "去除黑名单【N】" 使用
+    for (int i = 0; i < bl.size(); i++) {
+        int n = i + 1;
+        sb.append(n < 10 ? "【0" + n + "】" : "【" + n + "】");
+        sb.append(HOST.lookupName((String) bl.get(i), groupId)).append("\n");
+    }
+    sb.append("──────\n去除: 去除黑名单【序号】 或 去除黑名单 @对方");
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 管理员 (@2889-2915); 入口 purgeExpiredAdmins 惰性到期清除 (命令路径, 低频) ----
+void showAdmins(String groupId) {
+    try { purgeExpiredAdmins(groupId); } catch (Throwable t) {}   // v1.17.0 惰性到期清除 (命令路径, 低频)
+    StringBuilder sb = new StringBuilder();
+    // 群主段
+    sb.append("👑 群主:\n");
+    String me = HOST.getLoginWxid();
+    String meName = HOST.lookupName(me, groupId);
+    if (meName.equals("未知")) {
+        try { String a = getLoginAlias(); if (a != null && !a.isEmpty()) meName = a; } catch (Exception e) {}
+    }
+    sb.append("· [机器人] ").append(meName).append("\n");
+    List owners = getOwners();
+    for (int i = 0; i < owners.size(); i++) {
+        sb.append("· ").append(HOST.lookupName((String) owners.get(i), groupId)).append("\n");
+    }
+    // 管理员段
+    List admins = getAdmins(groupId);
+    if (!admins.isEmpty()) {
+        sb.append("\n🛡 管理员:\n");
+        for (int i = 0; i < admins.size(); i++) {
+            String aw = (String) admins.get(i);
+            sb.append("· ").append(HOST.lookupName(aw, groupId))
+              .append(" (").append(adminExpiryLabel(groupId, aw)).append(")\n");
+        }
+    }
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 警告名单 (@2917-2927) ----
+void showWarnList(String groupId) {
+    List wl = getWarnList(groupId);
+    if (wl.isEmpty()) { HOST.sendText(groupId, "📋 本群无警告记录"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("⚠️ 警告名单 (").append(wl.size()).append("):\n");
+    for (int i = 0; i < wl.size(); i++) {
+        String w = (String) wl.get(i);
+        sb.append("· ").append(HOST.lookupName(w, groupId)).append(" - ").append(getWarn(groupId, w)).append("/").append(getWarnKick(groupId)).append("\n");
+    }
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 保护名单 (@1647-1654) ----
+void showProtected(String groupId) {
+    List p = getProtected(groupId);
+    if (p.isEmpty()) { HOST.sendText(groupId, "📋 本群保护名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🛡 保护名单 (").append(p.size()).append("):\n");
+    for (int i = 0; i < p.size(); i++) sb.append("· ").append(HOST.lookupName((String) p.get(i), groupId)).append("\n");
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 本群白名单 (@3822-3831) ----
+void showWhitelist(String groupId) {
+    List wt = getWhitelist(groupId);
+    if (wt.isEmpty()) { HOST.sendText(groupId, "📋 本群白名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("✅ 本群白名单 (").append(wt.size()).append("):\n");
+    for (int i = 0; i < wt.size(); i++) {
+        sb.append("· ").append(HOST.lookupName((String) wt.get(i), groupId)).append("\n");
+    }
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 警告详情 (@3834-3863) ----
+void doWarnDetail(String groupId, String target) {
+    int n = getWarn(groupId, target);
+    String name = HOST.lookupName(target, groupId);
+    StringBuilder sb = new StringBuilder();
+    sb.append("⚠️ ").append(name).append(" 警告详情:\n");
+    sb.append("━━━━━━\n");
+    sb.append("当前警告: ").append(n).append("/").append(getWarnKick(groupId)).append("\n");
+    if (n == 0) {
+        sb.append("(无警告记录)");
+    } else {
+        String tsStr = HOST.getString("wnt_" + groupId + "_" + target, "");
+        if (!tsStr.isEmpty()) {
+            try {
+                long ts = Long.parseLong(tsStr);
+                long ago = (CLOCK.now() - ts) / 60000L;
+                if (ago < 60) sb.append("最近警告: ").append(ago).append(" 分钟前\n");
+                else if (ago < 1440) sb.append("最近警告: ").append(ago / 60).append(" 小时前\n");
+                else sb.append("最近警告: ").append(ago / 1440).append(" 天前\n");
+            } catch (Exception e) {}
+        }
+        String fromWxid = HOST.getString("wnf_" + groupId + "_" + target, "");
+        if (!fromWxid.isEmpty()) {
+            sb.append("操作人: ").append(HOST.lookupName(fromWxid, groupId)).append("\n");
+        }
+        int remain = getWarnKick(groupId) - n;
+        if (remain > 0) sb.append("还剩 ").append(remain).append(" 次机会");
+        else sb.append("已达上限");
+    }
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 全局黑名单 (@3894-3903) ----
+void showGlobalBlacklist(String groupId) {
+    List bl = getGlobalBlacklist();
+    if (bl.isEmpty()) { HOST.sendText(groupId, "🌐 全局黑名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🌐 全局黑名单 (").append(bl.size()).append("):\n");
+    for (int i = 0; i < bl.size(); i++) {
+        sb.append("· ").append(bl.get(i)).append("\n");
+    }
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- 全局白名单 (@3918-3927) ----
+void showGlobalWhitelist(String groupId) {
+    List wt = getGlobalWhitelist();
+    if (wt.isEmpty()) { HOST.sendText(groupId, "🌐 全局白名单为空"); return; }
+    StringBuilder sb = new StringBuilder();
+    sb.append("🌐 全局白名单 (").append(wt.size()).append("):\n");
+    for (int i = 0; i < wt.size(); i++) {
+        sb.append("· ").append(wt.get(i)).append("\n");
+    }
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- #群权限自检: 清 bot 群管权限缓存 (@1621-1626) ----
+void doCheckBotPriv(String groupId, String sender) {
+    if (!isAdminInGroup(groupId, sender)) return;
+    String old = botPrivState(groupId);
+    setBotPriv(groupId, "unknown");
+    HOST.sendText(groupId, "🔄 已清除本群权限缓存 (原状态: " + old + ")\n下次执行踢人时会重新检测");
+}

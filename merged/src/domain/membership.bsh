@@ -115,3 +115,115 @@ boolean isWhitelistAny(String groupId, String wxid) {
     if (wxid == null || wxid.isEmpty()) return false;
     return isGlobalWhitelist(wxid) || getWhitelist(groupId).contains(wxid);
 }
+
+// ============================================================
+// 名单读助手族 (组 A 查询/列表动作的数据源) — 逐字保真自线上, 键用【裸 groupId】不 norm。
+//   bl_<裸gid>        本群黑名单 CSV                                (@669)
+//   bl_global         全局黑名单 CSV                                (@761)
+//   protected_<裸gid> 本群保护名单 CSV (潜水豁免)                   (@755)
+// 端口改写: getString→HOST.getString。仅移植组 A 用到的读侧 (set 侧 YAGNI 不引入, 由后续动作组移植)。
+// ============================================================
+List getBlacklist(String groupId) { return parseCsv(HOST.getString("bl_" + groupId, "")); }        // @669
+List getGlobalBlacklist() { return parseCsv(HOST.getString("bl_global", "")); }                     // @761
+List getProtected(String groupId) { return parseCsv(HOST.getString("protected_" + groupId, "")); } // @755
+
+// 管理员名册写 (@1738): purgeExpiredAdmins 落盘用。键用 norm 后的 gid (与 getAdmins @1737 对齐)。
+void setAdmins(String groupId, List admins) { HOST.putString("admins_" + normGroupId(groupId), joinCsv(admins)); }
+
+// ============================================================
+// v1.17.0 管理员时效 (admin_exp_<normGroupId>) — 逐字保真自线上 @1745-1836。
+//   存储: CSV "wxid:到期毫秒;wxid:到期毫秒"。只存有时效的; 不在表里的管理员 = 永久。
+//   admins_<gid> 格式完全不动 → 老数据无 exp 记录 = 永久, 向后兼容。
+//   全部 helper try/catch(Throwable), 异常退化为 0(永久), 绝不抛回微信。
+// 端口改写: getString/putString→HOST.*; System.currentTimeMillis()→CLOCK.now()。其余逐字。
+// ★ purgeExpiredAdmins 只在管理相关函数 (isAuthorized/showAdmins/showAdminListDialog) 入口调用,
+//   绝不进每条消息热路径 (C-PERF-01)。
+// ============================================================
+java.util.Map _parseAdminExp(String groupId) {
+    java.util.HashMap m = new java.util.HashMap();
+    try {
+        String raw = HOST.getString("admin_exp_" + normGroupId(groupId), "");
+        if (raw == null || raw.isEmpty()) return m;
+        String[] parts = raw.split(";");
+        for (int i = 0; i < parts.length; i++) {
+            String p = parts[i].trim();
+            if (p.isEmpty()) continue;
+            int idx = p.lastIndexOf(":");
+            if (idx <= 0 || idx >= p.length() - 1) continue;
+            String w = p.substring(0, idx).trim();
+            String ms = p.substring(idx + 1).trim();
+            if (w.isEmpty()) continue;
+            try { m.put(w, new Long(Long.parseLong(ms))); } catch (Throwable t) {}
+        }
+    } catch (Throwable t) {}
+    return m;
+}
+void _saveAdminExp(String groupId, java.util.Map m) {
+    try {
+        StringBuilder sb = new StringBuilder();
+        java.util.Iterator it = m.keySet().iterator();
+        boolean first = true;
+        while (it.hasNext()) {
+            String w = (String) it.next();
+            Long v = (Long) m.get(w);
+            if (w == null || w.isEmpty() || v == null) continue;
+            if (!first) sb.append(";");
+            sb.append(w).append(":").append(v.longValue());
+            first = false;
+        }
+        HOST.putString("admin_exp_" + normGroupId(groupId), sb.toString());
+    } catch (Throwable t) {}
+}
+// 返回到期毫秒; 0 = 永久/无记录。
+long getAdminExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return 0L;
+        Long v = (Long) _parseAdminExp(groupId).get(wxid);
+        return v == null ? 0L : v.longValue();
+    } catch (Throwable t) { return 0L; }
+}
+void setAdminExpiry(String groupId, String wxid, long millis) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseAdminExp(groupId);
+        m.put(wxid, new Long(millis));
+        _saveAdminExp(groupId, m);
+    } catch (Throwable t) {}
+}
+void clearAdminExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseAdminExp(groupId);
+        if (m.remove(wxid) != null) _saveAdminExp(groupId, m);
+    } catch (Throwable t) {}
+}
+// 显示标签: "永久" 或 "有效期至 yyyy-MM-dd"。
+String adminExpiryLabel(String groupId, String wxid) {
+    try {
+        long exp = getAdminExpiry(groupId, wxid);
+        if (exp <= 0L) return "永久";
+        String d = new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp));
+        return "有效期至 " + d;
+    } catch (Throwable t) { return "永久"; }
+}
+// 惰性到期清除: 遍历 getAdmins, 对有 exp 且已过期者 → 从 admins 移除 + clearAdminExpiry, 变更则落盘。
+// 静默 (不发群消息)。★ 只在管理相关函数入口调用, 绝不进每条消息热路径 (C-PERF-01)。
+void purgeExpiredAdmins(String groupId) {
+    try {
+        java.util.Map m = _parseAdminExp(groupId);
+        if (m.isEmpty()) return;   // 无任何时效记录 → 无可清除 (老数据/纯永久群直接返回, 零开销)
+        long now = CLOCK.now();
+        List admins = getAdmins(groupId);
+        boolean changed = false;
+        for (int i = admins.size() - 1; i >= 0; i--) {
+            String w = (String) admins.get(i);
+            Long v = (Long) m.get(w);
+            if (v != null && now >= v.longValue()) {
+                admins.remove(i);
+                clearAdminExpiry(groupId, w);
+                changed = true;
+            }
+        }
+        if (changed) setAdmins(groupId, admins);
+    } catch (Throwable t) {}
+}
