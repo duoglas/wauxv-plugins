@@ -1,0 +1,100 @@
+// ============================================================
+// app/enable_state — GroupAdmin 启用子系统 (按群启用闸门 + 启用群内存缓存)。
+// 逐字保真移植自线上 plugins/group-admin/main.java v1.16.2 @1660-1725, 行为零改动。
+//   · ENABLED_CACHE / ENABLED_CACHE_TS / ENABLED_TTL_MS  (顶层缓存字段, 线上 @1660-1662)
+//   · loadEnabledCache  (@1665-1678) — 读 enabled_groups → parseCsv → normGroupId 装 HashSet, 原子替换 + 置 TS
+//   · getEnabledGroups  (@1680)      — 读 enabled_groups CSV → List
+//   · isGroupEnabled    (@1681-1699) — 走缓存(TTL 60s), miss/过期重载; 缓存异常回退直接线性比对
+//   · enableGroup       (@1700-1710) — 读+写 enabled_groups(加群), 写后 loadEnabledCache 即时失效
+//   · enableGroupWithBaseline (@1712-1715) — enableGroup + initFirstSeenBaseline(返回新增人数)
+//   · disableGroup      (@1716-1725) — 读+写 enabled_groups(移群), 写后 loadEnabledCache 即时失效
+//
+// ★关键红线 (C-PERF-01/03): ENABLED_CACHE 必须逐字保留 —— 消除 hooks.onHandleMsgBody 热路径
+//   (hooks.bsh:299) 每条消息 isGroupEnabled 读 FUSE config.prop (~26ms/条, waux-getstring-fuse-io-cache-hotpath)。
+//   命中缓存 = O(1) 内存查; 绝不能简化成每次读盘。enable/disable 变更后立即 loadEnabledCache 保即时生效。
+//
+// 命名: 保持 GA 原名 (enableGroup/isGroupEnabled/... 单参/单职责), 与 RP 侧 rpEnableGroup/rpIsGroupEnabled
+//   (redpacket_detect.bsh) 刻意不同名、缓存字段 ENABLED_CACHE 与 RP_ENABLED_CACHE 也不撞 —— 两闸门各管各的键
+//   (GA=enabled_groups, RP=rp_enabled_groups)。归一口径用 membership.bsh 的 normGroupId (复杂版, 非 RP 的 trim)。
+//
+// 依赖 (manifest 在本片之前拼入):
+//   domain/membership.bsh : parseCsv / joinCsv / normGroupId
+//   core 端口 HOST / CLOCK : HOST.getString/putString ; CLOCK.now()
+//   initFirstSeenBaseline : 前向引用 (W3 移入 dialogs/hooks 缝), 解析门只查语法不要求其存在。
+//
+// 端口改写 (只改这些, 其它逐字):
+//   getString(k,def)/putString(k,v)        → HOST.getString(k,def)/HOST.putString(k,v)
+//   System.currentTimeMillis()             → CLOCK.now()  (对齐合并体 RP 缓存既定端口约定)
+//   parseCsv/joinCsv/normGroupId            → 直接调 (membership.bsh 已定义, 不重复实现)
+// ============================================================
+
+// 启用群名单 (按群启用,默认全部关)
+// v1.16.2: [性能/C-PERF-01,03] 启用群集合内存缓存 — 消除 isGroupEnabled 每条消息读 FUSE config.prop (~26ms/条)。
+//   ENABLED_CACHE 存 normGroupId 后的群 id; TTL 60s 兜底外部 adb 改 config.prop; enable/disable 变更后立即刷新保即时生效。
+//   加载失败保留旧缓存 (降级安全); isGroupEnabled 异常时回退直接读 getString (宁可慢不可错: 这是插件在本群是否生效的总闸门)。
+java.util.HashSet ENABLED_CACHE = null;   // 已启用群 id 集合 (normGroupId 后); null=尚未加载
+long ENABLED_CACHE_TS = 0;                 // 上次加载毫秒
+long ENABLED_TTL_MS   = 60000;             // 缓存 TTL: 外部改 config.prop 最多此时长后生效
+
+// 从 config.prop 读 enabled_groups, 全量 norm 后原子替换 ENABLED_CACHE。失败保留旧缓存只 log。
+void loadEnabledCache() {
+    try {
+        List l = parseCsv(HOST.getString("enabled_groups", ""));
+        java.util.HashSet ns = new java.util.HashSet();
+        for (int i = 0; i < l.size(); i++) {
+            String g = normGroupId((String) l.get(i));
+            if (!g.isEmpty()) ns.add(g);
+        }
+        ENABLED_CACHE = ns;            // 原子替换
+        ENABLED_CACHE_TS = CLOCK.now();
+    } catch (Throwable t) {
+        log("loadEnabledCache failed (keep old cache): " + t);
+    }
+}
+
+List getEnabledGroups() { return parseCsv(HOST.getString("enabled_groups", "")); }
+boolean isGroupEnabled(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return false;
+    try {
+        long now = CLOCK.now();
+        if (ENABLED_CACHE == null || (now - ENABLED_CACHE_TS) > ENABLED_TTL_MS) {
+            loadEnabledCache();
+        }
+        if (ENABLED_CACHE != null) return ENABLED_CACHE.contains(g);
+    } catch (Throwable t) {
+        log("isGroupEnabled cache error, fallback to direct read: " + t);
+    }
+    // 回退: 缓存出错时直接读 (保证正确性, 与原逻辑完全一致)
+    List l = getEnabledGroups();
+    for (int i = 0; i < l.size(); i++) {
+        if (g.equals(normGroupId((String) l.get(i)))) return true;
+    }
+    return false;
+}
+void enableGroup(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return;
+    List l = getEnabledGroups();
+    for (int i = 0; i < l.size(); i++) {
+        if (g.equals(normGroupId((String) l.get(i)))) return;
+    }
+    l.add(g);
+    HOST.putString("enabled_groups", joinCsv(l));
+    loadEnabledCache();   // 变更即时失效: 启用后下一条消息立即生效
+}
+// 包装: 启用 + 建立潜水基线, 返回新增的 first_seen 人数
+int enableGroupWithBaseline(String groupId) {
+    enableGroup(groupId);
+    return initFirstSeenBaseline(groupId);
+}
+void disableGroup(String groupId) {
+    String g = normGroupId(groupId);
+    List l = getEnabledGroups();
+    boolean changed = false;
+    for (int i = l.size() - 1; i >= 0; i--) {
+        if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
+    }
+    if (changed) HOST.putString("enabled_groups", joinCsv(l));
+    loadEnabledCache();   // 变更即时失效: 停用后下一条消息立即不再管该群
+}
