@@ -24,15 +24,28 @@ void   _hostSendQuote(String grp, long msgid, String text) { sendQuoteMsg(grp, m
 //   名字与内置 getGroupMemberList 不同(_前缀)不会自递归。TODO(P3-c): 真机验内置确返 wxid List。
 java.util.List _hostGetMemberList(String grp) { return getGroupMemberList(grp); }
 
+// 权限错误判定 (GA main.java:677-687 逐字移植)。tryKickSilent 失败时判是否权限丢失 → 触发 setBotPriv(grp,"none")。
+//   顶层全局 helper (makeAndroidHost 之外), 与 _hostSendText 等转发缝同区; tryKickSilent 方法体裸调 (名字不同不自递归)。
+boolean isPermissionError(Exception e) {
+    if (e == null) return false;
+    String m = e.getMessage();
+    if (m == null) return false;
+    String lo = m.toLowerCase();
+    if (lo.indexOf("permission") >= 0 || lo.indexOf("admin") >= 0 ||
+        lo.indexOf("not allowed") >= 0 || lo.indexOf("forbidden") >= 0 ||
+        lo.indexOf("denied") >= 0) return true;
+    if (m.indexOf("权限") >= 0 || m.indexOf("管理") >= 0 || m.indexOf("无权") >= 0) return true;
+    return false;
+}
+
 Object makeAndroidHost() {
     String getString(String key, String def) { return _hostGetString(key, def); }
     void putString(String key, String val) { _hostPutString(key, val); }
     String getLoginWxid() { return _hostGetLoginWxid(); }
     String detectNativeOwner(String grp) {
-        // TODO(P2): 占位 return null。真实反射在 GA main.java:785 _detectNativeOwner
-        //   (经 _getGroupDataObj / _readRoleMethod 读 GroupData/ChatRoomInfo 群主字段)。
-        //   P2 集成时移植，L4 真机验证；本期骨架不接反射，原生群主仅靠手动登记键 nat_owner_。
-        return null;
+        // P3-b: 真实反射链已移植到 core/native_owner_reflect.bsh (_detectNativeOwner 及其传递闭合, GA @792-1381 逐字)。
+        //   方法转发到下划线全局版 _detectNativeOwner(名字不同, 不自递归)。
+        return _detectNativeOwner(grp);
     }
     // 发文本到群会话: 直接转发 WAuxiliary 内置 sendText。
     void sendText(String grp, String msg) { _hostSendText(grp, msg); }
@@ -51,12 +64,46 @@ Object makeAndroidHost() {
         }
         try { _hostSendText(grp, text); } catch (Throwable t) {}
     }
-    // 取可读名: GA main.java:1917 lookupName (群名片>备注>昵称>getFriendName>"未知")。
-    //   TODO(P2): 占位返回 wxid。真实实现走 WAuxiliary 名片/昵称查询，P2 移植 L4 验。
-    String lookupName(String wxid, String grp) { return wxid; }
-    // 静默踢人: GA main.java:691 tryKickSilent (经群管反射移除成员; 失败含权限丢失会 setBotPriv)。
-    //   TODO(P2): 占位 return false (不踢)。真实反射 P2 移植，L4 真机验证。
-    //   调用前应自行检查 botPrivState(grp) != "none"。
-    boolean tryKickSilent(String grp, String wxid) { return false; }
+    // 取可读名: GA main.java:1917-1938 lookupName (群名片>备注>昵称>getFriendName>"未知") 逐字移植。
+    //   线上形参 groupId → merged 形参 grp (仅形参名适配, 逻辑逐字)。getFriendDisplayName/getFriendRemarkName/
+    //   getFriendNickName/getFriendName 均 WAuxiliary 注入内置 (redpacket_send.bsh:139/141 已在用), 裸调即可。
+    String lookupName(String wxid, String grp) {
+        if (wxid == null || wxid.isEmpty()) return "未知";
+        if (grp != null && !grp.isEmpty()) {
+            try {
+                String n = getFriendDisplayName(wxid, grp);
+                if (n != null && !n.isEmpty()) return n;
+            } catch (Exception e) {}
+        }
+        try {
+            String n = getFriendRemarkName(wxid);
+            if (n != null && !n.isEmpty()) return n;
+        } catch (Exception e) {}
+        try {
+            String n = getFriendNickName(wxid);
+            if (n != null && !n.isEmpty()) return n;
+        } catch (Exception e) {}
+        try {
+            String n = getFriendName(wxid);
+            if (n != null && !n.isEmpty()) return n;
+        } catch (Exception e) {}
+        return "未知";
+    }
+    // 静默踢人: GA main.java:691-701 tryKickSilent 逐字移植 (经群管反射移除成员; 失败含权限丢失会 setBotPriv)。
+    //   线上形参 groupId → merged 形参 grp (仅形参名适配, 逻辑逐字)。delChatroomMember(WAuxiliary 内置)、
+    //   setBotPriv(全局, warning.bsh:63)、isPermissionError(下方全局 helper, 本片移植)、log(内置) 均裸调。
+    //   ★破坏性真踢: 不增删任何守卫/日志。调用前应自行检查 botPrivState(grp) != "none"。
+    //   返回: true=成功, false=失败 (调用方决定要不要 sendText)。
+    boolean tryKickSilent(String grp, String wxid) {
+        try {
+            delChatroomMember(grp, wxid);
+            setBotPriv(grp, "admin");
+            return true;
+        } catch (Exception e) {
+            if (isPermissionError(e)) setBotPriv(grp, "none");
+            log("kick fail group=" + grp + " wxid=" + wxid + " err=" + e.getMessage());
+            return false;
+        }
+    }
     return this;
 }

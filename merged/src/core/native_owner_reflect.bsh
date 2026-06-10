@@ -1,0 +1,586 @@
+// ============================================================
+// core/native_owner_reflect — 原生群主反射检测链 (P3-b 真机缝移植)。
+//   线上 plugins/group-admin/main.java @792-1381 的 _detectNativeOwner 传递闭合逐字搬入。
+//   host_android.bsh 的 detectNativeOwner(grp) 方法体 → return _detectNativeOwner(grp)(下划线全局版,
+//   名字不同不自递归)。本片只放 detectNativeOwner 真正传递闭合到的下划线 helper, 纯诊断 probe
+//   (_logNativeRoleProbe/_probeObjectAPI/_addRoleList/_addRoleValue 等不在闭合内) 不搬。
+//
+// ★callee 闭合 (零孤儿, 已扫描):
+//   _detectNativeOwner → getGroupList(内置)/log(内置)/_readRoleString/_getGroupDataObj/_detectChatRoomInfoObj
+//   _readRoleString → _readRoleMethod/_roleValueToString/_readRoleField
+//   _roleValueToString → _extractWxidsFromBytes → _addWxidToken
+//   _detectChatRoomInfoObj → getGroupList(内置)/_tryInvokeNoArg/_findChatRoomInfoInside/_getGroupDataObj/
+//        _detectChatRoomInfoFromWauxvInternals/Class.forName(JDK)/_getSingletonOrCompanion/_tryInvokeOneString/
+//        _isChatRoomInfoFor/_tryInvokeRoomDao
+//   _findChatRoomInfoInside → _isChatRoomInfoFor/_isSafeProbeClass/_tryFindChatRoomInfoFromMethod
+//   _tryFindChatRoomInfoFromMethod → _isChatRoomInfoFor/_findChatRoomInfoInside
+//   _isChatRoomInfoFor → _readRoleMethod/_roleValueToString/_readRoleField
+//   _detectChatRoomInfoFromWauxvInternals → _loadWauxvClass/_getSingletonOrCompanion/_tryGetChatRoomCursor/_tryMapChatRoomInfo/log(内置)
+//   _loadWauxvClass → getGroupList(内置)/_getGroupDataObj
+//   _tryGetChatRoomCursor → _collectCursorArgCandidates/_moveCursorToGroup/_arrayLength/log(内置)
+//   _collectCursorArgCandidates → _addCursorArgCandidate/_addStaticCursorArrayFields/_getSingletonOrCompanion/_addSingletonCursorArray/_addStaticCursorSingletonFields
+//   _addStaticCursorArrayFields → _addCursorArgCandidate
+//   _addStaticCursorSingletonFields → _addSingletonCursorArray
+//   _addSingletonCursorArray → _addCursorArgCandidate
+//   _addCursorArgCandidate → _arrayLength
+//   _moveCursorToGroup → log(内置)
+//   _tryMapChatRoomInfo → _getSingletonOrCompanion/_isChatRoomInfoFor/log(内置)
+//   _tryInvokeRoomDao → _tryInvokeRoomMethod ↔ _tryInvokeRoomDao(互递归)
+//   内置/JDK 不搬: getGroupList/log(WAuxiliary 注入)、Class.forName/Thread/反射 API/android.database.Cursor(JDK/Android)。
+// ============================================================
+
+Object _getGroupDataObj(Object info) {
+    try { return info.getClass().getMethod("getGroupData").invoke(info); }
+    catch (Exception e) { return null; }
+}
+
+Object _readRoleMethod(Object src, String name) {
+    if (src == null) return null;
+    try { return src.getClass().getMethod(name).invoke(src); }
+    catch (Exception e) {}
+    try {
+        java.lang.reflect.Method m = src.getClass().getDeclaredMethod(name);
+        m.setAccessible(true);
+        return m.invoke(src);
+    } catch (Exception e) {}
+    return null;
+}
+
+Object _readRoleField(Object src, String name) {
+    if (src == null) return null;
+    Class c = src.getClass();
+    while (c != null) {
+        try {
+            java.lang.reflect.Field f = c.getDeclaredField(name);
+            f.setAccessible(true);
+            return f.get(src);
+        } catch (Exception e) {}
+        c = c.getSuperclass();
+    }
+    return null;
+}
+
+String _roleValueToString(Object r) {
+    if (r == null) return null;
+    if (r instanceof List) {
+        List l = (List) r;
+        if (l.isEmpty()) return null;
+        Object one = l.get(0);
+        return one == null ? null : one.toString();
+    }
+    if (r instanceof byte[]) {
+        List ids = _extractWxidsFromBytes((byte[]) r);
+        return ids.isEmpty() ? null : ids.get(0).toString();
+    }
+    String s = r.toString().replace("[", "").replace("]", "").trim();
+    if (s.isEmpty()) return null;
+    String[] arr = s.split("[,;\\s]+");
+    return arr.length > 0 ? arr[0].trim() : s;
+}
+
+List _extractWxidsFromBytes(byte[] bs) {
+    List out = new ArrayList();
+    if (bs == null || bs.length == 0) return out;
+    StringBuilder cur = new StringBuilder();
+    for (int i = 0; i < bs.length; i++) {
+        int c = bs[i] & 0xff;
+        boolean ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-' || c == '@' || c == '.';
+        if (ok) cur.append((char) c);
+        else {
+            _addWxidToken(cur.toString(), out);
+            cur.setLength(0);
+        }
+    }
+    _addWxidToken(cur.toString(), out);
+    return out;
+}
+
+void _addWxidToken(String s, List out) {
+    if (s == null || s.length() < 4) return;
+    String[] arr = s.split("[,;\\s]+");
+    for (int i = 0; i < arr.length; i++) {
+        String one = arr[i].trim();
+        if ((one.startsWith("wxid_") || one.endsWith("@chatroom") || one.startsWith("gh_")) && !out.contains(one)) out.add(one);
+    }
+}
+
+String _readRoleString(Object src, String csvNames) {
+    if (src == null) return null;
+    String[] names = csvNames.split(",");
+    for (int i = 0; i < names.length; i++) {
+        Object r = _readRoleMethod(src, names[i]);
+        String v = _roleValueToString(r);
+        if (v != null && !v.isEmpty()) return v;
+        r = _readRoleField(src, names[i]);
+        v = _roleValueToString(r);
+        if (v != null && !v.isEmpty()) return v;
+    }
+    return null;
+}
+
+Object _tryInvokeNoArg(Object src, String name) {
+    if (src == null) return null;
+    try { return src.getClass().getMethod(name).invoke(src); } catch (Exception e) {}
+    try {
+        java.lang.reflect.Method m = src.getClass().getDeclaredMethod(name);
+        m.setAccessible(true);
+        return m.invoke(src);
+    } catch (Exception e) {}
+    return null;
+}
+
+Object _tryInvokeOneString(Object src, String name, String arg) {
+    if (src == null) return null;
+    Class[] pts = new Class[1];
+    pts[0] = String.class;
+    Object[] args = new Object[1];
+    args[0] = arg;
+    try { return src.getClass().getMethod(name, pts).invoke(src, args); } catch (Exception e) {}
+    try {
+        java.lang.reflect.Method m = src.getClass().getDeclaredMethod(name, pts);
+        m.setAccessible(true);
+        return m.invoke(src, args);
+    } catch (Exception e) {}
+    return null;
+}
+
+Object _getSingletonOrCompanion(Class c) {
+    if (c == null) return null;
+    try {
+        java.lang.reflect.Field f = c.getDeclaredField("INSTANCE");
+        f.setAccessible(true);
+        Object v = f.get(null);
+        if (v != null) return v;
+    } catch (Exception e) {}
+    try {
+        java.lang.reflect.Field f = c.getDeclaredField("Companion");
+        f.setAccessible(true);
+        Object v = f.get(null);
+        if (v != null) return v;
+    } catch (Exception e) {}
+    try {
+        java.lang.reflect.Field[] fs = c.getDeclaredFields();
+        for (int i = 0; i < fs.length; i++) {
+            fs[i].setAccessible(true);
+            int mod = fs[i].getModifiers();
+            if (!java.lang.reflect.Modifier.isStatic(mod)) continue;
+            Object v = fs[i].get(null);
+            if (v != null && c.isInstance(v)) return v;
+        }
+    } catch (Exception e) {}
+    return null;
+}
+
+Object _detectChatRoomInfoObj(String groupId) {
+    Object nested = null;
+    try {
+        List groups = getGroupList();
+        if (groups != null) {
+            for (int i = 0; i < groups.size(); i++) {
+                Object info = groups.get(i);
+                Object ridObj = _tryInvokeNoArg(info, "getRoomId");
+                if (ridObj == null || !ridObj.toString().equals(groupId)) continue;
+                nested = _findChatRoomInfoInside(info, groupId, 0);
+                if (nested != null) return nested;
+                nested = _findChatRoomInfoInside(_getGroupDataObj(info), groupId, 0);
+                if (nested != null) return nested;
+                break;
+            }
+        }
+    } catch (Exception e) {}
+
+    Object internal = _detectChatRoomInfoFromWauxvInternals(groupId);
+    if (internal != null) return internal;
+
+    String clsNames = "me.hd.wauxv.data.bean.db.ChatRoomInfo,me.hd.wauxv.data.db.ChatRoomInfoDao,me.hd.wauxv.data.db.ChatroomInfoDao,me.hd.wauxv.data.db.ChatRoomDao,me.hd.wauxv.data.db.ChatroomDao,me.hd.wauxv.data.dao.ChatRoomInfoDao,me.hd.wauxv.data.dao.ChatroomInfoDao,me.hd.wauxv.data.repository.ChatRoomInfoRepository,me.hd.wauxv.data.repository.ChatroomInfoRepository,me.hd.wauxv.data.db.ChatRoomInfoManager,me.hd.wauxv.data.db.ChatRoomInfoDatabase,me.hd.wauxv.data.db.WAuxiliaryDatabase,me.hd.wauxv.data.db.AppDatabase,me.hd.wauxv.data.WAuxiliaryDatabase,me.hd.wauxv.data.DataRepository";
+    String methodNames = "getChatRoomInfo,getChatroomInfo,getChatRoomInfoById,getChatroomInfoById,getByRoomId,getByChatroomName,getByUsername,getByUserName,getByWxid,getById,queryChatRoomInfo,queryChatroomInfo,queryByRoomId,queryByChatroomName,findChatRoomInfo,findChatroomInfo,findByRoomId,findByChatroomName,loadChatRoomInfo,loadChatroomInfo,loadByRoomId,loadByChatroomName";
+    String[] cs = clsNames.split(",");
+    String[] ms = methodNames.split(",");
+    for (int i = 0; i < cs.length; i++) {
+        try {
+            Class c = Class.forName(cs[i]);
+            if (cs[i].endsWith("ChatRoomInfo")) continue;
+            Object src = _getSingletonOrCompanion(c);
+            if (src == null) src = c.newInstance();
+            for (int k = 0; k < ms.length; k++) {
+                Object r = _tryInvokeOneString(src, ms[k], groupId);
+                if (_isChatRoomInfoFor(r, groupId)) return r;
+            }
+            Object r2 = _tryInvokeRoomDao(src, groupId, 0);
+            if (r2 != null) return r2;
+        } catch (Exception e) {}
+    }
+    return null;
+}
+
+boolean _isSafeProbeClass(Object obj) {
+    if (obj == null) return false;
+    String cn = obj.getClass().getName();
+    if (cn.startsWith("java.") || cn.startsWith("android.")) return false;
+    if (cn.startsWith("com.tencent.")) return false;
+    return cn.indexOf("wauxv") >= 0 || cn.indexOf("ᛱ") >= 0 || cn.indexOf("ChatRoom") >= 0 || cn.indexOf("Group") >= 0;
+}
+
+boolean _isChatRoomInfoFor(Object obj, String groupId) {
+    if (obj == null) return false;
+    String cn = obj.getClass().getName();
+    if (cn.indexOf("ChatRoomInfo") < 0 && _readRoleMethod(obj, "getLocalChatRoomWatchMembers") == null && _readRoleMethod(obj, "component19") == null) return false;
+    String room = _roleValueToString(_readRoleMethod(obj, "getChatroomname"));
+    if (room == null) room = _roleValueToString(_readRoleField(obj, "chatroomname"));
+    if (room == null) room = _roleValueToString(_readRoleMethod(obj, "getRoomId"));
+    if (room == null) room = _roleValueToString(_readRoleField(obj, "roomId"));
+    return room == null || room.equals(groupId);
+}
+
+Object _findChatRoomInfoInside(Object obj, String groupId, int depth) {
+    if (obj == null || depth > 2) return null;
+    if (_isChatRoomInfoFor(obj, groupId)) return obj;
+    if (!_isSafeProbeClass(obj)) return null;
+    try {
+        java.lang.reflect.Method[] ms = obj.getClass().getMethods();
+        for (int i = 0; i < ms.length; i++) {
+            Object r = _tryFindChatRoomInfoFromMethod(obj, ms[i], groupId, depth);
+            if (r != null) return r;
+        }
+    } catch (Exception e) {}
+    try {
+        java.lang.reflect.Method[] ms = obj.getClass().getDeclaredMethods();
+        for (int i = 0; i < ms.length; i++) {
+            ms[i].setAccessible(true);
+            Object r = _tryFindChatRoomInfoFromMethod(obj, ms[i], groupId, depth);
+            if (r != null) return r;
+        }
+    } catch (Exception e) {}
+    try {
+        Class c = obj.getClass();
+        while (c != null) {
+            java.lang.reflect.Field[] fs = c.getDeclaredFields();
+            for (int i = 0; i < fs.length; i++) {
+                fs[i].setAccessible(true);
+                Object v = fs[i].get(obj);
+                if (_isChatRoomInfoFor(v, groupId)) return v;
+                Object r = _findChatRoomInfoInside(v, groupId, depth + 1);
+                if (r != null) return r;
+            }
+            c = c.getSuperclass();
+        }
+    } catch (Exception e) {}
+    return null;
+}
+
+Object _tryFindChatRoomInfoFromMethod(Object obj, java.lang.reflect.Method m, String groupId, int depth) {
+    if (obj == null || m == null) return null;
+    try {
+        if (m.getReturnType() == Void.TYPE) return null;
+        if (m.getParameterTypes().length != 0) return null;
+        String mn = m.getName().toLowerCase();
+        if (mn.equals("getclass") || mn.indexOf("chatroom") < 0 && mn.indexOf("room") < 0 && mn.indexOf("data") < 0 && mn.indexOf("info") < 0) return null;
+        Object r = m.invoke(obj);
+        if (_isChatRoomInfoFor(r, groupId)) return r;
+        return _findChatRoomInfoInside(r, groupId, depth + 1);
+    } catch (Exception e) {}
+    return null;
+}
+
+Class _loadWauxvClass(String name) {
+    if (name == null || name.isEmpty()) return null;
+    try { return Class.forName(name); } catch (Exception e) {}
+    try {
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl != null) return cl.loadClass(name);
+    } catch (Exception e) {}
+    try {
+        List groups = getGroupList();
+        if (groups != null && !groups.isEmpty()) {
+            Object info = groups.get(0);
+            if (info != null && info.getClass().getClassLoader() != null) {
+                try { return info.getClass().getClassLoader().loadClass(name); } catch (Exception e) {}
+            }
+            Object data = _getGroupDataObj(info);
+            if (data != null && data.getClass().getClassLoader() != null) {
+                try { return data.getClass().getClassLoader().loadClass(name); } catch (Exception e) {}
+            }
+        }
+    } catch (Exception e) {}
+    return null;
+}
+
+Object _detectChatRoomInfoFromWauxvInternals(String groupId) {
+    try {
+        Class mapperClass = _loadWauxvClass("ᛱᛲᛳᛴᛵᛶᛷᲇᛸᲁᲈᲀᤞᤝ");
+        Class queryClass = _loadWauxvClass("ᛱᛲᛳᛴᛵᛶᛷᲀᛸᤞᲇᲈᲁᤝ");
+        if (mapperClass == null || queryClass == null) {
+            log("native-admin detect: class load failed mapper=" + (mapperClass != null) + ", query=" + (queryClass != null));
+            return null;
+        }
+        Object queryObj = _getSingletonOrCompanion(queryClass);
+        Object cursor = _tryGetChatRoomCursor(queryObj == null ? queryClass : queryObj, groupId);
+        if (cursor == null) { log("native-admin detect: no matching ChatRoomInfo cursor"); return null; }
+        try {
+            Object mapped = _tryMapChatRoomInfo(mapperClass, cursor, groupId);
+            if (mapped != null) {
+                log("native-admin detect: mapped " + mapped.getClass().getName());
+                return mapped;
+            }
+            log("native-admin detect: cursor found but mapper returned null");
+        } finally {
+            try { ((java.io.Closeable) cursor).close(); } catch (Exception e) {}
+        }
+    } catch (Exception e) { log("_detectChatRoomInfoFromWauxvInternals err: " + e.getClass().getName() + ": " + e.getMessage()); }
+    return null;
+}
+
+Object _tryGetChatRoomCursor(Object queryObj, String groupId) {
+    if (queryObj == null) return null;
+    int tried = 0;
+    int invoked = 0;
+    try {
+        boolean classMode = queryObj instanceof Class;
+        Class qc = classMode ? (Class) queryObj : queryObj.getClass();
+        java.lang.reflect.Method[] ms = qc.getDeclaredMethods();
+        for (int i = 0; i < ms.length; i++) {
+            ms[i].setAccessible(true);
+            Class[] pt = ms[i].getParameterTypes();
+            if (ms[i].getReturnType().getName().equals("android.database.Cursor") && pt.length == 1 && pt[0].isArray()) {
+                boolean isStatic = java.lang.reflect.Modifier.isStatic(ms[i].getModifiers());
+                if (classMode && !isStatic) continue;
+                tried++;
+                List candidates = _collectCursorArgCandidates(qc, pt[0]);
+                log("native-admin detect: cursor method#" + i + " candidates=" + candidates.size() + ", static=" + isStatic);
+                for (int ci = 0; ci < candidates.size(); ci++) {
+                    Object[] args = new Object[1];
+                    args[0] = candidates.get(ci);
+                    Object cursor = null;
+                    try {
+                        cursor = ms[i].invoke(classMode ? null : queryObj, args);
+                        invoked++;
+                        Object one = _moveCursorToGroup(cursor, groupId);
+                        if (one != null) {
+                            log("native-admin detect: cursor matched via method#" + i + ", candidate=" + ci + ", len=" + _arrayLength(args[0]) + ", static=" + isStatic);
+                            return one;
+                        }
+                    } catch (Exception e) {
+                        log("native-admin detect: cursor method#" + i + ", candidate=" + ci + " failed " + e.getClass().getName());
+                    }
+                    try { ((java.io.Closeable) cursor).close(); } catch (Exception e) {}
+                }
+            }
+        }
+    } catch (Exception e) { log("native-admin detect: cursor scan failed " + e.getClass().getName() + ": " + e.getMessage()); }
+    log("native-admin detect: cursor methods tried=" + tried + ", invoked=" + invoked);
+    return null;
+}
+
+List _collectCursorArgCandidates(Class queryClass, Class arrayType) {
+    List out = new ArrayList();
+    if (arrayType == null || !arrayType.isArray()) return out;
+    Class elemType = arrayType.getComponentType();
+
+    // 1) 保留旧路径：空数组。部分 DAO 查询方法可接受空条件。
+    _addCursorArgCandidate(out, java.lang.reflect.Array.newInstance(elemType, 0), arrayType);
+
+    // 2) DEX 原始调用常见路径：query 类上的静态参数数组字段。
+    _addStaticCursorArrayFields(out, queryClass, arrayType);
+    try {
+        Class enclosing = queryClass.getEnclosingClass();
+        if (enclosing != null) _addStaticCursorArrayFields(out, enclosing, arrayType);
+    } catch (Exception e) {}
+    try {
+        Class declaring = queryClass.getDeclaringClass();
+        if (declaring != null) _addStaticCursorArrayFields(out, declaring, arrayType);
+    } catch (Exception e) {}
+
+    // 3) Kotlin/object 或 enum-like 参数：参数元素类的静态单例，组装成一元素数组。
+    Object singleton = _getSingletonOrCompanion(elemType);
+    if (singleton != null && elemType.isInstance(singleton)) _addSingletonCursorArray(out, singleton, elemType, arrayType);
+    _addStaticCursorSingletonFields(out, elemType, arrayType);
+
+    return out;
+}
+
+void _addStaticCursorArrayFields(List out, Class srcClass, Class arrayType) {
+    if (srcClass == null || arrayType == null) return;
+    try {
+        Class c = srcClass;
+        while (c != null) {
+            java.lang.reflect.Field[] fs = c.getDeclaredFields();
+            for (int i = 0; i < fs.length; i++) {
+                try {
+                    int mod = fs[i].getModifiers();
+                    if (!java.lang.reflect.Modifier.isStatic(mod)) continue;
+                    fs[i].setAccessible(true);
+                    Object v = fs[i].get(null);
+                    _addCursorArgCandidate(out, v, arrayType);
+                } catch (Exception e) {}
+            }
+            c = c.getSuperclass();
+        }
+    } catch (Exception e) {}
+}
+
+void _addStaticCursorSingletonFields(List out, Class elemType, Class arrayType) {
+    if (elemType == null || arrayType == null) return;
+    try {
+        Class c = elemType;
+        while (c != null) {
+            java.lang.reflect.Field[] fs = c.getDeclaredFields();
+            for (int i = 0; i < fs.length; i++) {
+                try {
+                    int mod = fs[i].getModifiers();
+                    if (!java.lang.reflect.Modifier.isStatic(mod)) continue;
+                    fs[i].setAccessible(true);
+                    Object v = fs[i].get(null);
+                    if (v != null && elemType.isInstance(v)) _addSingletonCursorArray(out, v, elemType, arrayType);
+                } catch (Exception e) {}
+            }
+            c = c.getSuperclass();
+        }
+    } catch (Exception e) {}
+}
+
+void _addSingletonCursorArray(List out, Object singleton, Class elemType, Class arrayType) {
+    if (singleton == null || elemType == null || arrayType == null) return;
+    try {
+        Object arr = java.lang.reflect.Array.newInstance(elemType, 1);
+        java.lang.reflect.Array.set(arr, 0, singleton);
+        _addCursorArgCandidate(out, arr, arrayType);
+    } catch (Exception e) {}
+}
+
+void _addCursorArgCandidate(List out, Object arr, Class arrayType) {
+    if (out == null || arr == null || arrayType == null) return;
+    if (!arrayType.isInstance(arr)) return;
+    int len = _arrayLength(arr);
+    for (int i = 0; i < out.size(); i++) {
+        Object old = out.get(i);
+        if (old == arr) return;
+        if (len == 0 && _arrayLength(old) == 0 && old != null && old.getClass().equals(arr.getClass())) return;
+    }
+    out.add(arr);
+}
+
+int _arrayLength(Object arr) {
+    if (arr == null || !arr.getClass().isArray()) return -1;
+    try { return java.lang.reflect.Array.getLength(arr); } catch (Exception e) { return -1; }
+}
+
+Object _moveCursorToGroup(Object cursor, String groupId) {
+    if (cursor == null) return null;
+    try {
+        android.database.Cursor c = (android.database.Cursor) cursor;
+        int rows = 0;
+        int idx = c.getColumnIndex("chatroomname");
+        if (idx < 0) idx = c.getColumnIndex("username");
+        while (c.moveToNext()) {
+            rows++;
+            if (idx >= 0 && groupId.equals(c.getString(idx))) return cursor;
+            String[] cols = c.getColumnNames();
+            for (int i = 0; i < cols.length; i++) {
+                try {
+                    String v = c.getString(i);
+                    if (groupId.equals(v)) return cursor;
+                } catch (Exception e) {}
+            }
+        }
+        log("native-admin detect: scanned cursor rows=" + rows + ", no group match");
+    } catch (Exception e) { log("native-admin detect: move cursor failed " + e.getClass().getName() + ": " + e.getMessage()); }
+    return null;
+}
+
+Object _tryMapChatRoomInfo(Class mapperClass, Object cursor, String groupId) {
+    if (mapperClass == null || cursor == null) return null;
+    int tried = 0;
+    try {
+        Object mapper = _getSingletonOrCompanion(mapperClass);
+        boolean hasMapper = mapper != null;
+        java.lang.reflect.Method[] ms = mapperClass.getDeclaredMethods();
+        for (int i = 0; i < ms.length; i++) {
+            ms[i].setAccessible(true);
+            Class[] pt = ms[i].getParameterTypes();
+            if (pt.length == 1 && pt[0].getName().equals("android.database.Cursor") && ms[i].getReturnType().getName().indexOf("ChatRoomInfo") >= 0) {
+                boolean isStatic = java.lang.reflect.Modifier.isStatic(ms[i].getModifiers());
+                if (!hasMapper && !isStatic) continue;
+                tried++;
+                Object[] args = new Object[1];
+                args[0] = cursor;
+                try {
+                    Object r = ms[i].invoke(isStatic ? null : mapper, args);
+                    if (_isChatRoomInfoFor(r, groupId)) { log("native-admin detect: mapper method#" + i + " matched, static=" + isStatic); return r; }
+                } catch (Exception e) {
+                    log("native-admin detect: mapper method#" + i + " failed " + e.getClass().getName());
+                }
+            }
+        }
+        if (!hasMapper) log("native-admin detect: mapper has no singleton, static methods only");
+    } catch (Exception e) { log("native-admin detect: mapper scan failed " + e.getClass().getName() + ": " + e.getMessage()); }
+    log("native-admin detect: mapper methods tried=" + tried);
+    return null;
+}
+
+Object _tryInvokeRoomDao(Object src, String groupId, int depth) {
+    if (src == null || depth > 2) return null;
+    try {
+        java.lang.reflect.Method[] ms = src.getClass().getMethods();
+        for (int i = 0; i < ms.length; i++) {
+            Object r = _tryInvokeRoomMethod(src, ms[i], groupId, depth);
+            if (r != null) return r;
+        }
+    } catch (Exception e) {}
+    try {
+        java.lang.reflect.Method[] ms = src.getClass().getDeclaredMethods();
+        for (int i = 0; i < ms.length; i++) {
+            ms[i].setAccessible(true);
+            Object r = _tryInvokeRoomMethod(src, ms[i], groupId, depth);
+            if (r != null) return r;
+        }
+    } catch (Exception e) {}
+    return null;
+}
+
+Object _tryInvokeRoomMethod(Object src, java.lang.reflect.Method m, String groupId, int depth) {
+    if (src == null || m == null) return null;
+    try {
+        if (m.getReturnType() == Void.TYPE) return null;
+        Class[] pt = m.getParameterTypes();
+        String mn = m.getName().toLowerCase();
+        if (pt.length == 0) {
+            if (mn.indexOf("chatroom") < 0 && mn.indexOf("room") < 0 && mn.indexOf("dao") < 0) return null;
+            Object r = m.invoke(src);
+            if (r == null) return null;
+            if (r.getClass().getName().indexOf("ChatRoomInfo") >= 0) return r;
+            Object rr = _tryInvokeRoomDao(r, groupId, depth + 1);
+            if (rr != null) return rr;
+        }
+        if (pt.length == 1 && pt[0] == String.class) {
+            if (mn.indexOf("chatroom") < 0 && mn.indexOf("room") < 0 && mn.indexOf("query") < 0 && mn.indexOf("find") < 0 && mn.indexOf("get") < 0 && mn.indexOf("load") < 0) return null;
+            Object[] args = new Object[1];
+            args[0] = groupId;
+            Object r = m.invoke(src, args);
+            if (r == null) return null;
+            if (r.getClass().getName().indexOf("ChatRoomInfo") >= 0) return r;
+        }
+    } catch (Exception e) {}
+    return null;
+}
+
+// 自动检测 — 通过 reflection 同时探测 WAuxiliary GroupInfo / GroupData / ChatRoomInfo
+String _detectNativeOwner(String groupId) {
+    String names = "getOwner,getOwnerId,getRoomOwner,getRoomowner,getOwnerWxid,getRoomOwnerId,getChatroomOwner,getChatRoomOwner,getOwnerUserName,getOwnerUsername,component9,owner,ownerId,roomOwner,roomowner,ownerWxid,roomOwnerId,chatroomOwner,chatRoomOwner,ownerUserName,ownerUsername";
+    try {
+        List groups = getGroupList();
+        for (int i = 0; i < groups.size(); i++) {
+            Object info = groups.get(i);
+            Object ridObj = info.getClass().getMethod("getRoomId").invoke(info);
+            if (ridObj == null || !ridObj.toString().equals(groupId)) continue;
+            String v = _readRoleString(info, names);
+            if (v != null) return v;
+            v = _readRoleString(_getGroupDataObj(info), names);
+            if (v != null) return v;
+            v = _readRoleString(_detectChatRoomInfoObj(groupId), names);
+            if (v != null) return v;
+            break;
+        }
+    } catch (Exception e) { log("_detectNativeOwner err: " + e.getMessage()); }
+    String v = _readRoleString(_detectChatRoomInfoObj(groupId), names);
+    return v;
+}

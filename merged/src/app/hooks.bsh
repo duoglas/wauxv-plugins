@@ -222,20 +222,19 @@ void onUnload() {
 // 线上 onHandleMsgBody 从 msg 对象反射取这些字段; 骨架把"从 msg 取 X"隔离成缝, 让 hooks 的
 // 提取→采集→路由调用顺序真实可解析。占位返回值仅为解析门通过 + 调用骨架成立, 非真实语义。
 // ============================================================
-boolean _msgIsChatroom(Object msg)    { return false; }   // @2115 msg.isChatroom() — 群聊闸门(最廉价先判)
-boolean _msgIsText(Object msg)        { return false; }   // @2121 msg.isText()
-String  _msgGetContent(Object msg)    { return null; }    // @2124/@2126 msg.getContent()
-String  _msgGetTalker(Object msg)     { return null; }    // @2148/@2135 msg.getTalker() — groupId
-String  _msgGetSendTalker(Object msg) { return null; }    // @2149/@2136 msg.getSendTalker() — sender
-List    _msgGetAtUserList(Object msg) { return null; }    // @2150 msg.getAtUserList()
-// 引用回复 (W2): 线上 @2430-2461 getQuoteMsg().getSendTalker() + appmsg <title>。
-//   反射/XML 解析留 P2 (仅 !isText 动作分支才调, 见 C-PERF-01: 普通文本不付此成本)。
-String  _msgGetQuoteTarget(Object msg) { return null; }   // @2460 getQuoteMsg().getSendTalker()
-String  _msgGetQuoteTitle(Object msg)  { return null; }   // @2438-2455 引用 appmsg <title> 文本
-// RP 检测用的两个反射取值缝 (线上 RedPacketStats @1237 msg.getType() / @1262 msg.getMsgId())。
-//   占位返回 0 (= 非红包 type / msgid 0), 让解析门通过 + 调用骨架成立; P2 接 WAuxiliary 反射, L4 真机验。
-int  _msgGetType(Object msg)  { return 0; }    // @1237 ((Number)msg.getType()).intValue() — 红包 type==HB_MSG_TYPE
-long _msgGetMsgId(Object msg) { return 0L; }   // @1262 ((Number)msg.getMsgId()).longValue() — 原红包本地 msgId (供引用)
+boolean _msgIsChatroom(Object msg)    { try { return msg.isChatroom(); } catch (Throwable t) { return false; } }   // @2115 已接真机反射 msg.isChatroom() — 群聊闸门(最廉价先判) (GA@2115 / RP@1207)
+boolean _msgIsText(Object msg)        { try { return msg.isText(); } catch (Throwable t) { return false; } }       // @2121 已接真机反射 msg.isText() (GA@2121)
+String  _msgGetContent(Object msg)    { try { return msg.getContent(); } catch (Throwable t) { return null; } }    // @2124 已接真机反射 msg.getContent() (GA@2124 / RP@1212)
+String  _msgGetTalker(Object msg)     { try { return msg.getTalker(); } catch (Throwable t) { return null; } }     // @2148 已接真机反射 msg.getTalker() — groupId (GA@2148 / RP@1210)
+String  _msgGetSendTalker(Object msg) { try { return msg.getSendTalker(); } catch (Throwable t) { return null; } } // @2149 已接真机反射 msg.getSendTalker() — sender (GA@2149 / RP@1211)
+List    _msgGetAtUserList(Object msg) { try { return msg.getAtUserList(); } catch (Throwable t) { return null; } } // @2150 已接真机反射 msg.getAtUserList() (GA@2150 / RP@1226)
+// 引用回复 (W2): 线上 @2430-2461 getQuoteMsg().getSendTalker() + appmsg <title>。已接真机反射。
+//   仅 !isText 动作分支才调 (见 C-PERF-01: 普通文本不付此成本)。
+String  _msgGetQuoteTarget(Object msg) { try { Object quote = msg.getQuoteMsg(); if (quote == null) return null; return quote.getSendTalker(); } catch (Throwable t) { return null; } }   // @2430-2431+2459-2460 已接真机反射 getQuoteMsg().getSendTalker()
+String  _msgGetQuoteTitle(Object msg)  { try { String content = msg.getContent(); if (content == null) return null; java.util.regex.Matcher m = java.util.regex.Pattern.compile("<title>(.*?)</title>", java.util.regex.Pattern.DOTALL).matcher(content); if (m.find()) return m.group(1); return null; } catch (Throwable t) { return null; } }   // @2437-2456 已接真机反射 引用 appmsg <title> 原始 title 内文 (split/动作词/qDays 在 commands.bsh:391-399 消费侧)
+// RP 检测用的两个反射取值缝 (线上 RedPacketStats @1237 msg.getType() / @1262 msg.getMsgId()), 已接真机反射。
+int  _msgGetType(Object msg)  { try { return ((Number) msg.getType()).intValue(); } catch (Throwable t) { return 0; } }    // @1237 已接真机反射 ((Number)msg.getType()).intValue() — 红包 type==HB_MSG_TYPE
+long _msgGetMsgId(Object msg) { try { return ((Number) msg.getMsgId()).longValue(); } catch (Throwable t) { return 0L; } }   // @1262 已接真机反射 ((Number)msg.getMsgId()).longValue() — 原红包本地 msgId (供引用)
 
 // perf 落盘 (线上 RedPacketStats perfFlush @4035: 聚合 PERF_* 窗口 → 后台写 perf.log)。
 //   ★ P3-b T3 已实现真实落盘: 定义移至 app/redpacket_worker.bsh (worker tick 驱动落盘 + 热路径兜底)。
@@ -365,9 +364,14 @@ void onHandleMsgBody(Object msg) {
     content = content.trim();
     if (content.isEmpty()) return;
 
-    // 引用回复字段 (W2): 仅 !isText 动作分支会用, routeCommand 内按 isTextMsg 二分决定是否消费。
-    String quoteTarget = _msgGetQuoteTarget(msg);
-    String quoteTitle  = _msgGetQuoteTitle(msg);
+    // 引用回复字段 (W2): 仅 !isText 动作分支会用 (线上 GA getQuoteMsg/正则只在 !isText 分支, 普通文本零额外成本, C-PERF-01)。
+    //   普通文本 (isTextMsg=true) 传 null —— routeCommand 对文本路径 (commands.bsh:379-381) 直接 return false, 不消费这两参。
+    String quoteTarget = null;
+    String quoteTitle  = null;
+    if (!isTextMsg) {
+        quoteTarget = _msgGetQuoteTarget(msg);
+        quoteTitle  = _msgGetQuoteTitle(msg);
+    }
 
     // 5. GA 路由 (@2158-2469 那段逐字已在 commands.bsh)。routeCommand 内含:
     //    群管开关命令 → isGroupEnabled 闸门 → 潜水追踪采集 recordSpeak(@2217) → 命令前置授权 → 各命令分发。
