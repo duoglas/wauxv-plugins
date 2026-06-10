@@ -11,7 +11,8 @@
 //   - FREELOADER_MAX_WARN          → domain/freeloader.bsh:22 (=10, 同值)。本片不再声明, 设备代码复用之。
 //   - 全部 K_*/DEF_* 配置键/默认值 (tier/qualify/export/freeloader 相关)
 //       → domain/redpacket_tiers.bsh (RP_K_*/RP_DEF_*)、redpacket_qualify.bsh (RPQ_K_*)、
-//         redpacket_export.bsh (RP_K_EXPORT_*/RP_DEF_EXPORT_TARGET)、app/redpacket_app.bsh (K_FREELOADER_SINCE_PREFIX)。
+//         redpacket_export.bsh (RP_K_EXPORT_*/RP_DEF_EXPORT_TARGET)。
+//       (伸手党 since 闸门键 K_FREELOADER_SINCE_PREFIX 已随 C-ARCH-04 移除, 基线共通后无需开关锚点。)
 //     这些是领域配置键, 不属设备层独占 → 本片不搬。
 // ============================================================
 

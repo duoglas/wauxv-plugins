@@ -190,8 +190,10 @@ void rpRecordStats(String key, String talker, String senderWxid, String title, L
 // ==================== 分档 + 发两条提醒 (线上 hbTierAndSend @2970/@2972 逐字) ====================
 // msgid = 原红包本地 msgId (供引用条引用原红包)。v1.1.4 §16: 引用群规条(无@) + @条(sendText 真@)。
 //   ★发送换端口: rpSendQuote → HOST.sendQuote (健壮回退在端口内); rpSendAt/sendText → HOST.sendText。
-void hbTierAndSend(String talker, long msgid, List receivers) { hbTierAndSend(talker, msgid, receivers, false); }
-void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) {
+void hbTierAndSend(String talker, long msgid, List receivers) { hbTierAndSend(talker, msgid, receivers, false, null); }
+void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) { hbTierAndSend(talker, msgid, receivers, isCustom, null); }
+// ★A2: 全签名加 senderWxid —— 发包人本人不进 @ 列表 (旧 2/3 参入口仍可用, senderWxid 缺省 null)。
+void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom, String senderWxid) {
     try {
         // ---- §13.3: 同群 @ 限频。两条提醒间隔 < cfgMsgGap 则跳过本次 (分档前就判)。----
         long gapMs = cfgMsgGap() * 1000L;
@@ -216,6 +218,8 @@ void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) 
         // §12: 分档前剔除本群排除名单 (不@、不计入达标总人数 → 影响 >上限 判定)。
         List excl = getExcludeList(talker);
         int excludedHit = 0;
+        int senderSkipHit = 0;   // ★A2: 发包人本人跳过 @ 的计数 (单独计, 不并入 excludedHit; 日志不泄漏 wxid)。
+        String _senderWxid = (senderWxid == null) ? null : senderWxid.trim();
 
         // 每档一个 wxid 列表 (index 0 = 档1 最低)。
         List groups = new java.util.ArrayList();
@@ -226,6 +230,8 @@ void hbTierAndSend(String talker, long msgid, List receivers, boolean isCustom) 
             long cent = ((Long) r[1]).longValue();
             String wxid = (String) r[2];
             if (wxid == null || wxid.isEmpty()) continue;   // @ 需要 wxid
+            // ★A2: 发包人本人不进 @ 列表 (防御性: 发包人理论上不在领取者里, 仍跳过保险)。单独计数, 不污染 excludedHit。
+            if (_senderWxid != null && !_senderWxid.isEmpty() && wxid.equals(_senderWxid)) { senderSkipHit++; continue; }
             boolean skip = false;
             for (int j = 0; j < excl.size(); j++) { if (wxid.equals(((String) excl.get(j)).trim())) { skip = true; break; } }
             if (skip) { excludedHit++; continue; }
@@ -317,8 +323,8 @@ void rpDeliverReceivers(Object[] job, java.util.List receivers, boolean isCustom
     try { rpRecordStats(key, talker, senderWxid, title, receivers); }
     catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " stats-db: write threw (ignored, degrade): " + t); }
 
-    // ② 分档 + 发提醒 (线上 @2814; talker 非空才发)。
-    if (talker != null) hbTierAndSend(talker, msgid, receivers, isCustom);
+    // ② 分档 + 发提醒 (线上 @2814; talker 非空才发)。★A2: 透传 senderWxid → 发包人不进 @ 列表。
+    if (talker != null) hbTierAndSend(talker, msgid, receivers, isCustom, senderWxid);
     else hbBgLog("[RP] " + hbNow() + " detail: talker null, cannot send.");
 }
 

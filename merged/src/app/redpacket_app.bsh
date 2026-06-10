@@ -28,17 +28,10 @@ int RP_PROC_EQUAL_SPLIT = 0;   // 均分包 → 清状态不发不判 (仅拼手
 int RP_PROC_SENT        = 1;   // 拼手气 → 已写库 + 分档发送 (达标≥1)
 int RP_PROC_NO_QUALIFY  = 2;   // 拼手气但无人达标 → 写库跳过(线上 qualified==0 不录), 不发送
 
-// ---- 伸手党 since 闸门键 (逐字保真线上 plugins/redpacket-stats/main.java:280 K_FREELOADER_SINCE_PREFIX) ----
-//   per-group 键 "rp_freeloader_since_<normGroupId(gid)>" = 全局开关 OFF→ON 写的当前 ms (宽限锚点)。
-//   命令『伸手党 开』/Dialog OFF→ON 的写点在 P3-b 接线 (main.java:1545/3689, 键经 normGroupId 与读一致)。
-//   读/lazy-init 写都经 normGroupId(gid) 规整, 与线上 cfgFreeloaderSince(@847)/v1.11.4 Santa 修复键一致。
-String K_FREELOADER_SINCE_PREFIX = "rp_freeloader_since_";
-
-// 读 since 锚点 (逐字对齐线上 cfgFreeloaderSince @846-849): 走 HOST.getString, 空/解析失败/≤0 → 0L。
-long rpFreeloaderSince(String grp) {
-    try { long v = Long.parseLong(HOST.getString(K_FREELOADER_SINCE_PREFIX + normGroupId(grp), "").trim()); return (v > 0L) ? v : 0L; }
-    catch (Throwable t) { return 0L; }
-}
+// ---- 伸手党 since 闸门已移除 (C-ARCH-04, P3-c) ----
+//   原 K_FREELOADER_SINCE_PREFIX/rpFreeloaderSince(开关 OFF→ON 写宽限锚点)已删:
+//   发言基线(first_seen/last_speak)现为共通基础设施(onLoad 对任一功能启用群建基线 + 热路径共通 recordSpeak),
+//   伸手党新人保护直接基于共通 first_seen(FL_EXEMPT_NEW, FREELOADER_NEWMEMBER_EXEMPT_MS), 不再绑开关锚点(消除升级缺口)。
 
 // ============================================================
 // (1) 红包处理编排 — rpProcessReceivers
@@ -135,7 +128,7 @@ int rpProcessReceivers(String key, long msgid, String date, long ts, String grp,
 //   ★降级红线 (spec §4.1): snapshot==null / 无此人 / 拿不准 = SKIP, 绝不误警告。
 //   该语义在 freeloaderJudge 内已落地; 本编排不绕过 (snapFail 或 toWarn 为空 → 一个 doWarn 都不发)。
 // 闸门整包跳过的 summary (与 freeloaderJudge snapFail 路径同形, 便于下游/测试统一读): 零警告、全员计 skip。
-//   额外 "gate" 标该跳过原因 (no_reason / no_since_anchor / within_activation_grace), 供观测; 绝不调 doWarn。
+//   额外 "gate" 标该跳过原因 (现仅 no_reason; since 闸门 no_since_anchor/within_activation_grace 已随 C-ARCH-04 移除), 供观测; 绝不调 doWarn。
 java.util.Map rpFreeloaderGateSkip(java.util.List receivers, String gate) {
     java.util.Map res = new java.util.HashMap();
     res.put("snapFail", Boolean.FALSE);
@@ -171,23 +164,11 @@ java.util.Map freeloaderRunWithSnapshot(String grp, java.util.List receivers, St
         return rpFreeloaderGateSkip(receivers, "no_reason");
     }
 
-    // ---- (a1) since 全局开关时刻宽限闸门 (MAJOR 1, spec §4 不变项 + 测试矩阵 #16)。----
-    //   逐字对齐线上 plugins/redpacket-stats/main.java:2761-2772 (v1.11.4 修复):
-    //     ① since<=0 (无锚点, 老用户升级缺口 → 键空) → lazy-init 补写 since=now 再整包跳过 (自愈, 下个包才生效)。
-    //     ② packetMs 在 since+winMs 内 (开关刚打开预热期) → 整包跳过 (全员豁免, 数据未预热完整防误警告全群)。
-    //     ③ 否则正常走 judge→doWarn (快照已由调用方在 P+G 预拍)。
-    //   读/写键经 normGroupId(grp) (rpFreeloaderSince + 下方写点一致, 对齐线上 v1.11.4 Santa 修复)。
-    //   闸门触发整包跳过时绝不调 doWarn (降级红线同向: 宁可漏判不可误踢)。
-    long since = rpFreeloaderSince(grp);
-    if (since <= 0L) {
-        // ① 无锚点: lazy-init 补写 since=now (走 HOST 端口; 生产 CLOCK.now()=System.currentTimeMillis 同线上 @2768), 本轮跳过。
-        try { HOST.putString(K_FREELOADER_SINCE_PREFIX + normGroupId(grp), String.valueOf(CLOCK.now())); } catch (Throwable t) {}
-        return rpFreeloaderGateSkip(receivers, "no_since_anchor");
-    }
-    if (packetMs - since < winMs) {
-        // ② 预热期: packetMs 在 [since, since+winMs) 内 → 全员豁免整包跳过 (逐字对齐线上 @2772 fPacketMs - since < winMs)。
-        return rpFreeloaderGateSkip(receivers, "within_activation_grace");
-    }
+    // ---- (a1) since 闸门已移除 (C-ARCH-04): 新人保护完全交给 freeloaderJudge 内建的 first_seen 新人豁免 ----
+    //   (FL_EXEMPT_NEW, 用 FREELOADER_NEWMEMBER_EXEMPT_MS; freeloader.bsh:46-47)。
+    //   原 since 锚点把伸手党新人保护绑死在"开关 OFF→ON 才写"上 → 升级缺口/静默失效 (RP v1.11.4 病根)。
+    //   现发言基线=共通基础设施 (onLoad 对任一功能启用群建 first_seen + 热路径共通 recordSpeak),
+    //   伸手党直接基于共通 first_seen 判新人, 不再需开关锚点。降级红线仍全在 freeloaderJudge 内 (本编排不绕过)。
 
     // ---- (c) 判定 (纯逻辑, 复用 freeloader.freeloaderJudge; 降级语义在其内, 本编排不绕过)。----
     //   ★降级: 注入快照为 null (P+G 拍照失败/G 夹取没拍成/job 已终结没 put) → freeloaderJudge 整批 SKIP, 零警告 (§4.1 #1)。

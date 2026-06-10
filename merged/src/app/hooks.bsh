@@ -116,16 +116,22 @@ void onLoad() {
                 // 一次性迁移旧 CSV → SQLite (migrated 标志守卫只迁一次)。
                 try { l3MigrateCsvToDb(); } catch (Throwable t) { try { log("l3 migrate err: " + t); } catch (Throwable t2) {} }
 
-                List groups = getEnabledGroups();
+                // C-ARCH-04: 发言基线=共通基础设施, 与功能开关解耦。补基线群集 = 任一功能启用的群:
+                //   union(群管 getEnabledGroups ∪ 红包 rpGetEnabledGroups), LinkedHashSet 去重。
+                //   读两套独立键 (enabled_groups / rp_enabled_groups, 键名同源不混); 任一功能开启即建 first_seen。
+                java.util.LinkedHashSet baseGroups = new java.util.LinkedHashSet();
+                try { List _ga = getEnabledGroups(); if (_ga != null) for (int i = 0; i < _ga.size(); i++) { String g = (String) _ga.get(i); if (g != null && !g.isEmpty()) baseGroups.add(g); } } catch (Throwable t) {}
+                try { List _rp = rpGetEnabledGroups(); if (_rp != null) for (int i = 0; i < _rp.size(); i++) { String g = (String) _rp.get(i); if (g != null && !g.isEmpty()) baseGroups.add(g); } } catch (Throwable t) {}
                 int touched = 0;
                 int totalAdded = 0;
-                for (int i = 0; i < groups.size(); i++) {
-                    String g = (String) groups.get(i);
-                    // v1.20.0: 对所有已启用群补基线 (initFirstSeenBaseline 幂等, 只补缺失成员, 冲突取 min)。
+                java.util.Iterator _bgIt = baseGroups.iterator();
+                while (_bgIt.hasNext()) {
+                    String g = (String) _bgIt.next();
+                    // v1.20.0: 对所有启用群补基线 (initFirstSeenBaseline 幂等, 只补缺失成员, 冲突取 min)。
                     int added = initFirstSeenBaseline(g);
                     if (added > 0) { touched++; totalAdded += added; }
                 }
-                log("GroupAdmin baseline check: 已启用群 " + groups.size() + ", 补基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
+                log("GroupAdmin baseline check (C-ARCH-04 共通): 启用群(GA∪RP) " + baseGroups.size() + ", 补基线群 " + touched + ", 新增 first_seen " + totalAdded + " 人");
             }
         });
     } catch (Throwable t) {
@@ -332,6 +338,16 @@ void onHandleMsgBody(Object msg) {
     } catch (Throwable t) { rpConsumed = false; }
     if (rpConsumed) return;   // 排除命令: 已 toast 消费, 不当聊天消息 (GA 不记不路由, 与线上 RP @1229 return 一致)。
 
+    // C-ARCH-04: 共通发言基线采集 — 任一功能启用即记 (与群管/红包统计开关解耦, 单一上游点, O(1) 内存写)。
+    //   放在 rpConsumed return 之后 → 排除命令(bot 自发)仍不记 (行为不变); 在 isText 二分之前 →
+    //   文本与非文本(红包/图片/语音等)消息的发送者都在此被记一次, 下游不再重复采集 (C2)。
+    //   热路径红线: isGroupEnabled/rpIsGroupEnabled 均 TTL60s 内存缓存 → O(1) 零 FUSE; recordSpeak O(1) 内存写; 整段 try/catch。
+    try {
+        if (sender != null && !sender.isEmpty() && (isGroupEnabled(groupId) || rpIsGroupEnabled(groupId))) {
+            recordSpeak(groupId, sender);
+        }
+    } catch (Throwable _sErr) {}
+
     // 4. GA isText 二分取 content (@2117-2143)。普通文本零额外成本; 非文本才回看 content 判空。
     boolean isTextMsg = _msgIsText(msg);
     String content;
@@ -340,16 +356,9 @@ void onHandleMsgBody(Object msg) {
     } else {
         content = rawContent;
         if (content == null || content.trim().isEmpty()) {
-            // ★非文本且无可读文本 (图片/表情/语音/红包/文件等): 在早退前先采集一次发言活动 (@2128-2141)。
-            //   红包消息正落此分支 → 发包人 last_speak 推进 (GA v1.18.0 "发红包=活动" 红线; RP 已在第 3 步入队)。
-            //   热路径红线: 只调 _msgGetTalker(已取)/_msgGetSendTalker(已取)/isGroupEnabled(缓存)/recordSpeak(O(1) 内存写),
-            //   绝不解析 XML; 整段 try/catch。groupId/sender 复用第 2 步反射取值, 不重复反射。
-            try {
-                if (sender != null && !sender.isEmpty() && isGroupEnabled(groupId)) {
-                    recordSpeak(groupId, sender);
-                }
-            } catch (Throwable _aErr) {}
-            return;   // 非文本且无可读文本 → 采集后不再处理 (GA 路由仅对文本/引用 appmsg)
+            // ★非文本且无可读文本 (图片/表情/语音/红包/文件等): 发言采集已上移至共通点 (C-ARCH-04, 上方 rpConsumed return 后),
+            //   故此处不再重复 recordSpeak (红包/图片/语音等发送者已被共通点记一次, 含发包人"发红包=活动"语义)。
+            return;   // 非文本且无可读文本 → 不再处理 (GA 路由仅对文本/引用 appmsg)
         }
     }
     if (content == null) return;

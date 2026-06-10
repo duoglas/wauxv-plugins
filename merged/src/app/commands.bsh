@@ -218,11 +218,9 @@ boolean routeCommand(String groupId, String sender, String content,
     // ---- 没启用就静默忽略其他所有命令 (@2206) ----
     if (!_cmdGroupEnabled(groupId)) return false;
 
-    // ---- 潜水追踪: 每条群消息记录发言时间 + first_seen (@2211) ----
-    // 热路径 L3 采集已在 d1 (app/speak_buffer.recordSpeak); 路由只保留这一行占位真调, 不重复抽 infra。
-    if (sender != null && !sender.isEmpty()) {
-        recordSpeak(groupId, sender);
-    }
+    // ---- 潜水追踪: 发言基线采集已上移至共通点 (C-ARCH-04, hooks.onHandleMsgBody rpConsumed return 之后) ----
+    //   该共通点对"任一功能启用"的群即记 (与群管/红包开关解耦), 覆盖文本与非文本消息, 故此处不再重复 recordSpeak。
+    //   (原 @2211 群管启用闸门后逐条 recordSpeak 的语义已由上游共通点承载。)
 
     // ---- 群管命令统一前置: 非管理员一律静默忽略 (@2233) ----
     boolean isCmd = content.equals("群管帮助") || content.equals("帮助 群管") ||
@@ -702,10 +700,9 @@ boolean rpOnClickSendBtn(String text) {
             String groupId = rpCurrentGroupOrToast();
             if (groupId == null) return true;
             try {
-                boolean wasOn = cfgFreeloaderOn(groupId);   // v1.11.3 §25.9: 仅 OFF→ON 写 since, 不重置宽限
                 HOST.putString(RP_K_FREELOADER_ON_PREFIX + groupId, "1");
-                if (!wasOn) HOST.putString(K_FREELOADER_SINCE_PREFIX + normGroupId(groupId), String.valueOf(System.currentTimeMillis()));   // v1.11.4: key 经 normGroupId 与读一致
-                toast("✅ 已开启本群伸手党治理 (开后" + cfgFreeloaderWin(groupId) + "分钟内全员豁免, 之后抢到前未发言 → 发群管警告)");
+                // C-ARCH-04: since 锚点已移除 (开关只管开/关, 不再写宽限锚点); 新人保护交 first_seen 共通基线判定。
+                toast("✅ 已开启本群伸手党治理 (抢红包前" + cfgFreeloaderWin(groupId) + "分钟未发言 → 发群管警告; 新人按 first_seen 自动豁免)");
             } catch (Throwable t) {}
             return true;
         }

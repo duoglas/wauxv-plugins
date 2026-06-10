@@ -1,0 +1,80 @@
+// ============================================================
+// L2 (P3-c A2): hbTierAndSend 发包人 @条豁免 —— 发包人本人不进 @ 列表 (但写库不动, 另测)。
+//   权威: P3-c 前置补丁任务 A2 (发包人豁免 + senderWxid 透传)。
+//
+//   hbTierAndSend 依赖若干 host leaf (delay/getGroupList/log/hbBgLog) 与 cfg 读 (rpCfgLong/Int/Str→HOST.getString)。
+//   本片用最小桩: delay 同步执行 Runnable (捕获 @条 msg2 进 FAKE_SENT)、hbBgLog/hbNow/RP_LAST_MSG/log 桩、
+//   档表/排除名单走 redpacket_tiers + redpacket_qualify 真实模块 (config 经 HOST fake)。
+//   验: 发包人 wxid 在 receivers 里 (防御性) → 不进 @ 列表; 非发包人达标者照常 @。
+// 运行 cwd = merged/。
+// ============================================================
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");        // HOST(fake) ; sendText→FAKE_SENT, sendQuote→FAKE_QUOTED
+source("src/domain/membership.bsh");        // normGroupId/parseCsv/joinCsv
+source("src/domain/redpacket_tiers.bsh");   // getTiersByType/tierOf/renderTierRuleLine/rpCfgInt/rpCfgStr/rpNormGroupId
+source("src/domain/redpacket_qualify.bsh"); // getExcludeList
+
+// ---- 最小桩 (device_base / redpacket_detect / 宿主 leaf, 不 source 整片以免拖入更多 leaf) ----
+java.util.Map RP_LAST_MSG = new java.util.HashMap();        // 限频表 (本测不触发限频: 默认 gap 30s, 首次发无 last)
+void hbBgLog(String s) {}                                   // 脱敏日志桩 (本测不验日志)
+String hbNow() { return "00:00:00"; }
+void log(String s) {}
+long rpCfgLong(String key, long def) {                      // device_send 经此读 cfgMsgGap/cfgTwoMsgGap (redpacket_detect 原实现, 桩走 HOST)
+    try { String v = HOST.getString(key, ""); if (v == null || v.trim().isEmpty()) return def; return Long.parseLong(v.trim()); }
+    catch (Throwable t) { return def; }
+}
+// delay 桩: 同步跑 Runnable (生产 fire-and-forget; 测试需同步捕获 @条 msg2)。
+void delay(int ms, Runnable r) { try { r.run(); } catch (Throwable t) {} }
+
+// redpacket_send.bsh 原文用 final (匿名内部类闭包/方法参数); bsh.Interpreter 不接受裸 final 解析,
+//   故先剥 final 写临时文件再 source (装配体 check.sh 也是去 final 后解析, 行为等价)。
+String _srcPath = "src/app/redpacket_send.bsh";
+String _tmpPath = System.getProperty("java.io.tmpdir") + "/rp_send_nofinal_" + System.nanoTime() + ".bsh";
+{
+    java.io.BufferedReader _br = new java.io.BufferedReader(new java.io.FileReader(_srcPath));
+    java.io.PrintWriter _pw = new java.io.PrintWriter(new java.io.FileWriter(_tmpPath));
+    String _ln;
+    while ((_ln = _br.readLine()) != null) { _pw.println(_ln.replaceAll("\\bfinal\\b", "")); }
+    _br.close(); _pw.close();
+}
+source(_tmpPath);                            // hbTierAndSend (被测, 去 final 副本)
+
+String GRP = "g1@chatroom";
+// 档表全局默认三档 5/10/20 元; 限频 gap 设 0 避免误触发。
+HOST.putString("rp_msg_min_gap_sec", "0");
+HOST.putString("rp_two_msg_gap_sec", "0");
+Object[] rcv(String nick, long cent, String wxid) { return new Object[]{ nick, new Long(cent), wxid }; }
+void reset() { FAKE_SENT.clear(); FAKE_QUOTED.clear(); }
+
+boolean atHit(String wxid) {
+    for (int i = 0; i < FAKE_SENT.size(); i++) {
+        String m = ((Object[]) FAKE_SENT.get(i))[1].toString();
+        if (m.indexOf("[AtWx=" + wxid + "]") >= 0) return true;
+    }
+    return false;
+}
+
+// ============================================================
+// A2: 发包人 ws 在 receivers 里 (防御性), 达标金额 → 不进 @ 列表; 其他达标者 w1 照常 @。
+// ============================================================
+reset();
+java.util.List rc = new java.util.ArrayList();
+rc.add(rcv("张三", 600L, "w1"));     // 6元 > 5 → 达标, 非发包人 → 应 @
+rc.add(rcv("发包人", 1500L, "ws")); // 15元 > 5 → 达标, 但=发包人 → 不应 @
+hbTierAndSend(GRP, 222L, rc, false, "ws");
+check("A2 引用条照发 (发包人豁免不影响群规条)", FAKE_QUOTED.size() == 1);
+check("A2 达标者 w1 (非发包人) → 被 @", atHit("w1"));
+check("A2 发包人 ws (在 receivers) → 不被 @", !atHit("ws"));
+
+// ---- 对照: 不传 senderWxid (旧 4 参入口) → 发包人 ws 照常被 @ (无豁免) ----
+reset();
+hbTierAndSend(GRP, 222L, rc, false);   // 旧 4 参签名, senderWxid 缺省 null
+check("A2 对照: 旧 4 参入口无豁免 → ws 照常被 @", atHit("ws"));
+check("A2 对照: 旧 4 参入口 w1 照常被 @", atHit("w1"));
+
+// ---- 对照: 旧 3 参入口仍可用 (不报 NoSuchMethod) ----
+reset();
+hbTierAndSend(GRP, 222L, rc);          // 旧 3 参签名
+check("A2 对照: 旧 3 参入口可用 + w1 被 @", atHit("w1"));
+
+done();

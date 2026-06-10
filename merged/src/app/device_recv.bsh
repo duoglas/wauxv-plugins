@@ -400,8 +400,17 @@ void hbDetailExtract(Object root, String key) {
                 // 排除名单 → Set (命中者豁免不判)。
                 java.util.Set exSet = new java.util.HashSet();
                 try { java.util.List ex = getExcludeList(talker); if (ex != null) for (int i = 0; i < ex.size(); i++) { String e = (String) ex.get(i); if (e != null) exSet.add(e.trim()); } } catch (Throwable t) {}
+                // ★A1 发包人豁免: 发包人本人永不被判伸手党 (写库照常含, 仅判定豁免)。
+                try { String _spw = (job != null) ? (String) job[JOB_SENDER] : null; if (_spw != null && !_spw.isEmpty()) exSet.add(_spw.trim()); } catch (Throwable t) {}
                 int win = cfgFreeloaderWin(talker);
-                String reason = win + "分钟内未发言";   // doWarn auto 来源理由 (线上 @2794 "警告 {N}分钟内未发言")
+                // ★B 警告文案: 含红包检测时刻 HH:mm + X分钟未发言领取。doWarn 已渲染前缀"⚠️ 警告 N/10 — {名}..."
+                //   (warning.bsh:88/111 把 reason 拼成 " · {reason}"), reason 末尾绝不加"警告"(否则双"警告")。
+                //   整段 try/catch: HH:mm 格式化失败 → 回退原"{N}分钟内未发言", 绝不让文案构造抛异常影响判定。
+                String reason;
+                try {
+                    String _hm = new java.text.SimpleDateFormat("HH:mm").format(new java.util.Date(packetMs));
+                    reason = _hm + "红包 · " + win + "分钟未发言领取";
+                } catch (Throwable _rErr) { reason = win + "分钟内未发言"; }
                 // 操作人=bot 自己(群主); doWarn auto 分支对管理员/群主/白名单/保护静默豁免, canActOn(bot→target)成立。
                 java.util.Map sum = freeloaderRunWithSnapshot(talker, wxids, HOST.getLoginWxid(), packetMs,
                     (long) win * 60000L, FREELOADER_NEWMEMBER_EXEMPT_MS, exSet, FREELOADER_MAX_WARN, reason, snap);

@@ -1478,9 +1478,8 @@ void showPageFreeloader(final String groupId) {
         Runnable onSave = new Runnable() {
             public void run() {
                 try {
-                    boolean wasOn = cfgFreeloaderOn(fGroupId);   // v1.11.3 §25.9: 仅 OFF→ON 写 since, 不重置宽限
                     HOST.putString(RP_K_FREELOADER_ON_PREFIX + fGroupId, onHolder[0] ? "1" : "");
-                    if (onHolder[0] && !wasOn) HOST.putString(K_FREELOADER_SINCE_PREFIX + normGroupId(fGroupId), String.valueOf(System.currentTimeMillis()));   // v1.11.4: key 经 normGroupId 与读一致
+                    // C-ARCH-04: since 锚点已移除 (开关只管开/关, 不再写宽限锚点); 新人保护交 first_seen 共通基线判定。
                     // 窗口校验 1-1440, 越界/非法不写 (保留原值)。
                     String wv = winBox.getText().toString().trim();
                     boolean winOk = false;

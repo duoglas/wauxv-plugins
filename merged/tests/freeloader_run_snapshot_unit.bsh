@@ -26,8 +26,7 @@ Long L(long v) { return new Long(v); }
 Long oldFs = L(P - 10L * EX);                // 老成员
 Long newFs = L(P - 2L * 3600000L);           // 新人(P-2h, 在 EXEMPT 内)
 
-void setSince(String w, long ms) { HOST.putString("rp_freeloader_since_" + normGroupId(w), String.valueOf(ms)); }
-setSince(GRP, P - 2L * N);                    // 锚点过预热期 → 正常判定
+// C-ARCH-04 (P3-c): since 闸门已移除 → 不再写/读 rp_freeloader_since_; 新人保护交 first_seen(FL_EXEMPT_NEW)。
 setWarnKick(GRP, 99);                         // 阈值设高 → 只警告不踢(踢人累计另有 #25 测)
 void reset() { FAKE_SENT.clear(); FAKE_KICKED.clear(); }
 
@@ -64,13 +63,16 @@ check("#21 null 快照 → snapFail",       ((Boolean) sumNull.get("snapFail")).
 check("#21 null 快照 → toWarn 空",      ((java.util.List) sumNull.get("toWarn")).isEmpty());
 check("#21 null 快照 → 零 doWarn",      FAKE_SENT.isEmpty());
 
-// ---- #16 since 预热期: packetMs 在 since+winMs 内 → 整包跳过零 doWarn ----
+// ---- #16 since 闸门已移除 (C-ARCH-04): 不再有 within_activation_grace 整包跳过; 直接正常判定 ----
+//   原 #16 断言"预热期整包跳过"已废弃。现无 since 锚点干扰, 同一 snap 直接判定:
+//   u_warn/u_never(老成员未发言)正常判伸手党, u_new(新人)走 FL_EXEMPT_NEW 豁免, u_active 活跃。
 reset();
-setSince(GRP, P - 1000L);                     // since 很近 → packetMs-since=1s < N → 预热期
-java.util.Map sumGrace = freeloaderRunWithSnapshot(GRP, rcv, "bot", P, N, EX, new java.util.HashSet(), FREELOADER_MAX_WARN, "30分钟内未发言", snap);
-check("#16 预热期 → gate=within_activation_grace", "within_activation_grace".equals(sumGrace.get("gate")));
-check("#16 预热期 → 零 doWarn",         FAKE_SENT.isEmpty());
-setSince(GRP, P - 2L * N);                     // 还原
+java.util.Map sumNoGate = freeloaderRunWithSnapshot(GRP, rcv, "bot", P, N, EX, exSet, FREELOADER_MAX_WARN, "30分钟内未发言", snap);
+check("#16 无 since 闸门 → gate==null (不再整包跳过)", sumNoGate.get("gate") == null);
+java.util.Map vNoGate = (java.util.Map) sumNoGate.get("verdicts");
+check("#16 老成员未发言 → WARN (非闸门跳过)", ((Integer) vNoGate.get("u_never")).intValue() == FL_WARN);
+check("#16 新人 → FL_EXEMPT_NEW (新人保护交 first_seen, 非 since)", ((Integer) vNoGate.get("u_new")).intValue() == FL_EXEMPT_NEW);
+check("#16 正常判伸手党 warned=2",         ((Integer) sumNoGate.get("warned")).intValue() == 2);
 
 // ---- reason 守护: reason 空白 → 整批不发 (绝不落手动语义) ----
 reset();
@@ -87,5 +89,41 @@ java.util.Map sumCap = freeloaderRunWithSnapshot(GRP, rcv2, "bot", P, N, EX, new
 check("#18 判伸手党 warned=11",         ((Integer) sumCap.get("warned")).intValue() == 11);
 check("#18 实发 toWarn=10",             ((java.util.List) sumCap.get("toWarn")).size() == 10);
 check("#18 capped=1",                   ((Integer) sumCap.get("capped")).intValue() == 1);
+
+// ============================================================
+// ★A1 发包人豁免: device_recv 把发包人 wxid 加进 exSet → 发包人(即便在 receivers 里, 防御性)永不进 toWarn。
+//   这里模拟 device_recv 的 exSet 构造: 发包人 = "u_never"(老成员未发言, 否则会 WARN), 加进排除集。
+//   断言: 发包人不在 toWarn, 计入 excluded, 其余伸手党(u_warn)照常判。写库不在本函数(rpRecordStats 另测), 此处只验判定豁免。
+// ============================================================
+reset();
+String SENDER = "u_never";                         // 发包人本人(老成员从未发言, 不豁免则会 WARN)
+java.util.Set exA1 = new java.util.HashSet();
+exA1.add(SENDER);                                  // device_recv: exSet.add(发包人 job[JOB_SENDER])
+java.util.Map sumA1 = freeloaderRunWithSnapshot(GRP, rcv, "bot", P, N, EX, exA1, FREELOADER_MAX_WARN, "30分钟内未发言", snap);
+java.util.List twA1 = (java.util.List) sumA1.get("toWarn");
+check("A1 发包人(在 receivers, 防御性) → 不在 toWarn", !twA1.contains(SENDER));
+java.util.Map vA1 = (java.util.Map) sumA1.get("verdicts");
+check("A1 发包人计 excluded(豁免不判)", ((Integer) sumA1.get("excluded")).intValue() == 1);
+check("A1 其余伸手党 u_warn 照常进 toWarn (豁免只作用发包人)", twA1.contains("u_warn"));
+
+// ============================================================
+// ★B 警告文案: device_recv 构造 reason = "{HH:mm}红包 · {win}分钟未发言领取"; 不含双"警告"。
+//   doWarn 已渲染前缀"⚠️ 警告 N/10 — {名}..."(warning.bsh), reason 末尾绝不带"警告"。此处对 reason 串单测。
+// ============================================================
+long _pktMs = P;
+int  _win = 30;
+String _reasonB;
+try {
+    String _hm = new java.text.SimpleDateFormat("HH:mm").format(new java.util.Date(_pktMs));
+    _reasonB = _hm + "红包 · " + _win + "分钟未发言领取";
+} catch (Throwable _e) { _reasonB = _win + "分钟内未发言"; }
+check("B reason 含 HH:mm (检测时刻)", _reasonB.matches("^[0-9]{2}:[0-9]{2}红包 · .*"));
+check("B reason 含 '分钟未发言领取'", _reasonB.indexOf("分钟未发言领取") >= 0);
+check("B reason 不含 '警告' (避免 doWarn 前缀叠双警告)", _reasonB.indexOf("警告") < 0);
+// doWarn 拼出的整行 = "⚠️ 警告 N/10 — {名} 还剩 X 次 · {reason}" → 恰一个"警告"
+String _rendered = "⚠️ 警告 1/10 — 张三 还剩 9 次 · " + _reasonB;
+int _cnt = 0; int _idx = 0;
+while ((_idx = _rendered.indexOf("警告", _idx)) >= 0) { _cnt++; _idx += 2; }
+check("B 整行恰含一个 '警告' (前缀渲染, reason 不叠)", _cnt == 1);
 
 done();

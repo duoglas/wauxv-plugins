@@ -69,7 +69,8 @@ boolean r1 = routeCommand(gid, "admin1", "@张三 警告", true, atTarget("u1"),
 check("1 @警告 路由消费",            r1 == true);
 check("1 @警告 真调 doWarn 计数+1",  getWarn(gid, "u1") == 1);
 check("1 @警告 发了警告回执",        lastSent().indexOf("警告") >= 0);
-check("1 @警告 也采集 recordSpeak",  !FAKE_RECORDED.isEmpty());
+// C-ARCH-04 (P3-c): 发言采集已上移至 hooks.onHandleMsgBody 共通点, routeCommand 不再采集 → 此处不应记。
+check("1 @警告 routeCommand 不再采集 (采集已上移共通点)", FAKE_RECORDED.isEmpty());
 
 // ============================================================
 // 2. @TA 清零 → 真调 domain doWarnClear (先垫计数, 清零后归 0 + ✅ 回执)
@@ -89,14 +90,15 @@ check("3 #潜水 路由消费",            r3 == true);
 check("3 #潜水 命中 showInactive 缝", leafHit("showInactive"));
 
 // ============================================================
-// 4. 非命令普通文本 → 不触发任何动作 (返回 false=未消费), 但仍采集发言
+// 4. 非命令普通文本 → 不触发任何动作 (返回 false=未消费)。
+//    C-ARCH-04 (P3-c): 发言采集已上移至 hooks.onHandleMsgBody 共通点, routeCommand 不再采集。
 // ============================================================
 reset();
 boolean r4 = routeCommand(gid, "admin1", "今天天气不错", true, noAt, null, null);
 check("4 普通文本 未消费",           r4 == false);
 check("4 普通文本 无动作叶子",        FAKE_LEAF.isEmpty());
 check("4 普通文本 无回执",           FAKE_SENT.isEmpty());
-check("4 普通文本 仍采集发言",        !FAKE_RECORDED.isEmpty());
+check("4 普通文本 routeCommand 不再采集 (采集已上移共通点)", FAKE_RECORDED.isEmpty());
 
 // ============================================================
 // 5. 非管理员发命令 → 静默消费, 无回执无动作 (isCmd && !authorized)
