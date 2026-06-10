@@ -78,6 +78,18 @@ boolean gaOnClickSendBtn(String text) {
     return false;
 }
 
+// ---- GA UI 颜色/圆角 helper (补回线上 plugins/group-admin/main.java @2009-2015 的逃逸孤儿:
+//      _gaBtn/_gaRow 等调 _gaC/_gaRound, 但 W7 抽片时漏带其 col-0 定义 → 运行期开"群管"配置面板
+//      会 NoSuchMethod 崩, 解析门只查语法故逃逸。逐字保真, Color/GradientDrawable 是 Android 原生,
+//      与 RP 的 _rpC/_rpRound @1006-1012 对称。_gaRound 内部调 _gaC 是 col-0 顶层函数互调, 非自递归。) ----
+int _gaC(String s) { return android.graphics.Color.parseColor(s); }
+android.graphics.drawable.GradientDrawable _gaRound(String fill, int radius) {
+    android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+    g.setColor(_gaC(fill));
+    g.setCornerRadius(radius);
+    return g;
+}
+
 // ---- 通用 UI helper ----
 android.widget.Button _gaBtn(Activity ctx, String text, String fillColor) {
     int dp = (int) ctx.getResources().getDisplayMetrics().density;
