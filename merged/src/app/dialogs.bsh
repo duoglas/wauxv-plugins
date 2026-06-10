@@ -907,6 +907,7 @@ void showInactiveControlDialog(String groupId) {
 // ============================================================
 // ==== v1.12: 白名单 GUI 子 Dialog (线上 @3952-4022 逐字) ====
 // ============================================================
+// (RP 设置 UI 移植段在本片尾部, 见下方 "RedPacketStats 设置 UI" 分隔块。)
 void showWhitelistDialog(String groupId) {
     Activity ctx = getTopActivity();
     if (ctx == null) return;
@@ -977,4 +978,818 @@ void showWhitelistDialog(String groupId) {
     sv.setBackground(_gaRound("#0F1115", 0));
     dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
     dh[0].show();
+}
+
+// ████████████████████████████████████████████████████████████████████████
+// ████ RedPacketStats 设置 UI (P3-b 移植自线上 plugins/redpacket-stats/main.java) ████
+// ████████████████████████████████████████████████████████████████████████
+// 逐字保真移植自线上 §23 设置页拆分 (主菜单 Dialog + 7 子页 + UI/Forward/落库 helper)。
+//   行为零改, 只换载体 (拼接式单文件 → 模块) + 按符号改名表替换:
+//     getString(k,def)→HOST.getString  putString(k,v)→HOST.putString  sendText→HOST.sendText
+//     tiersCustomKey→rpTiersCustomKey
+//     K_T1/2/3→RP_K_T1/2/3  K_TXT1/2/3→RP_K_TXT1/2/3  K_DELAY→RP_K_DELAY  K_RETRY1/2/3→RP_K_RETRY1/2/3  (K_AT_LIMIT 保持)
+//     K_FREELOADER_ON_PREFIX→RP_K_FREELOADER_ON_PREFIX  K_FREELOADER_WIN_PREFIX→RP_K_FREELOADER_WIN_PREFIX  (K_FREELOADER_SINCE_PREFIX 保持)
+//     K_EXPORT_TARGET→RP_K_EXPORT_TARGET  K_EXPORT_TARGET_NAME→RP_K_EXPORT_TARGET_NAME  K_DAILY_HOUR→K_DAILY_HOUR_KEY
+//     isGroupEnabled→rpIsGroupEnabled / enableGroup→rpEnableGroup / disableGroup→rpDisableGroup
+//       (RP 本群开关读写, 合并里 RP 路径已独立命名以避与 GA 同名函数撞名; 键同源 RP_K_ENABLED, redpacket_detect.bsh)
+//   ★C-PERF-01/03: 全部 Dialog/命令在 UI 线程, 绝不进 onHandleMsg 热路径; 取数/发送各自后台 Thread + try/catch。
+//   ★不移植 onClickSendBtn (RP 线上 @1333, 与 GA 撞名, 留 T8 命令路由收口)。
+//   getTopActivity/toast/delay/getFriendList/getGroupList/getFriendDisplayName/getRemark/getNickname/getRoomId/getName
+//     = WAuxiliary 宿主注入 leaf (解析门只查语法, 不解析这些类型/符号)。sCachedFriendList/sCachedGroupList = device_base.bsh。
+// ████████████████████████████████████████████████████████████████████████
+
+// 目标是否为群 (线上 rpTargetIsGroup @905 逐字; UI 显示「（群）/（好友）」用)。
+boolean rpTargetIsGroup(String target) { try { return target != null && target.indexOf("@chatroom") >= 0; } catch (Throwable t) { return false; } }
+
+// ----- RP UI 基建 helper (线上 @3221-3271 逐字) -----
+int _rpC(String s) { return android.graphics.Color.parseColor(s); }
+android.graphics.drawable.GradientDrawable _rpRound(String fill, int radius) {
+    android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
+    d.setColor(_rpC(fill));
+    d.setCornerRadius(radius);
+    return d;
+}
+android.widget.Button _rpBtn(Activity ctx, String text, String fillColor) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.Button b = new android.widget.Button(ctx);
+    b.setText(text);
+    b.setTextColor(_rpC("#E8E9EC"));
+    b.setBackground(_rpRound(fillColor, 24));
+    b.setAllCaps(false);
+    b.setTextSize(14);
+    b.setPadding(20 * dp, 12 * dp, 20 * dp, 12 * dp);
+    b.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+    return b;
+}
+android.widget.EditText _rpEdit(Activity ctx, String val, boolean numeric) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.EditText e = new android.widget.EditText(ctx);
+    e.setText(val);
+    e.setTextColor(_rpC("#E8E9EC"));
+    e.setHintTextColor(_rpC("#7C828E"));
+    e.setBackground(_rpRound("#252934", 12));
+    e.setPadding(12 * dp, 8 * dp, 12 * dp, 8 * dp);
+    e.setTextSize(14);
+    if (numeric) e.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+    e.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+    return e;
+}
+void _rpLabel(android.widget.LinearLayout root, Activity ctx, String text) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.TextView tv = new android.widget.TextView(ctx);
+    tv.setText(text);
+    tv.setTextColor(_rpC("#E8E9EC"));
+    tv.setTextSize(13);
+    tv.setPadding(0, 8 * dp, 0, 4 * dp);
+    root.addView(tv);
+}
+void _rpSpacer(android.widget.LinearLayout root, Activity ctx, int h) {
+    android.view.View v = new android.view.View(ctx);
+    v.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+        android.widget.LinearLayout.LayoutParams.MATCH_PARENT, h));
+    root.addView(v);
+}
+
+// WAuxiliary 设置入口 (线上 @3273-3279 逐字)。
+void openSettings() {
+    try {
+        // 无 groupId 上下文 → 全局配置 Dialog (启用开关那一行用提示文字代替)
+        showConfigDialog(null);
+    } catch (Throwable t) { try { toast("打开设置失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ================================================================
+// ===== v1.8.0 §23: 设置页拆分 (主菜单 Dialog + 二级子页 Dialog) =====
+//   只重构 Dialog 展示层 — worker / onHandleMsg 热路径 / 文字命令 / 存储键 全不动。
+//   读取/校验/写入键全沿用既有 helper (setTiers/rpParseTierBox/setCustomOn/saveIntField/...)。
+//   每个子页保存「只写本页对应的 key」, 互不影响其它配置。
+//   §7 ANR: 只构建 Dialog/EditText/Button, 绝不做 UI 节点遍历; 排除名单沿用 rpRebuildExcludeRows。
+// ================================================================
+
+// 通用子页根容器 (线上 @3290-3297 逐字)。
+android.widget.LinearLayout _rpPageRoot(Activity ctx) {
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_rpRound("#0F1115", 0));
+    return root;
+}
+
+// 通用子页弹窗骨架 (线上 @3299-3323 逐字)。
+void _rpShowSubPage(final Activity ctx, final String groupId, String dlgTitle, android.widget.LinearLayout root, final Runnable onSave) {
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_rpRound("#0F1115", 0));
+    new android.app.AlertDialog.Builder(ctx)
+        .setTitle(dlgTitle)
+        .setView(sv)
+        .setPositiveButton("💾 保存", new android.content.DialogInterface.OnClickListener() {
+            public void onClick(android.content.DialogInterface d, int which) {
+                try { if (onSave != null) onSave.run(); } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
+                try { showConfigDialog(groupId); } catch (Throwable t) {}
+            }
+        })
+        .setNegativeButton("← 返回", new android.content.DialogInterface.OnClickListener() {
+            public void onClick(android.content.DialogInterface d, int which) {
+                try { showConfigDialog(groupId); } catch (Throwable t) {}
+            }
+        })
+        .create()
+        .show();
+}
+
+// 主菜单 Dialog (线上 @3325-3439 逐字)。
+void showConfigDialog(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    try {
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        // v1.8.1: 捕获主菜单 dialog, 入口按钮开子页前先 dismiss 它 → 任意时刻只一个 Dialog (修「关闭」失效=对话框堆叠)。
+        final android.app.AlertDialog[] menuHolder = new android.app.AlertDialog[1];
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+
+        android.widget.TextView title = new android.widget.TextView(ctx);
+        title.setText("🧧 红包统计 v1.11.2 设置");
+        title.setTextColor(_rpC("#E8E9EC"));
+        title.setTextSize(18);
+        title.setPadding(0, 0, 0, 8 * dp);
+        root.addView(title);
+
+        // ===== 顶部状态摘要 (§23.1) =====
+        android.widget.TextView summary = new android.widget.TextView(ctx);
+        summary.setTextColor(_rpC("#7C828E"));
+        summary.setTextSize(12);
+        StringBuilder sb = new StringBuilder();
+        if (groupId != null) {
+            sb.append("群: ").append(groupId).append("\n");
+            sb.append("启用: ").append(rpIsGroupEnabled(groupId) ? "✅ 开" : "❌ 关").append("\n");
+            sb.append("每日定时: ").append(isDailyEnabled(groupId) ? ("⏰ 开 (每天" + cfgDailyHour() + "点)") : "关").append("\n");
+            String kw = "";
+            try { kw = getCustomKw(groupId); } catch (Throwable t) { kw = ""; }
+            sb.append("定制: ").append(isCustomOn(groupId) ? ("✅ 开 关键字「" + (kw == null ? "" : kw) + "」") : "关");
+        } else {
+            sb.append("全局面板 (无群上下文)\n本群启用/每日定时/排除名单请在目标群内操作。\n此处配置全局默认阈值/文案/延迟/at上限。");
+        }
+        summary.setText(sb.toString());
+        root.addView(summary);
+        _rpSpacer(root, ctx, 10 * dp);
+
+        // ===== 入口按钮 =====
+        if (groupId != null) {
+            // 群上下文: 全部入口。
+            android.widget.Button bBasic = _rpBtn(ctx, "📌 基础开关", "#5CB6FF");
+            bBasic.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageBasic(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+            });
+            root.addView(bBasic);
+            _rpSpacer(root, ctx, 6 * dp);
+        }
+        android.widget.Button bNormal = _rpBtn(ctx, "🧧 普通档表", "#5CB6FF");
+        bNormal.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageNormalTiers(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+        });
+        root.addView(bNormal);
+        _rpSpacer(root, ctx, 6 * dp);
+
+        if (groupId != null) {
+            android.widget.Button bCustom = _rpBtn(ctx, "🎯 定制包", "#5CB6FF");
+            bCustom.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageCustom(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+            });
+            root.addView(bCustom);
+            _rpSpacer(root, ctx, 6 * dp);
+        }
+
+        android.widget.Button bDelay = _rpBtn(ctx, "⏱️ 延迟 & @上限", "#5CB6FF");
+        bDelay.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageDelay(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+        });
+        root.addView(bDelay);
+        _rpSpacer(root, ctx, 6 * dp);
+
+        if (groupId != null) {
+            android.widget.Button bExcl = _rpBtn(ctx, "🚫 排除名单", "#5CB6FF");
+            bExcl.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageExclude(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+            });
+            root.addView(bExcl);
+            _rpSpacer(root, ctx, 6 * dp);
+        }
+
+        // v1.11.0 §25: 伸手党治理子页 (仅群上下文)。
+        if (groupId != null) {
+            android.widget.Button bFree = _rpBtn(ctx, "🖐 伸手党治理", "#5CB6FF");
+            bFree.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageFreeloader(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+            });
+            root.addView(bFree);
+            _rpSpacer(root, ctx, 6 * dp);
+        }
+
+        // v1.9.0 §24: 转发对象子页 (选好友/群 + 设置后通知)。导出/每日定时均沿用 cfgExportTarget(), 此处可改目标。
+        android.widget.Button bForward = _rpBtn(ctx, "📮 转发对象", "#5CB6FF");
+        bForward.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) { try { if (menuHolder[0] != null) menuHolder[0].dismiss(); } catch (Throwable td) {} try { showPageForward(groupId); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+        });
+        root.addView(bForward);
+        _rpSpacer(root, ctx, 6 * dp);
+
+        // 导出: 直接动作 (不进子页, §23.1)。
+        android.widget.Button bExport = _rpBtn(ctx, "📤 导出今日 → 私聊", "#3FB27F");
+        bExport.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) {
+                try { rpExportToday(); } catch (Throwable t) { try { toast("❌ 导出失败: " + t); } catch (Throwable t2) {} }
+            }
+        });
+        root.addView(bExport);
+
+        android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+        sv.addView(root);
+        sv.setBackground(_rpRound("#0F1115", 0));
+        menuHolder[0] = new android.app.AlertDialog.Builder(ctx)
+            .setView(sv)
+            .setNegativeButton("关闭", null)
+            .create();
+        menuHolder[0].show();
+    } catch (Throwable t) { try { toast("打开设置失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 子页: 📌 基础开关 (线上 @3441-3478 逐字) -----
+void showPageBasic(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    try {
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+
+        android.widget.TextView gid = new android.widget.TextView(ctx);
+        gid.setText("群: " + groupId);
+        gid.setTextColor(_rpC("#7C828E"));
+        gid.setTextSize(11);
+        root.addView(gid);
+
+        // 本群启用开关 (即时生效, 沿用 rpEnableGroup/rpDisableGroup)。
+        final boolean[] enabledHolder = new boolean[]{ rpIsGroupEnabled(groupId) };
+        final android.widget.Button toggleBtn = _rpBtn(ctx, enabledHolder[0] ? "🔕 关闭本群红包统计" : "✅ 开启本群红包统计", enabledHolder[0] ? "#FF6B6B" : "#5CB6FF");
+        toggleBtn.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) {
+                if (enabledHolder[0]) { rpDisableGroup(groupId); enabledHolder[0] = false; toggleBtn.setText("✅ 开启本群红包统计"); toggleBtn.setBackground(_rpRound("#5CB6FF", 24)); toast("已关闭本群"); }
+                else { rpEnableGroup(groupId); enabledHolder[0] = true; toggleBtn.setText("🔕 关闭本群红包统计"); toggleBtn.setBackground(_rpRound("#FF6B6B", 24)); toast("已开启本群"); }
+            }
+        });
+        root.addView(toggleBtn);
+        _rpSpacer(root, ctx, 6 * dp);
+
+        // v1.9.2 §24: 每日定时开关 + 推送时间已迁至「📮 转发对象」子页, 本页只留「本群启用」。
+
+        android.widget.TextView hint = new android.widget.TextView(ctx);
+        hint.setText("提示: 开关点击即时生效 (无需保存)。每日定时开关/推送时间见「📮 转发对象」子页。");
+        hint.setTextColor(_rpC("#7C828E"));
+        hint.setTextSize(11);
+        root.addView(hint);
+
+        // 本页无延迟写 key (toggle 即时生效), onSave 传 null → 「保存」等同返回主菜单。
+        _rpShowSubPage(ctx, groupId, "📌 基础开关", root, null);
+    } catch (Throwable t) { try { toast("打开基础开关失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 子页: 🧧 普通档表 (线上 @3480-3551 逐字) -----
+void showPageNormalTiers(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    try {
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+
+        if (groupId != null) {
+            // 本群档表: 单个多行 EditText (每行 "阈值 动作"), 保存复用 rpParseTierBox 逐行解析 + setTiers。
+            _rpLabel(root, ctx, "本群档位 (1-10 行, 每行: 阈值 动作; 阈值正整数递增)");
+            StringBuilder pre = new StringBuilder();
+            List _tt = getTiers(groupId);
+            for (int i = 0; i < _tt.size(); i++) {
+                Object[] te = (Object[]) _tt.get(i);
+                if (i > 0) pre.append("\n");
+                pre.append(((Integer) te[0]).intValue()).append(" ").append((String) te[1]);
+            }
+            final android.widget.EditText tierBox = _rpEdit(ctx, pre.toString(), false);
+            tierBox.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+            tierBox.setMinLines(2); tierBox.setMaxLines(11); tierBox.setSingleLine(false);
+            root.addView(tierBox);
+
+            final String fGroupId = groupId;
+            Runnable onSave = new Runnable() {
+                public void run() {
+                    try {
+                        // 复用 rpParseTierBox: 全无效不保存(不破坏原表), 部分有效存有效行。只写本群档表键。
+                        Object[] res = rpParseTierBox(tierBox.getText().toString());
+                        List parsed = (List) res[0];
+                        StringBuilder errs = (StringBuilder) res[1];
+                        int errCount = ((Integer) res[2]).intValue();
+                        boolean overflow = ((Boolean) res[3]).booleanValue();
+                        if (parsed.isEmpty()) {
+                            toast("❌ 档位为空或全部无效, 未保存档位" + (errs.length() > 0 ? ": " + errs.toString() : ""));
+                        } else {
+                            setTiers(fGroupId, parsed);
+                            if (errCount > 0 || overflow) toast("⚠️ 部分档位行有误已忽略 (" + errs.toString() + "), 已存 " + parsed.size() + " 档");
+                            else toast("✅ 已存 " + parsed.size() + " 档");
+                        }
+                    } catch (Throwable t) { try { toast("档表保存失败: " + t); } catch (Throwable t2) {} }
+                }
+            };
+            _rpShowSubPage(ctx, groupId, "🧧 普通档表", root, onSave);
+        } else {
+            // 全局默认三档 (cfgT1/2/3 + cfgTxt1/2/3), 作为未配置群的回退源。保存只写 RP_K_T*/RP_K_TXT*。
+            _rpLabel(root, ctx, "全局默认三档阈值 (元, 严格大于; 仅作未配置群的回退)");
+            final android.widget.EditText e1 = _rpEdit(ctx, String.valueOf(cfgT1()), true); root.addView(e1);
+            _rpSpacer(root, ctx, 4 * dp);
+            final android.widget.EditText e2 = _rpEdit(ctx, String.valueOf(cfgT2()), true); root.addView(e2);
+            _rpSpacer(root, ctx, 4 * dp);
+            final android.widget.EditText e3 = _rpEdit(ctx, String.valueOf(cfgT3()), true); root.addView(e3);
+            _rpLabel(root, ctx, "全局默认三档动作核心词 (原样, 周围措辞会自动随机)");
+            final android.widget.EditText t1 = _rpEdit(ctx, cfgTxt1(), false); root.addView(t1);
+            _rpSpacer(root, ctx, 4 * dp);
+            final android.widget.EditText t2 = _rpEdit(ctx, cfgTxt2(), false); root.addView(t2);
+            _rpSpacer(root, ctx, 4 * dp);
+            final android.widget.EditText t3 = _rpEdit(ctx, cfgTxt3(), false); root.addView(t3);
+
+            Runnable onSave = new Runnable() {
+                public void run() {
+                    try {
+                        saveIntField(RP_K_T1, e1); saveIntField(RP_K_T2, e2); saveIntField(RP_K_T3, e3);
+                        saveStrField(RP_K_TXT1, t1); saveStrField(RP_K_TXT2, t2); saveStrField(RP_K_TXT3, t3);
+                        toast("✅ 全局默认档已保存");
+                    } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
+                }
+            };
+            _rpShowSubPage(ctx, groupId, "🧧 全局默认档", root, onSave);
+        }
+    } catch (Throwable t) { try { toast("打开普通档表失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 子页: 🎯 定制包 (线上 @3553-3619 逐字) -----
+void showPageCustom(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    if (groupId == null) { try { toast("全局面板无定制包配置 (需群上下文)"); } catch (Throwable t) {} return; }
+    try {
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+
+        _rpLabel(root, ctx, "—— 定制包 (祝福语包含关键字时改用定制档表) ——");
+        // ☑ 是否开启定制 (仅此处可改 rp_custom_on)。
+        final boolean[] customOnHolder = new boolean[]{ isCustomOn(groupId) };
+        final android.widget.Button customToggle = _rpBtn(ctx, customOnHolder[0] ? "✅ 已开启定制 (点击关闭)" : "🔴 未开启定制 (点击开启)", customOnHolder[0] ? "#FF6B6B" : "#5CB6FF");
+        customToggle.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) {
+                if (customOnHolder[0]) { customOnHolder[0] = false; customToggle.setText("🔴 未开启定制 (点击开启)"); customToggle.setBackground(_rpRound("#5CB6FF", 24)); }
+                else { customOnHolder[0] = true; customToggle.setText("✅ 已开启定制 (点击关闭)"); customToggle.setBackground(_rpRound("#FF6B6B", 24)); }
+            }
+        });
+        root.addView(customToggle);
+        // 📝 定制关键字 (rp_custom_kw)。
+        _rpLabel(root, ctx, "定制关键字 (包含匹配祝福语; 空=不启用)");
+        final android.widget.EditText customKwBox = _rpEdit(ctx, getCustomKw(groupId), false); root.addView(customKwBox);
+        // 📋 定制档表 (rp_tiers_custom; 每行 阈值 动作; 复用普通档表逐行解析)。
+        _rpLabel(root, ctx, "定制档位 (1-10 行, 每行: 阈值 动作; 未配置则回退普通档)");
+        StringBuilder cpre = new StringBuilder();
+        List _ctt = getTiersByType(groupId, true);
+        for (int i = 0; i < _ctt.size(); i++) {
+            Object[] cte = (Object[]) _ctt.get(i);
+            if (i > 0) cpre.append("\n");
+            cpre.append(((Integer) cte[0]).intValue()).append(" ").append((String) cte[1]);
+        }
+        final android.widget.EditText customTierBox = _rpEdit(ctx, cpre.toString(), false);
+        customTierBox.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        customTierBox.setMinLines(2); customTierBox.setMaxLines(11); customTierBox.setSingleLine(false);
+        root.addView(customTierBox);
+        // v1.7.1 §22.6: 定制群规前缀 (rp_custom_rule_prefix_<gid>)。
+        _rpLabel(root, ctx, "定制群规前缀 (定制包第一条群规文本; 空=默认「" + DEF_CUSTOM_RULE_PREFIX + "」)");
+        final android.widget.EditText customRulePrefixBox = _rpEdit(ctx, cfgCustomRulePrefix(groupId), false); root.addView(customRulePrefixBox);
+
+        final String fGroupId = groupId;
+        Runnable onSave = new Runnable() {
+            public void run() {
+                try {
+                    // 只写定制相关键 (rp_custom_on / rp_custom_kw / rp_custom_rule_prefix / rp_tiers_custom)。
+                    setCustomOn(fGroupId, customOnHolder[0]);
+                    setCustomKw(fGroupId, customKwBox.getText().toString());
+                    HOST.putString(customRulePrefixKey(fGroupId), customRulePrefixBox.getText().toString().trim());
+                    // 定制档表: 复用 rpParseTierBox; 全无效不保存(不破坏原表), 部分有效存有效行。
+                    Object[] cres = rpParseTierBox(customTierBox.getText().toString());
+                    List cparsed = (List) cres[0];
+                    StringBuilder cerrs = (StringBuilder) cres[1];
+                    int cerrCount = ((Integer) cres[2]).intValue();
+                    boolean coverflow = ((Boolean) cres[3]).booleanValue();
+                    if (cparsed.isEmpty()) {
+                        toast("⚠️ 定制档位为空或全部无效, 未保存定制档位 (开关/关键字/前缀已存)" + (cerrs.length() > 0 ? ": " + cerrs.toString() : ""));
+                    } else {
+                        setTiersToKey(rpTiersCustomKey(fGroupId), cparsed);
+                        if (cerrCount > 0 || coverflow) toast("⚠️ 部分定制档位行有误已忽略 (" + cerrs.toString() + "), 已存 " + cparsed.size() + " 定制档");
+                        else toast("✅ 定制配置已保存");
+                    }
+                } catch (Throwable t) { try { toast("定制保存失败: " + t); } catch (Throwable t2) {} }
+            }
+        };
+        _rpShowSubPage(ctx, groupId, "🎯 定制包", root, onSave);
+    } catch (Throwable t) { try { toast("打开定制包失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 子页: ⏱️ 延迟 & @上限 (线上 @3621-3651 逐字) -----
+void showPageDelay(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    try {
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+
+        _rpLabel(root, ctx, "首次延迟 / 重试1 / 重试2 / 重试3 (秒)");
+        final android.widget.EditText d0 = _rpEdit(ctx, String.valueOf(cfgDelay()), true); root.addView(d0);
+        _rpSpacer(root, ctx, 4 * dp);
+        final android.widget.EditText d1 = _rpEdit(ctx, String.valueOf(cfgRetry1()), true); root.addView(d1);
+        _rpSpacer(root, ctx, 4 * dp);
+        final android.widget.EditText d2 = _rpEdit(ctx, String.valueOf(cfgRetry2()), true); root.addView(d2);
+        _rpSpacer(root, ctx, 4 * dp);
+        final android.widget.EditText d3 = _rpEdit(ctx, String.valueOf(cfgRetry3()), true); root.addView(d3);   // v1.10.0 §4: 重试3 (末档, 默认1小时)
+        _rpLabel(root, ctx, "at 上限 (达标总人数超此值改发无@群规消息)");
+        final android.widget.EditText al = _rpEdit(ctx, String.valueOf(cfgAtLimit()), true); root.addView(al);
+
+        Runnable onSave = new Runnable() {
+            public void run() {
+                try {
+                    saveLongField(RP_K_DELAY, d0); saveLongField(RP_K_RETRY1, d1); saveLongField(RP_K_RETRY2, d2); saveLongField(RP_K_RETRY3, d3);
+                    saveIntField(K_AT_LIMIT, al);
+                    toast("✅ 延迟 & @上限已保存");
+                } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
+            }
+        };
+        _rpShowSubPage(ctx, groupId, "⏱️ 延迟 & @上限", root, onSave);
+    } catch (Throwable t) { try { toast("打开延迟设置失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 子页: 🖐 伸手党治理 (线上 @3653-3701 逐字) -----
+void showPageFreeloader(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    if (groupId == null) { try { toast("伸手党治理需在目标群内设置"); } catch (Throwable t) {} return; }
+    try {
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+
+        _rpLabel(root, ctx, "—— 伸手党治理 (抢到前N分钟未发言→发群管警告, 累计可触发踢人) ——");
+        // 开关 toggle (保存时写 rp_freeloader_on)。
+        final boolean[] onHolder = new boolean[]{ cfgFreeloaderOn(groupId) };
+        final android.widget.Button freeToggle = _rpBtn(ctx, onHolder[0] ? "✅ 已开启 (点击关闭)" : "🔴 未开启 (点击开启)", onHolder[0] ? "#FF6B6B" : "#5CB6FF");
+        freeToggle.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) {
+                if (onHolder[0]) { onHolder[0] = false; freeToggle.setText("🔴 未开启 (点击开启)"); freeToggle.setBackground(_rpRound("#5CB6FF", 24)); }
+                else { onHolder[0] = true; freeToggle.setText("✅ 已开启 (点击关闭)"); freeToggle.setBackground(_rpRound("#FF6B6B", 24)); }
+            }
+        });
+        root.addView(freeToggle);
+        // 窗口 EditText (分钟, 1-1440)。
+        _rpLabel(root, ctx, "判定窗口 (分钟, 1-1440; 默认30)");
+        final android.widget.EditText winBox = _rpEdit(ctx, String.valueOf(cfgFreeloaderWin(groupId)), true); root.addView(winBox);
+
+        android.widget.TextView hint = new android.widget.TextView(ctx);
+        hint.setText("说明: 开启后该窗口时长内全员豁免(数据预热); 之后抢到红包者若抢前该窗口内未在本群发言 → 自动发 [警告] 命令交群管执行。排除名单内豁免。只发命令不直接踢人。");
+        hint.setTextColor(_rpC("#7C828E"));
+        hint.setTextSize(11);
+        root.addView(hint);
+
+        final String fGroupId = groupId;
+        Runnable onSave = new Runnable() {
+            public void run() {
+                try {
+                    boolean wasOn = cfgFreeloaderOn(fGroupId);   // v1.11.3 §25.9: 仅 OFF→ON 写 since, 不重置宽限
+                    HOST.putString(RP_K_FREELOADER_ON_PREFIX + fGroupId, onHolder[0] ? "1" : "");
+                    if (onHolder[0] && !wasOn) HOST.putString(K_FREELOADER_SINCE_PREFIX + normGroupId(fGroupId), String.valueOf(System.currentTimeMillis()));   // v1.11.4: key 经 normGroupId 与读一致
+                    // 窗口校验 1-1440, 越界/非法不写 (保留原值)。
+                    String wv = winBox.getText().toString().trim();
+                    boolean winOk = false;
+                    try { int n = Integer.parseInt(wv); if (n >= 1 && n <= 1440) { HOST.putString(RP_K_FREELOADER_WIN_PREFIX + fGroupId, String.valueOf(n)); winOk = true; } } catch (Throwable t) {}
+                    if (winOk) toast("✅ 伸手党治理已保存 (" + (onHolder[0] ? "开" : "关") + ", 窗口" + cfgFreeloaderWin(fGroupId) + "分钟)");
+                    else toast("⚠️ 开关已存; 窗口需 1-1440 整数, 未改 (当前" + cfgFreeloaderWin(fGroupId) + "分钟)");
+                } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
+            }
+        };
+        _rpShowSubPage(ctx, groupId, "🖐 伸手党治理", root, onSave);
+    } catch (Throwable t) { try { toast("打开伸手党治理失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 子页: 🚫 排除名单 (线上 @3703-3725 逐字) -----
+void showPageExclude(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    if (groupId == null) { try { toast("全局面板无排除名单 (需群上下文)"); } catch (Throwable t) {} return; }
+    try {
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+        _rpLabel(root, ctx, "红包提醒排除名单 (此名单的人永不被 @ / 不计入上限)");
+        final android.widget.LinearLayout exclBox = new android.widget.LinearLayout(ctx);
+        exclBox.setOrientation(android.widget.LinearLayout.VERTICAL);
+        root.addView(exclBox);
+        rpRebuildExcludeRows(ctx, exclBox, groupId);   // 沿用现有逻辑/移除按钮 (即时刷新, 合规无遍历)
+
+        android.widget.TextView hint = new android.widget.TextView(ctx);
+        hint.setText("提示: 在目标群内用 bot 账号 @某人 发『红包排除』可加入。移除点击即时生效。");
+        hint.setTextColor(_rpC("#7C828E"));
+        hint.setTextSize(11);
+        root.addView(hint);
+
+        // 排除名单移除即时生效, 无延迟写 key, onSave 传 null → 「保存」等同返回主菜单。
+        _rpShowSubPage(ctx, groupId, "🚫 排除名单", root, null);
+    } catch (Throwable t) { try { toast("打开排除名单失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 子页: 📮 转发对象 (线上 @3731-3831 逐字) -----
+void showPageForward(final String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { try { toast("无法获取 Activity"); } catch (Throwable t) {} return; }
+    try {
+        android.widget.LinearLayout root = _rpPageRoot(ctx);
+
+        final boolean hasGroup = (normGroupId(groupId).length() > 0);
+        // 当前目标 (§24.2 顶部): 显示【当前群】的转发对象 (按群, 未设回退全局默认)。无群上下文则提示需在群内设置。
+        android.widget.TextView cur = new android.widget.TextView(ctx);
+        if (hasGroup) {
+            String curT = cfgExportTargetFor(groupId);
+            String curN = cfgExportTargetNameFor(groupId);
+            String curTail = (curT != null && curT.length() >= 4) ? curT.substring(curT.length() - 4) : curT;
+            cur.setText("本群转发对象: " + ((curN != null && !curN.isEmpty()) ? curN : "(未命名)")
+                + (rpTargetIsGroup(curT) ? "（群）" : "（好友）") + " 尾4: " + curTail);
+        } else {
+            cur.setText("⚠️ 无群上下文, 请在群内打开本设置以设置该群转发对象");
+        }
+        cur.setTextColor(_rpC("#E8E9EC"));
+        cur.setTextSize(13);
+        root.addView(cur);
+        _rpLabel(root, ctx, "（本群每日定时/手动导出都发到此对象; 未设则回退全局默认）");
+
+        // 选好友 / 选群 按钮。
+        final android.widget.Button bFriend = _rpBtn(ctx, "👤 选好友", "#5CB6FF");
+        bFriend.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) { try { rpPickTarget(ctx, groupId, false); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+        });
+        root.addView(bFriend);
+        _rpSpacer(root, ctx, 6);
+
+        final android.widget.Button bGroup = _rpBtn(ctx, "👥 选群", "#5CB6FF");
+        bGroup.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) { try { rpPickTarget(ctx, groupId, true); } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} } }
+        });
+        root.addView(bGroup);
+
+        // 手动输入兜底 (§24.2)。
+        _rpLabel(root, ctx, "手动输入 (列表找不到时): 填 wxid 或 xxx@chatroom");
+        final android.widget.EditText manualBox = _rpEdit(ctx, "", false);
+        root.addView(manualBox);
+        final android.widget.Button bSaveManual = _rpBtn(ctx, "💾 保存手填", "#3FB27F");
+        bSaveManual.setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) {
+                try {
+                    String t = manualBox.getText().toString().trim();
+                    if (t.isEmpty()) { try { toast("请输入 wxid 或 xxx@chatroom"); } catch (Throwable t2) {} return; }
+                    rpApplyForwardTarget(groupId, t, t);   // 手填: 显示名同 target, 作用当前群
+                } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
+            }
+        });
+        root.addView(bSaveManual);
+
+        // v1.9.2 §20/§24: —— 每日定时 (从基础开关页迁来) ——
+        _rpLabel(root, ctx, "—— 每日定时统计 ——");
+
+        // 📅 本群每日定时开关 (即时生效, 独立于红包统计开关; 沿用 enable/disableDailyGroup)。
+        if (hasGroup) {
+            final boolean[] dailyHolder = new boolean[]{ isDailyEnabled(groupId) };
+            final android.widget.Button dailyBtn = _rpBtn(ctx, dailyHolder[0] ? "✅ 已开启每日定时 (点击关闭)" : "🔴 未开启每日定时 (点击开启)", dailyHolder[0] ? "#FF6B6B" : "#5CB6FF");
+            dailyBtn.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    try {
+                        if (dailyHolder[0]) { disableDailyGroup(groupId); dailyHolder[0] = false; dailyBtn.setText("🔴 未开启每日定时 (点击开启)"); dailyBtn.setBackground(_rpRound("#5CB6FF", 24)); toast("已关闭本群每日定时"); }
+                        else { enableDailyGroup(groupId); dailyHolder[0] = true; dailyBtn.setText("✅ 已开启每日定时 (点击关闭)"); dailyBtn.setBackground(_rpRound("#FF6B6B", 24)); toast("已开启本群每日定时"); }
+                        try { showPageForward(groupId); } catch (Throwable t) {}   // 即时写后刷新本页
+                    } catch (Throwable t) { try { toast("切换失败: " + t); } catch (Throwable t2) {} }
+                }
+            });
+            root.addView(dailyBtn);
+        } else {
+            android.widget.TextView dn = new android.widget.TextView(ctx);
+            dn.setText("⚠️ 每日定时开关需在群内设置 (当前无群上下文)");
+            dn.setTextColor(_rpC("#7C828E"));
+            dn.setTextSize(12);
+            root.addView(dn);
+        }
+
+        // ⏰ 每日推送时间 (全局, 影响所有群; 沿用 K_DAILY_HOUR/cfgDailyHour, 0-23 夹取)。
+        _rpLabel(root, ctx, "⏰ 每日推送时间 (小时, 0-23; 全局, 影响所有群)");
+        final android.widget.EditText hourBox = _rpEdit(ctx, String.valueOf(cfgDailyHour()), true);
+        root.addView(hourBox);
+
+        // 「💾 保存」校验小时 0-23 后写 K_DAILY_HOUR (全局); 定时开关已即时生效, 不在此写。
+        Runnable onSave = new Runnable() {
+            public void run() {
+                try {
+                    String s = hourBox.getText().toString().trim();
+                    if (s.isEmpty()) return;
+                    int h;
+                    try { h = Integer.parseInt(s); } catch (Throwable t) { try { toast("❌ 推送时间需为 0-23 的整数"); } catch (Throwable t2) {} return; }
+                    if (h < 0 || h > 23) { try { toast("❌ 推送时间需在 0-23 之间"); } catch (Throwable t2) {} return; }
+                    HOST.putString(K_DAILY_HOUR_KEY, String.valueOf(h));
+                    try { toast("✅ 每日推送时间已设为 " + h + " 点 (全局)"); } catch (Throwable t2) {}
+                } catch (Throwable t) { try { toast("保存失败: " + t); } catch (Throwable t2) {} }
+            }
+        };
+        _rpShowSubPage(ctx, groupId, "📮 转发对象", root, onSave);
+    } catch (Throwable t) { try { toast("打开转发对象失败: " + t); } catch (Throwable t2) {} }
+}
+
+// 后台线程加载好友/群 list (缓存), 完成后主线程弹单选 AlertDialog (线上 rpPickTarget @3833-3900 逐字)。
+void rpPickTarget(final Activity ctx, final String groupId, final boolean isGroup) {
+    try {
+        try { toast("正在加载…"); } catch (Throwable t) {}
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    final java.util.List list;
+                    if (isGroup) {
+                        if (sCachedGroupList == null) { try { sCachedGroupList = getGroupList(); } catch (Throwable t) { sCachedGroupList = null; } }
+                        list = sCachedGroupList;
+                    } else {
+                        if (sCachedFriendList == null) { try { sCachedFriendList = getFriendList(); } catch (Throwable t) { sCachedFriendList = null; } }
+                        list = sCachedFriendList;
+                    }
+                    // 主线程构建/弹 Dialog (§7 ANR: 只 setItems 单选, 无 UI 遍历)。
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        public void run() {
+                            try {
+                                if (list == null || list.isEmpty()) { try { toast("未获取到列表"); } catch (Throwable t) {} return; }
+                                final int n = list.size();
+                                final String[] ids = new String[n];
+                                final String[] names = new String[n];
+                                final String[] items = new String[n];
+                                for (int i = 0; i < n; i++) {
+                                    Object info = list.get(i);
+                                    String id = ""; String nm = "";
+                                    if (isGroup) {
+                                        try { Object r = info.getClass().getMethod("getRoomId").invoke(info); if (r != null) id = r.toString(); } catch (Throwable t) {}
+                                        try { Object nn = info.getClass().getMethod("getName").invoke(info); if (nn != null) nm = nn.toString(); } catch (Throwable t) {}
+                                        if (nm == null || nm.trim().isEmpty()) nm = id;
+                                        items[i] = "🏠 " + nm + "\nID:" + id;
+                                    } else {
+                                        try { Object w = info.getClass().getMethod("getWxid").invoke(info); if (w != null) id = w.toString(); } catch (Throwable t) {}
+                                        String rmk = null; String nick = null;
+                                        try { Object r = info.getClass().getMethod("getRemark").invoke(info); if (r != null) rmk = r.toString().trim(); } catch (Throwable t) {}
+                                        try { Object nn = info.getClass().getMethod("getNickname").invoke(info); if (nn != null) nick = nn.toString().trim(); } catch (Throwable t) {}
+                                        if (rmk != null && !rmk.isEmpty()) nm = rmk;
+                                        else if (nick != null && !nick.isEmpty()) nm = nick;
+                                        else nm = id;
+                                        items[i] = "👤 " + nm + "\nID:" + id;
+                                    }
+                                    ids[i] = id; names[i] = nm;
+                                }
+                                new android.app.AlertDialog.Builder(ctx)
+                                    .setTitle(isGroup ? "👥 选群" : "👤 选好友")
+                                    .setItems(items, new android.content.DialogInterface.OnClickListener() {
+                                        public void onClick(android.content.DialogInterface d, int which) {
+                                            try {
+                                                if (which < 0 || which >= ids.length) return;
+                                                rpApplyForwardTarget(groupId, ids[which], names[which]);
+                                            } catch (Throwable t) { try { toast("选择失败: " + t); } catch (Throwable t2) {} }
+                                        }
+                                    })
+                                    .setNegativeButton("取消", null)
+                                    .create()
+                                    .show();
+                            } catch (Throwable t) { try { toast("弹窗失败: " + t); } catch (Throwable t2) {} }
+                        }
+                    });
+                } catch (Throwable t) {
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        public void run() { try { toast("加载失败"); } catch (Throwable t2) {} }
+                    });
+                }
+            }
+        }).start();
+    } catch (Throwable t) { try { toast("加载失败: " + t); } catch (Throwable t2) {} }
+}
+
+// 写【按群】目标 + 显示名 → toast → sendForwardNotice (线上 rpApplyForwardTarget @3904-3917 逐字)。
+void rpApplyForwardTarget(String groupId, String target, String name) {
+    try {
+        if (target == null) return;
+        final String t = target.trim();
+        if (t.isEmpty()) { try { toast("目标为空"); } catch (Throwable t2) {} return; }
+        String g = normGroupId(groupId);
+        if (g.isEmpty()) { try { toast("请在群内设置转发对象"); } catch (Throwable t2) {} return; }
+        String nm = (name == null) ? "" : name.trim();
+        try { HOST.putString(RP_K_EXPORT_TARGET + "_" + g, t); } catch (Throwable e) {}
+        try { HOST.putString(RP_K_EXPORT_TARGET_NAME + "_" + g, nm); } catch (Throwable e) {}
+        try { toast("✅ 本群转发对象已设为: " + (nm.isEmpty() ? t : nm)); } catch (Throwable e) {}
+        sendForwardNotice(g, t);
+    } catch (Throwable t) { try { toast("设置失败: " + t); } catch (Throwable t2) {} }
+}
+
+// 设置后给目标发一条通知 (线上 sendForwardNotice @3921-3937 逐字; sendText→HOST.sendText)。
+void sendForwardNotice(final String groupId, final String target) {
+    try {
+        if (target == null || target.trim().isEmpty()) return;
+        int hour = cfgDailyHour();
+        String gn = null;
+        try { gn = rpGroupName(groupId); } catch (Throwable t) { gn = null; }
+        if (gn == null || gn.trim().isEmpty()) gn = (groupId == null) ? "" : groupId;
+
+        StringBuilder msg = new StringBuilder();
+        msg.append("✅ 本群「").append(gn).append("」红包统计转发已开启到这里\n");
+        msg.append("每日 ").append(hour).append(":00 推送过去24小时统计\n");
+        msg.append("范围: ").append(hour).append(":00 ~ 次日").append(hour).append(":00\n");
+        msg.append("(可在该群「红包统计设置 → 转发对象」调整)");
+        final String text = msg.toString();
+        try { HOST.sendText(target, text); } catch (Throwable t) { try { toast("通知发送失败 (目标已保存)"); } catch (Throwable t2) {} }
+    } catch (Throwable t) { try { toast("通知发送失败: " + t); } catch (Throwable t2) {} }
+}
+
+// 重建排除名单行 (线上 rpRebuildExcludeRows @3940-4008 逐字)。移除走 removeExclude (redpacket_qualify.bsh)。
+void rpRebuildExcludeRows(final Activity ctx, final android.widget.LinearLayout box, final String groupId) {
+    try {
+        box.removeAllViews();
+        int dp = (int) ctx.getResources().getDisplayMetrics().density;
+        List l = getExcludeList(groupId);
+        if (l == null || l.isEmpty()) {
+            android.widget.TextView empty = new android.widget.TextView(ctx);
+            empty.setText("(本群暂无排除名单)");
+            empty.setTextColor(_rpC("#7C828E"));
+            empty.setTextSize(12);
+            empty.setPadding(0, 4 * dp, 0, 4 * dp);
+            box.addView(empty);
+            return;
+        }
+        for (int i = 0; i < l.size(); i++) {
+            final String wxid = ((String) l.get(i)).trim();
+            if (wxid.isEmpty()) continue;
+            // v1.8.1: 用 rpSenderName(群名片→微信昵称→wxid, 与统计同口径) 取名字, 显示「昵称（…尾4）」。
+            String nm = null;
+            try { nm = rpSenderName(wxid, groupId); } catch (Throwable t) { nm = null; }
+            String tail = (wxid.length() > 4) ? wxid.substring(wxid.length() - 4) : wxid;
+            String nick;
+            if (nm != null && !nm.isEmpty() && !nm.equals(wxid)) {
+                nick = nm + "（…" + tail + "）";   // 有昵称: 昵称 + wxid 尾4 便于区分
+            } else {
+                nick = (wxid.length() > 16) ? (wxid.substring(0, 16) + "…") : wxid;   // 拿不到昵称才显示 wxid
+            }
+
+            android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+            row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            row.setPadding(0, 3 * dp, 0, 3 * dp);
+            row.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
+
+            android.widget.TextView name = new android.widget.TextView(ctx);
+            name.setText(nick);
+            name.setTextColor(_rpC("#E8E9EC"));
+            name.setTextSize(13);
+            android.widget.LinearLayout.LayoutParams nlp = new android.widget.LinearLayout.LayoutParams(
+                0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            nlp.gravity = android.view.Gravity.CENTER_VERTICAL;
+            name.setLayoutParams(nlp);
+            row.addView(name);
+
+            android.widget.Button rm = new android.widget.Button(ctx);
+            rm.setText("移除");
+            rm.setTextColor(_rpC("#E8E9EC"));
+            rm.setBackground(_rpRound("#FF6B6B", 18));
+            rm.setAllCaps(false);
+            rm.setTextSize(12);
+            rm.setPadding(16 * dp, 6 * dp, 16 * dp, 6 * dp);
+            rm.setOnClickListener(new android.view.View.OnClickListener() {
+                public void onClick(android.view.View v) {
+                    try {
+                        java.util.List one = new java.util.ArrayList(); one.add(wxid);
+                        removeExclude(groupId, one);
+                        toast("✅ 已移出排除名单");
+                        rpRebuildExcludeRows(ctx, box, groupId);   // 即时刷新
+                    } catch (Throwable t) { try { toast("移除失败: " + t); } catch (Throwable t2) {} }
+                }
+            });
+            row.addView(rm);
+            box.addView(row);
+        }
+    } catch (Throwable t) {
+        try { hbBgLog("[RP] " + hbNow() + " rebuild-exclude-rows err: " + t); } catch (Throwable t2) {}
+    }
+}
+
+// UI 落库 helper (线上 @4010-4017 逐字; putString→HOST.putString)。
+void saveIntField(String key, android.widget.EditText e) {
+    try { String s = e.getText().toString().trim(); if (!s.isEmpty()) { Integer.parseInt(s); HOST.putString(key, s); } } catch (Throwable t) {}
+}
+void saveLongField(String key, android.widget.EditText e) {
+    try { String s = e.getText().toString().trim(); if (!s.isEmpty()) { Long.parseLong(s); HOST.putString(key, s); } } catch (Throwable t) {}
+}
+void saveStrField(String key, android.widget.EditText e) {
+    try { String s = e.getText().toString().trim(); if (!s.isEmpty()) HOST.putString(key, s); } catch (Throwable t) {}
 }

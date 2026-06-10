@@ -325,6 +325,31 @@ void rpDeliverReceivers(Object[] job, java.util.List receivers, boolean isCustom
 // 开了每日定时的群 (CSV)。读 K_DAILY_GROUPS。
 java.util.List getDailyGroups() { return parseCsv(HOST.getString(K_DAILY_GROUPS, "")); }
 
+// 每日定时开关读写 (UI「📮 转发对象」每日定时 toggle 用; 线上 @1078-1099 逐字)。
+//   键同源: 复用 getDailyGroups + 读侧同款 normGroupId; K_DAILY_GROUPS 已存在; putString→HOST.putString。
+boolean isDailyEnabled(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return false;
+    List l = getDailyGroups();
+    for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) return true;
+    return false;
+}
+void enableDailyGroup(String groupId) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty()) return;
+    List l = getDailyGroups();
+    for (int i = 0; i < l.size(); i++) if (g.equals(normGroupId((String) l.get(i)))) return;
+    l.add(g);
+    HOST.putString(K_DAILY_GROUPS, joinCsv(l));
+}
+void disableDailyGroup(String groupId) {
+    String g = normGroupId(groupId);
+    List l = getDailyGroups();
+    boolean changed = false;
+    for (int i = l.size() - 1; i >= 0; i--) if (g.equals(normGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
+    if (changed) HOST.putString(K_DAILY_GROUPS, joinCsv(l));
+}
+
 // 每日发送 (worker rpDailyCheck @181 调): 查 rp_record 中 ts∈[windowStart,windowEnd) 且 grp∈每日定时群, 按群一条多行, 按群路由转发目标。
 //   无记录 → 发一条全局心跳。整段后台线程 + try/catch 可降级。manual=true 时 header 标手动测试。
 //   ★合并适配: 窗口查询走 domain rpQueryWindow(STORAGE 端口, 线上 rawQuery ts范围+grp IN @2560 逐字), 组装走 domain rpBuildGroupedMsgs。
@@ -369,4 +394,50 @@ void rpDailySend(final long windowStart, final long windowEnd, final boolean man
             } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " daily-send thread err: " + t); }
         }
     }.start();
+}
+
+// ==================== 手动导出今日 → 私聊 (线上 rpExportToday @2438-2486) ====================
+// UI 主菜单「📤 导出今日 → 私聊」按钮直接触发 (UI 线程, 取数+发送各自后台/try-catch)。
+//   ★合并适配 (端口化, 行为零改): 线上 rpDb()/Cursor 取数 → domain rpQueryToday(date) (STORAGE 端口, 列序与 rpBuildGroupedMsgs 对齐);
+//   线上 sendText → HOST.sendText。一切可见行为/文案/脱敏日志/toast 文字与线上逐字一致。
+//   组装/发送结构镜像同文件 rpDailySend: rpBuildGroupedMsgs(rows, header) → 后台 Thread 按 cfgExportTargetFor(grp) 路由 → hbBgLog → toast。
+void rpExportToday() {
+    try {
+        String date = rpToday();
+
+        List rows = rpQueryToday(date);   // 线上 @2449 当日全部达标行 (ORDER BY grp,ts); STORAGE 端口取数
+
+        if (rows.isEmpty()) { try { toast("今日无红包统计"); } catch (Throwable t) {} return; }
+
+        // 头行前缀: 当天 MM-dd。
+        String mmdd = date;
+        try { mmdd = new java.text.SimpleDateFormat("MM-dd").format(new java.util.Date()); } catch (Throwable t) {}
+        String headerPrefix = "📊 红包统计 " + mmdd;
+        List msgs = rpBuildGroupedMsgs(rows, headerPrefix);   // v1.9.1: List<Object[]{grp, msg}>
+
+        final List fMsgs = msgs;
+        final int fRows = rows.size();
+        // 发消息放后台线程 (sendText 可能涉及 IO; UI 回调里别阻塞)。
+        // v1.9.1 §24.4: 每条按 cfgExportTargetFor(该群 grp) 发到该群自己的目标 (未设回退全局默认 → 旧行为不变)。
+        new Thread() {
+            public void run() {
+                try {
+                    for (int i = 0; i < fMsgs.size(); i++) {
+                        try {
+                            Object[] gm = (Object[]) fMsgs.get(i);
+                            String grp = (String) gm[0];
+                            String msg = (String) gm[1];
+                            HOST.sendText(cfgExportTargetFor(grp), msg);
+                        } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " export sendText err: " + t); }
+                    }
+                    // 嗅探日志 (脱敏): 只记实际发送条数 + 行数, 绝不打群名/昵称/内容/目标。
+                    hbBgLog("[RP] " + hbNow() + " export: sent " + fMsgs.size() + " msg (per-group routed) (rows=" + fRows + "). content NOT logged.");
+                } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " export thread err: " + t); }
+            }
+        }.start();
+        try { toast("📤 已导出 " + rows.size() + " 个红包 → 私聊 (按群发 " + msgs.size() + " 条)"); } catch (Throwable t) {}
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " export err: " + t);
+        try { toast("❌ 导出失败: " + t); } catch (Throwable t2) {}
+    }
 }

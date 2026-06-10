@@ -199,6 +199,57 @@ String rpTiersSummary(List tiers) {
     return sb.toString();
 }
 
+// ==================== 全局默认三档 cfg getter (线上 @488-493 逐字; cfgInt→rpCfgInt/cfgStr→rpCfgStr, K_*→RP_K_*) ====================
+int cfgT1() { return rpCfgInt(RP_K_T1, RP_DEF_T1); }
+int cfgT2() { return rpCfgInt(RP_K_T2, RP_DEF_T2); }
+int cfgT3() { return rpCfgInt(RP_K_T3, RP_DEF_T3); }
+String cfgTxt1() { return rpCfgStr(RP_K_TXT1, RP_DEF_TXT1); }
+String cfgTxt2() { return rpCfgStr(RP_K_TXT2, RP_DEF_TXT2); }
+String cfgTxt3() { return rpCfgStr(RP_K_TXT3, RP_DEF_TXT3); }
+
+// ==================== Dialog 多行档表解析 helper (线上 rpParseTierBox @783-811 / rpAppendErr @813-820 逐字) ====================
+// v1.7.0 §22.4: 普通/定制档表编辑器共用; 逐行校验 + 行号错误 + 满档截断。
+//   返回 Object[]{ List parsed, StringBuilder errs, Integer errCount, Boolean overflow }。逻辑与 v1.6.1 内联段逐字一致。
+//   依赖 RP_MAX_TIERS/sanitizeTierAction (本片已定义)。
+Object[] rpParseTierBox(String raw) {
+    List parsed = new java.util.ArrayList();
+    StringBuilder errs = new StringBuilder();
+    int errCount = 0;
+    int nonEmptyLineNo = 0;
+    boolean overflow = false;
+    if (raw == null) raw = "";
+    String[] lines = raw.split("\n");
+    for (int i = 0; i < lines.length; i++) {
+        String ln = lines[i].trim();
+        if (ln.isEmpty()) continue;
+        nonEmptyLineNo++;
+        if (parsed.size() >= RP_MAX_TIERS) { overflow = true; continue; }
+        int sp = ln.indexOf(' ');
+        if (sp < 0) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行格式错(缺动作)"); errCount++; continue; }
+        String ts = ln.substring(0, sp).trim();
+        String act = sanitizeTierAction(ln.substring(sp + 1));
+        int thr;
+        try { thr = Integer.parseInt(ts); } catch (Throwable t) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值非整数"); errCount++; continue; }
+        if (thr <= 0) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值需正整数"); errCount++; continue; }
+        if (act.isEmpty()) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行缺动作"); errCount++; continue; }
+        boolean dup = false;
+        for (int j = 0; j < parsed.size(); j++) { if (((Integer) ((Object[]) parsed.get(j))[0]).intValue() == thr) { dup = true; break; } }
+        if (dup) { rpAppendErr(errs, errCount, "第" + nonEmptyLineNo + "行阈值重复"); errCount++; continue; }
+        parsed.add(new Object[]{ Integer.valueOf(thr), act });
+    }
+    if (overflow) rpAppendErr(errs, errCount, "最多 " + RP_MAX_TIERS + " 档, 超出已截断");
+    return new Object[]{ parsed, errs, Integer.valueOf(errCount), Boolean.valueOf(overflow) };
+}
+
+// v1.6.1: Dialog 行解析错误收集 helper (前 5 条带分隔符追加, 简化调用点避免 BeanShell 深嵌套解析问题)。
+void rpAppendErr(StringBuilder errs, int curCount, String msg) {
+    try {
+        if (curCount >= 5) return;
+        if (curCount > 0) errs.append("; ");
+        errs.append(msg);
+    } catch (Throwable t) {}
+}
+
 // ---- 群规第一条 文本渲染 (纯逻辑, 线上 hbTierAndSend @3036-3045 逐字抽出)。----
 //   prefix = 群规前缀(普通 cfgRulePrefix / 定制 cfgCustomRulePrefix, 由调用方按类型传入, 本片不读该键不发送)。
 //   各档拼 "，过{阈值}元{动作}"。

@@ -89,6 +89,31 @@ boolean rpIsGroupEnabled(String groupId) {
     return false;
 }
 
+// ==================== RP 本群启用写 (UI「📌 基础开关」toggle 用; 线上 enableGroup @1009 / disableGroup @1020 逐字) ====================
+//   ★命名独立 rpEnableGroup/rpDisableGroup, 不与 GA enableGroup/disableGroup (commands.bsh 2参 leaf) 撞名 —— 与读侧 rpIsGroupEnabled 同款命名策略。
+//   ★键同源: 走 RP 自己的 RP_K_ENABLED + rpNormGroupId + 写后 rpLoadEnabledCache 即时失效 (线上 @1017/@1027 逐字), 不误用 GA enabled_groups。
+//   putString→HOST.putString; getEnabledGroups→rpGetEnabledGroups; normGroupId→rpNormGroupId(线上 RP normGroupId=trim 同源)。
+//   线上 enableGroup 的 §20 副作用 (开启统计时默认把该群加进每日定时) 逐字保留 (调 enableDailyGroup, redpacket_send.bsh)。
+void rpEnableGroup(String groupId) {
+    String g = rpNormGroupId(groupId);
+    if (g.isEmpty()) return;
+    java.util.List l = rpGetEnabledGroups();
+    boolean already = false;
+    for (int i = 0; i < l.size(); i++) if (g.equals(rpNormGroupId((String) l.get(i)))) { already = true; break; }
+    if (!already) { l.add(g); HOST.putString(RP_K_ENABLED, joinCsv(l)); }
+    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 开启后下一个红包立即按新状态判定
+    // v1.4.0 §20: 开启红包统计时默认把该群加进每日定时 (可单独关)。
+    try { enableDailyGroup(g); } catch (Throwable t) {}
+}
+void rpDisableGroup(String groupId) {
+    String g = rpNormGroupId(groupId);
+    java.util.List l = rpGetEnabledGroups();
+    boolean changed = false;
+    for (int i = l.size() - 1; i >= 0; i--) if (g.equals(rpNormGroupId((String) l.get(i)))) { l.remove(i); changed = true; }
+    if (changed) HOST.putString(RP_K_ENABLED, joinCsv(l));
+    rpLoadEnabledCache();   // v1.6.4 变更即时失效: 关闭后下一个红包立即不再处理该群
+}
+
 // ==================== 队列入队/读长 (线上 @1635/@1638 逐字) ====================
 // CUR_JOB 的去重 key (线上 curKey @1632)。CUR_JOB 为空返回 null。
 String rpCurKey() {

@@ -46,6 +46,23 @@ boolean isExcluded(String groupId, String wxid) {
     return false;
 }
 
+// 排除名单移除 (UI「🚫 排除名单」移除按钮用; 线上 removeExclude @1061-1072 逐字)。
+//   ★键同源: 复用读侧 rpExcludeKey(=K_EXCLUDE_PREFIX+normGroupId) + parseCsv/joinCsv, 不另起键名/规整。
+//   putString→HOST.putString。返回移除数量。
+int removeExclude(String groupId, List wxids) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty() || wxids == null || wxids.isEmpty()) return 0;
+    List l = getExcludeList(g);
+    int removed = 0;
+    for (int k = 0; k < wxids.size(); k++) {
+        String w = ((String) wxids.get(k)).trim();
+        if (w.isEmpty()) continue;
+        for (int i = l.size() - 1; i >= 0; i--) if (w.equals(((String) l.get(i)).trim())) { l.remove(i); removed++; }
+    }
+    if (removed > 0) HOST.putString(rpExcludeKey(g), joinCsv(l));
+    return removed;
+}
+
 // ==================== 定制包判定 (v1.7.0/v1.7.1, 线上 @568-619 逐字) ====================
 String rpCustomOnKey(String groupId) { return RPQ_K_CUSTOM_ON_PREFIX + normGroupId(groupId); }
 // 定制开关: 键值 trim 后 =="1" 为开(线上 @575); 无效 gid/异常 → 关(false)。
@@ -57,6 +74,14 @@ boolean isCustomOn(String groupId) {
         return s != null && s.trim().equals("1");
     } catch (Throwable t) { return false; }
 }
+// 定制开关写 (UI「🎯 定制包」onSave 用; 线上 setCustomOn @578-584 逐字)。键同源: 复用读侧 rpCustomOnKey。putString→HOST.putString。
+void setCustomOn(String groupId, boolean on) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty()) return;
+        HOST.putString(rpCustomOnKey(g), on ? "1" : "");
+    } catch (Throwable t) {}
+}
 String rpCustomKwKey(String groupId) { return RPQ_K_CUSTOM_KW_PREFIX + normGroupId(groupId); }
 // 定制关键字: 取本群键值; 无效 gid/异常 → 空串(线上 @588 逐字, 注意不 trim, trim 留给 rpIsCustom)。
 String getCustomKw(String groupId) {
@@ -66,6 +91,14 @@ String getCustomKw(String groupId) {
         String s = HOST.getString(rpCustomKwKey(g), "");
         return (s == null) ? "" : s;
     } catch (Throwable t) { return ""; }
+}
+// 定制关键字写 (UI「🎯 定制包」onSave 用; 线上 setCustomKw @596-602 逐字)。键同源: 复用读侧 rpCustomKwKey。putString→HOST.putString。
+void setCustomKw(String groupId, String kw) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty()) return;
+        HOST.putString(rpCustomKwKey(g), (kw == null) ? "" : kw.trim());
+    } catch (Throwable t) {}
 }
 // 包类型判定(线上 @609 逐字, v1.7.1 包含匹配):
 //   开关关 → 普通(false); 否则 kw trim 后非空 且 title 包含 kw → 定制(true); 否则普通。

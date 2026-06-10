@@ -35,3 +35,42 @@ P3-b 全程纯本地产出 + 解析 + 审查。adb push / 改 per-group 配置 /
 1. ✅ 同意 9 任务拆法与顺序（T1→T8 移植、T9 验收）。
 2. ✅ 设备层用**多模块拆分**：新建 `app/device_detect.bsh`/`device_worker.bsh`/`device_ui.bsh`/`device_recv.bsh`（与方案 B"不要单一巨型"一致，便于分任务审查）。
 3. ✅ session 接力：**每 2-3 任务一个 commit 节点**，到 ~400K tokens 主动开新 session（规避长 session tool-call 退化，CLAUDE.md 教训）。
+
+## 进度更新
+- ✅ **T6 完成 (commit bd7f4b1)**：发送层 `redpacket_send.bsh` + host sendQuote 健壮回退 + domain rpQueryWindow。check.sh GREEN 21/21，独立 Review 0 CRITICAL。详见 docs/memory-snapshot/project-status.md。
+- 🔄 **T7 进行中**：
+  - ✅ **W1 盘点完成**（下方）。
+  - ✅ **W2+W3 完成**（RP 设置 UI 全套并入，Implementer Agent 移植 + 我独立复核）：
+    - 新增 **995 行 / 0 删除**（纯加载体），5 文件：dialogs.bsh(+815, 主菜单+7子页+UI helper)、redpacket_send.bsh(+71, isDailyEnabled/enable·disableDailyGroup/rpExportToday端口化)、redpacket_qualify.bsh(+33, setCustomOn/setCustomKw/removeExclude)、redpacket_tiers.bsh(+51, cfgT1-3/cfgTxt1-3/rpParseTierBox/rpAppendErr)、redpacket_detect.bsh(+25, rpEnableGroup/rpDisableGroup)。
+    - 符号改名表对齐合并命名空间（cfgInt→rpCfgInt / K_*→RP_K_* / tiersCustomKey→rpTiersCustomKey / putString·getString·sendText→HOST.*）；键全部读写同源（rpCustomOnKey/rpExcludeKey/RP_K_ENABLED/K_DAILY_GROUPS）。
+    - **2 处非纯改名（语义等价/收口）**：① rpExportToday 端口化（rpQueryToday+HOST.sendText 镜像 rpDailySend，文案/脱敏日志逐字）；② RP 本群启用写路径 rpEnableGroup/rpDisableGroup 提前落地（rp 前缀避撞 GA enableGroup，与读侧 rpIsGroupEnabled 同源，§20 enableDailyGroup 副作用保留）——**T8 isGroupEnabled 同源收口时复核**。
+    - **验证 GREEN（我独立复跑）**：build EXIT=0(6308行) / check.sh 21/21 / uniq -d 仅 3 个已知 arity 重载(dispatchAction/doWarn/hbTierAndSend) 无新撞名 / 基础页正确接 rp 前缀路径不与 GA 交叉 / 0 敏感泄漏。
+  - 🔄 **W4 待做**：RP 文字命令路由（routeRpCommand：阈值/文案/档/定制/延迟/排除/转发/伸手党 + 红包排除 handler）→ commands.bsh；onClickSendBtn 撞名先抽 rpOnClickSendBtn（合并收口留 T8）。
+  - ⏳ **W6 待做**：独立 Code Review 对照线上 §22-§25 逐子页保真 + 热路径/ANR 审。
+
+## T7 W1 盘点结果（2026-06-10，line refs = 线上 plugins/redpacket-stats/main.java）
+**总规模 ≈ 1000+ 行逐字移植（P3-b 最大单任务）。建议 W2-W4 在 fresh context 跑。**
+
+### A. RP Dialog（≈730 行，@3221-3950）→ 并入 merged `dialogs.bsh`（与 GA 共存）
+- UI helper：`_rpC`@3221 / `_rpRound`@3222 / `_rpBtn`@3228（**与 GA `_gaC`/`_gaRound`/`_gaBtn` 无撞名** ✓）
+- 主菜单 `showConfigDialog`@3326（**与 GA `showGroupConfigDialog` 无撞名** ✓）
+- 7 子页（全 `showPage*` 前缀，唯一）：`showPageBasic`@3442 / `showPageNormalTiers`@3481 / `showPageCustom`@3554 / `showPageDelay`@3622 / `showPageFreeloader`@3654 / `showPageExclude`@3704 / `showPageForward`@3731
+- Forward 子页 helper：`rpPickTarget`@3833（后台 getFriendList/getGroupList + Handler 主线程弹框防 ANR）/ `rpApplyForwardTarget`@3904 / `sendForwardNotice`@3921
+- 配置读写一律改走 HOST 端口（对齐 dialogs.bsh 既有约定）；键名/默认/夹取逐字保真。
+
+### B. RP 命令路由（≈290 行）→ 接 merged `commands.bsh`（新 routeRpCommand 或并入）
+- 命令段在线上 `onHandleMsgBody`@1204 内 @1359-1600：`红包统计状态`@1359 / `红包阈值`@1459 / `红包延迟`@1493 / `伸手党 开/关/窗口`@1539 等（命令 helper 如 `rpSetThresholdsCmd`@684 等需核实哪些已抽 domain）
+- `红包排除`/`取消红包排除` 命令 @1119-1160（rpHandleExcludeCmd，走 onHandleMsg bot 自发 @ 路径）
+- ⚠️ **真撞名**：RP `onClickSendBtn`@1333 与 GA `onClickSendBtn`(merged dialogs.bsh:62) **同名** → 必须合并成一个入口（同时认 GA「群管」+ RP 触发词）。**此 collision 解决可放 T8 onLoad/hook 合一**，T7 先把 RP 入口逻辑抽成 `rpOnClickSendBtn` 待 T8 收口，或 T7 直接合并（决策见 W2）。
+
+### C. 每日定时写侧 → `enableDailyGroup`@1085 / `disableDailyGroup`@1093（写 rp_daily_groups，与 T6 已移的读侧 getDailyGroups 同键 K_DAILY_GROUPS="rp_daily_groups"）
+
+### D. 键同源盯点（config-key 升级缺口教训）
+- RP per-group 键的 normGroupId：线上 RP normGroupId=trim → merged 用 `rpNormGroupId`（tiers）。T7 Dialog/命令写键必须与读侧（domain tiers/qualify/export + T6 send）逐字同源。
+- 定制群规前缀键 `rp_custom_rule_prefix_<rpNormGroupId>`（T6 cfgCustomRulePrefix 读侧已定）；档表键 rp_tiers_/rp_tiers_custom_；排除 rp_exclude_；转发 rp_export_target_；伸手党 rp_freeloader_on_/win_/since_。
+
+### W2-W4 拆法（待 fresh context 执行）
+- **W2**：RP UI helper(_rp*) + showConfigDialog 主菜单 + 子页 Basic/NormalTiers/Custom/Delay/Exclude → dialogs.bsh
+- **W3**：showPageForward(含 enable/disableDailyGroup 写侧 + rpPickTarget/rpApplyForwardTarget/sendForwardNotice) + showPageFreeloader → dialogs.bsh
+- **W4**：RP 命令路由(routeRpCommand: 红包统计状态/阈值/文案/档/定制/延迟/排除/转发/伸手党) + 红包排除 handler → commands.bsh；onClickSendBtn 撞名先抽 rpOnClickSendBtn（合并收口 T8）
+- **W5/W6**：build+解析+check.sh+uniq -d撞名查重+键同源grep / 独立 Review
