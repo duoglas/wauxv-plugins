@@ -1,0 +1,303 @@
+// ============================================================
+// app/ga_actions_destructive — GroupAdmin 组 C 动作: 破坏性类 (踢人 doKick · 拉黑 doBan · 潜水扫描/批量踢 doShowInactive/doKickInactive)。
+// 逐字保真移植自线上 plugins/group-admin/main.java, 行为零改动, 只换载体 + 端口改写。
+//
+// 对应线上锚点 (函数实际边界为准):
+//   warnNoBotPriv        @703-705   机器人无群管权限提示
+//   recordFirstSeen      @735-741   first_seen UPSERT (取 min, 非热路径)
+//   parseIndexRange      @642-668   解析 "1,3,5-8" → 去重升序 1-based 编号
+//   doShowInactive       @1450-1551 潜水扫描 (建基线/出名单/写 pending_kick)
+//   doKickInactive       @1553-1619 #踢潜水 批量踢 (按 pending_kick 名单 + 编号)
+//   doKick               @2580-2590 踢出单人
+//   doBan                @2592-2613 拉黑 (加黑名单 + 踢)
+//
+// 依赖 (manifest 在本片之前拼入):
+//   domain/membership.bsh : canActOn · isWhitelistAny · getBlacklist/setBlacklist · getProtected ·
+//                           isAdminInGroup · isOwner · isNativeOwner · parseCsv/joinCsv
+//   domain/warning.bsh    : botPrivState (经 host_android)
+//   domain/speak.bsh      : LURK_NEWMEMBER_EXEMPT_MS
+//   domain/speak_store.bsh: speakSnapshotAll (一次性全群快照) · l3UpsertFirstSeen
+//   app/speak_buffer.bsh  : l3Flush
+//   core 端口 HOST/CLOCK  : HOST.getString/putString/sendText/lookupName/getLoginWxid/getGroupMemberList/tryKickSilent ; CLOCK.now()
+//
+// 端口改写 (只改这些, 其它逐字):
+//   getString(k,def)/putString(k,v)        → HOST.getString(k,def)/HOST.putString(k,v)
+//   sendText(grp, text)                    → HOST.sendText(grp, text)
+//   getLoginWxid()                         → HOST.getLoginWxid()
+//   lookupName(wxid, grp)                  → HOST.lookupName(wxid, grp)
+//   getGroupMemberList(grp)                → HOST.getGroupMemberList(grp)
+//   tryKickSilent(grp, wxid)               → HOST.tryKickSilent(grp, wxid)
+//   System.currentTimeMillis()             → CLOCK.now()
+//   canActOn/isWhitelistAny/getBlacklist/setBlacklist/getProtected/botPrivState/isAdminInGroup/isOwner/
+//   isNativeOwner/parseCsv/joinCsv/l3Flush/l3UpsertFirstSeen/recordFirstSeen/warnNoBotPriv/parseIndexRange/
+//   LURK_NEWMEMBER_EXEMPT_MS/speakSnapshotAll/log : 领域/同模块裸调用, 不加 HOST. 前缀。
+//
+// doShowInactive 唯一结构性端口改写: 线上 l3QueryLastSpeak/l3QueryFirstSeen(android.database 直查) →
+//   merged STORAGE 端口的 speakSnapshotAll 一次性全群快照拆分 (语义等价, 见函数内注释)。
+//
+// 守卫职责: `@所有人` 守卫由调用方 routeCommand (dispatch 侧 _isAtAll 拦截) 负责; 本组 doKick/doBan 自身守卫是 canActOn (逐字保留)。
+// 保真红线: 文案/表情/分支/序号格式/权限校验 逐字, 不臆造/不增删语义 (YAGNI + 保真)。
+// 本文件只产出 do* 组 C 真实函数; 不接 LEAF 桥 (commands.bsh 的占位留 W6)。
+// ============================================================
+
+// ---- 机器人无群管权限提示 (@703-705) ----
+void warnNoBotPriv(String groupId) {
+    HOST.sendText(groupId, "❌ 机器人在本群没有群管理员权限，无法执行踢人\n请群主先把机器人在群里提升为管理员\n之后发 #群权限自检 重置检测");
+}
+
+// ---- first_seen UPSERT (@735-741) ----
+void recordFirstSeen(String groupId, String wxid) {
+    if (groupId == null || wxid == null || wxid.isEmpty()) return;
+    // T2′: first_seen UPSERT 进 SQLite, 冲突取 min (绝不覆盖更早的)。命令/入群路径 (L1/L2), 非热路径。
+    List one = new ArrayList();
+    one.add(wxid);
+    l3UpsertFirstSeen(groupId, one, CLOCK.now());
+}
+
+// ---- 解析 "1,3,5-8" → 去重升序 1-based 编号 (@642-668) ----
+List parseIndexRange(String s, int max) {
+    Set seen = new LinkedHashSet();
+    if (s == null) return new ArrayList();
+    String[] parts = s.split(",");
+    for (int i = 0; i < parts.length; i++) {
+        String p = parts[i].trim();
+        if (p.isEmpty()) continue;
+        int dash = p.indexOf('-');
+        if (dash > 0 && dash < p.length() - 1) {
+            try {
+                int a = Integer.parseInt(p.substring(0, dash).trim());
+                int b = Integer.parseInt(p.substring(dash + 1).trim());
+                if (a > b) { int t = a; a = b; b = t; }
+                if (a < 1) a = 1;
+                if (b > max) b = max;
+                for (int x = a; x <= b; x++) seen.add(Integer.valueOf(x));
+            } catch (Exception e) {}
+        } else {
+            try {
+                int x = Integer.parseInt(p);
+                if (x >= 1 && x <= max) seen.add(Integer.valueOf(x));
+            } catch (Exception e) {}
+        }
+    }
+    return new ArrayList(seen);
+}
+
+// ---- 潜水扫描 (@1450-1551) ----
+void doShowInactive(String groupId, String content) {
+    String[] tk = content.split("[\\s\\u2005\\u00A0]+");
+    int days = 7;
+    if (tk.length >= 2) { try { days = Integer.parseInt(tk[1].trim()); } catch (Exception e) {} }
+    if (days < 1) days = 1;
+    if (days > 365) days = 365;
+
+    List members = null;
+    try { members = HOST.getGroupMemberList(groupId); } catch (Exception e) { log("getGroupMemberList fail: " + e); }
+    if (members == null || members.isEmpty()) { HOST.sendText(groupId, "❌ 拿不到群成员列表"); return; }
+
+    // T2′: flush-before-read — 最新发言可能仍在内存脏增量未落盘, 读前先同步 flush 提交进 DB, 避免刚发言者被误判潜水。
+    // 注: 正确性由 UPSERT 单调 max(last_speak)/min(first_seen) 语义保证, 非靠 FLUSH_LOCK 串行化 (随后的 query 在锁外)。
+    try { l3Flush(); } catch (Throwable t) { log("doShowInactive l3Flush fail: " + t); }
+
+    long now = CLOCK.now();
+    long cutoff = now - (long) days * 86400000L;        // 潜水(活跃)判定窗口
+    long exemptCutoff = now - LURK_NEWMEMBER_EXEMPT_MS;  // v1.20.0: 新成员豁免固定 1 天 (与 days 解耦)
+    // [W5 端口改写] 线上 l3QueryLastSpeak/l3QueryFirstSeen(android.database 直查)→ merged STORAGE 端口的 speakSnapshotAll 一次性全群快照拆分。
+    // 语义等价: ls/fs 只收非 null 列值(对齐线上 l3Query* 仅 put 非 null), coldStart=fs.isEmpty() 不变。
+    Map ls = new HashMap();
+    Map fs = new HashMap();
+    Map _snap = speakSnapshotAll(groupId);
+    java.util.Iterator _it = _snap.entrySet().iterator();
+    while (_it.hasNext()) {
+        java.util.Map.Entry _e = (java.util.Map.Entry) _it.next();
+        String _w = (String) _e.getKey();
+        Object[] _v = (Object[]) _e.getValue();
+        if (_v[0] != null) ls.put(_w, _v[0]);
+        if (_v[1] != null) fs.put(_w, _v[1]);
+    }
+    boolean coldStart = fs.isEmpty();
+    if (coldStart) {
+        // 冷启动: 该群 DB 无任何 first_seen, 把所有当前成员的 first_seen 设为 now (批量 UPSERT, 冲突取 min)。
+        List allMem = new ArrayList();
+        for (int i = 0; i < members.size(); i++) allMem.add(members.get(i));
+        l3UpsertFirstSeen(groupId, allMem, now);
+        for (int i = 0; i < members.size(); i++) fs.put((String) members.get(i), Long.valueOf(now));
+    }
+    List prot = getProtected(groupId);
+    String botWxid = HOST.getLoginWxid();
+
+    if (coldStart) {
+        HOST.sendText(groupId, "📊 已建立潜水基线 (共 " + members.size() + " 人)\n新成员豁免 1 天, 请等待 1 天后再发 #潜水 " + days);
+        return;
+    }
+
+    List inactive = new ArrayList();
+    int newJoinSkip = 0;
+    for (int i = 0; i < members.size(); i++) {
+        String w = (String) members.get(i);
+        if (w == null || w.isEmpty()) continue;
+        if (w.equals(botWxid)) continue;
+        if (isAdminInGroup(groupId, w) || isOwner(w)) continue;
+        if (isNativeOwner(groupId, w)) continue;
+        if (prot.contains(w)) continue;
+
+        Long fst = (Long) fs.get(w);
+        if (fst == null) {
+            // 新成员刚刚被加入 fsg, 跳过本轮
+            recordFirstSeen(groupId, w);
+            newJoinSkip++;
+            continue;
+        }
+        if (fst.longValue() > exemptCutoff) { newJoinSkip++; continue; }  // v1.20.0: 新成员豁免固定 1 天
+
+        Long lst = (Long) ls.get(w);
+        if (lst != null && lst.longValue() > cutoff) continue;     // 期内说过话
+
+        inactive.add(w);
+    }
+
+    if (inactive.isEmpty()) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("✅ 过去 ").append(days).append(" 天本群无潜水成员");
+        if (newJoinSkip > 0) sb.append("\n(").append(newJoinSkip).append(" 个新成员在豁免期)");
+        HOST.sendText(groupId, sb.toString());
+        return;
+    }
+
+    int cap = 80;
+    int total = inactive.size();
+    int show = total < cap ? total : cap;
+    List shown = new ArrayList();
+    StringBuilder sb = new StringBuilder();
+    sb.append("📋 过去 ").append(days).append(" 天潜水名单 (共 ").append(total).append(" 人):\n");
+    sb.append("━━━━━━\n");
+    for (int i = 0; i < show; i++) {
+        String w = (String) inactive.get(i);
+        shown.add(w);
+        sb.append(i + 1).append(". ").append(HOST.lookupName(w, groupId));
+        Long lst = (Long) ls.get(w);
+        if (lst != null) {
+            long ago = (now - lst.longValue()) / 86400000L;
+            sb.append("  ·  ").append(ago).append("天前");
+        } else {
+            Long fst = (Long) fs.get(w);
+            long inGroup = fst != null ? (now - fst.longValue()) / 86400000L : 0;
+            sb.append("  ·  从未发言 (在群 ").append(inGroup).append("天)");
+        }
+        sb.append('\n');
+    }
+    if (total > cap) sb.append("...（仅显示前 ").append(cap).append(" 个）\n");
+    sb.append("━━━━━━\n");
+    sb.append("批量踢: #踢潜水 1,3,5-8\n");
+    sb.append("豁免某人: @TA 保护  ");
+    if (newJoinSkip > 0) sb.append("\n(已跳过 ").append(newJoinSkip).append(" 个新成员)");
+
+    HOST.putString("pending_kick_" + groupId, joinCsv(shown));
+    HOST.putString("pending_kick_ts_" + groupId, String.valueOf(now));
+    HOST.sendText(groupId, sb.toString());
+}
+
+// ---- #踢潜水 批量踢 (@1553-1619) ----
+void doKickInactive(String groupId, String sender, String content) {
+    if (!isAdminInGroup(groupId, sender)) return;
+
+    String[] tk = content.split("[\\s\\u2005\\u00A0]+", 2);
+    if (tk.length < 2 || tk[1].trim().isEmpty()) {
+        HOST.sendText(groupId, "用法: #踢潜水 1,3,5-8\n先发 #潜水 N 拿待踢名单");
+        return;
+    }
+
+    List pending = parseCsv(HOST.getString("pending_kick_" + groupId, ""));
+    if (pending.isEmpty()) { HOST.sendText(groupId, "❌ 没有待踢名单，先发 #潜水 N"); return; }
+
+    String tsStr = HOST.getString("pending_kick_ts_" + groupId, "0");
+    long ts = 0;
+    try { ts = Long.parseLong(tsStr); } catch (Exception e) {}
+    if (ts > 0 && CLOCK.now() - ts > 1800000L) {
+        HOST.sendText(groupId, "❌ 待踢名单已过期 (>30分钟), 请重新 #潜水 N");
+        return;
+    }
+
+    List indexes = parseIndexRange(tk[1], pending.size());
+    if (indexes.isEmpty()) { HOST.sendText(groupId, "❌ 编号无效"); return; }
+
+    if (botPrivState(groupId).equals("none")) {
+        warnNoBotPriv(groupId);
+        return;
+    }
+
+    String botWxid = HOST.getLoginWxid();
+    int okCnt = 0, skipCnt = 0, failCnt = 0;
+    StringBuilder sb = new StringBuilder();
+    sb.append("🦶 批量踢潜水 (共 ").append(indexes.size()).append(" 个):\n");
+    sb.append("━━━━━━\n");
+
+    boolean abortedByPriv = false;
+    for (int i = 0; i < indexes.size(); i++) {
+        int idx = ((Integer) indexes.get(i)).intValue();
+        String w = (String) pending.get(idx - 1);
+        String name = HOST.lookupName(w, groupId);
+
+        // 二次防护
+        if (w.equals(botWxid) || isAdminInGroup(groupId, w) || isOwner(w) || isNativeOwner(groupId, w) || getProtected(groupId).contains(w)) {
+            sb.append("#").append(idx).append(" ").append(name).append(" ⏭ 跳过(受保护)\n");
+            skipCnt++; continue;
+        }
+
+        if (HOST.tryKickSilent(groupId, w)) {
+            sb.append("#").append(idx).append(" ").append(name).append(" ✅\n");
+            okCnt++;
+        } else {
+            sb.append("#").append(idx).append(" ").append(name).append(" ❌\n");
+            failCnt++;
+            if (botPrivState(groupId).equals("none")) {
+                sb.append("⚠️ 检测到机器人无群管权限, 中止剩余 ").append(indexes.size() - i - 1).append(" 个\n");
+                abortedByPriv = true;
+                break;
+            }
+        }
+    }
+    sb.append("━━━━━━\n");
+    sb.append("✅ ").append(okCnt).append(" 成功 / ⏭ ").append(skipCnt).append(" 跳过 / ❌ ").append(failCnt).append(" 失败");
+    if (abortedByPriv) sb.append("\n请群主把机器人提为群管理员, 然后 #群权限自检 重置缓存");
+    HOST.sendText(groupId, sb.toString());
+
+    HOST.putString("pending_kick_" + groupId, "");
+    HOST.putString("pending_kick_ts_" + groupId, "");
+}
+
+// ---- 踢出单人 (@2580-2590) ----
+void doKick(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { HOST.sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
+    if (botPrivState(groupId).equals("none")) { warnNoBotPriv(groupId); return; }
+    if (HOST.tryKickSilent(groupId, target)) {
+        HOST.sendText(groupId, "👢 已踢出 " + HOST.lookupName(target, groupId));
+    } else if (botPrivState(groupId).equals("none")) {
+        warnNoBotPriv(groupId);
+    } else {
+        HOST.sendText(groupId, "❌ 踢出失败 (非权限原因，可能成员已离群或网络问题)");
+    }
+}
+
+// ---- 拉黑 (@2592-2613) ----
+void doBan(String groupId, String sender, String target) {
+    if (!canActOn(groupId, sender, target)) { HOST.sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
+    // v1.12: 在白名单的人不能直接拉黑 (需先用 @TA 移除白名单)
+    if (isWhitelistAny(groupId, target)) {
+        HOST.sendText(groupId, "🛡 " + HOST.lookupName(target, groupId) + " 在白名单, 不能拉黑\n如需拉黑请先 @TA 移除白名单");
+        return;
+    }
+    List bl = getBlacklist(groupId);
+    if (!bl.contains(target)) { bl.add(target); setBlacklist(groupId, bl); }
+    String name = HOST.lookupName(target, groupId);
+    if (botPrivState(groupId).equals("none")) {
+        HOST.sendText(groupId, "🚫 已加入黑名单: " + name + "\n⚠️ 机器人无群管权限，本次未踢出。再入群时也无法自动踢。");
+        return;
+    }
+    if (HOST.tryKickSilent(groupId, target)) {
+        HOST.sendText(groupId, "🚫 已拉黑 " + name + " (再入群自动踢)");
+    } else if (botPrivState(groupId).equals("none")) {
+        HOST.sendText(groupId, "🚫 已加入黑名单: " + name + "\n⚠️ 但机器人无群管权限，未能踢出");
+    } else {
+        HOST.sendText(groupId, "🚫 已加入黑名单: " + name + "\n⚠️ 踢出失败 (非权限原因)");
+    }
+}
