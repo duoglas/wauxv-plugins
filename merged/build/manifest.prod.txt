@@ -22,6 +22,7 @@ src/app/device_ui.bsh
 src/app/speak_buffer.bsh
 src/app/enable_state.bsh
 src/app/ga_actions_query.bsh
+src/app/ga_actions_write.bsh
 src/app/speak_baseline.bsh
 src/app/redpacket_app.bsh
 src/app/device_recv.bsh

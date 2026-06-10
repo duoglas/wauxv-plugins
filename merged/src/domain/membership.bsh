@@ -106,7 +106,9 @@ boolean canActOn(String groupId, String operator, String target) {
 //   wt_global    全局白名单 CSV                                  (@765)
 // ============================================================
 List getWhitelist(String groupId) { return parseCsv(HOST.getString("wt_" + groupId, "")); }   // @758
+void setWhitelist(String groupId, List wt) { HOST.putString("wt_" + groupId, joinCsv(wt)); }   // @759 (W4 名单写)
 List getGlobalWhitelist() { return parseCsv(HOST.getString("wt_global", "")); }                // @765
+void setGlobalWhitelist(List wt) { HOST.putString("wt_global", joinCsv(wt)); }                 // @766 (W4 名单写)
 boolean isGlobalWhitelist(String wxid) {                                                        // @767
     return wxid != null && !wxid.isEmpty() && getGlobalWhitelist().contains(wxid);
 }
@@ -116,6 +118,10 @@ boolean isWhitelistAny(String groupId, String wxid) {
     return isGlobalWhitelist(wxid) || getWhitelist(groupId).contains(wxid);
 }
 
+// 严格模式 (全局 strict_mode 键; 开启时命令仅群主, 否则管理员+) — 键与 commands.bsh:_cmdStrictModeOn 同源 (@776-777)。
+boolean isStrictMode() { return "1".equals(HOST.getString("strict_mode", "0")); }                // @776
+void setStrictMode(boolean on) { HOST.putString("strict_mode", on ? "1" : "0"); }                // @777
+
 // ============================================================
 // 名单读助手族 (组 A 查询/列表动作的数据源) — 逐字保真自线上, 键用【裸 groupId】不 norm。
 //   bl_<裸gid>        本群黑名单 CSV                                (@669)
@@ -124,8 +130,11 @@ boolean isWhitelistAny(String groupId, String wxid) {
 // 端口改写: getString→HOST.getString。仅移植组 A 用到的读侧 (set 侧 YAGNI 不引入, 由后续动作组移植)。
 // ============================================================
 List getBlacklist(String groupId) { return parseCsv(HOST.getString("bl_" + groupId, "")); }        // @669
+void setBlacklist(String groupId, List bl) { HOST.putString("bl_" + groupId, joinCsv(bl)); }       // @670 (W4 名单写)
 List getGlobalBlacklist() { return parseCsv(HOST.getString("bl_global", "")); }                     // @761
+void setGlobalBlacklist(List bl) { HOST.putString("bl_global", joinCsv(bl)); }                       // @762 (W4 名单写)
 List getProtected(String groupId) { return parseCsv(HOST.getString("protected_" + groupId, "")); } // @755
+void setProtected(String groupId, List p) { HOST.putString("protected_" + groupId, joinCsv(p)); }  // @1445 (W4 名单写)
 
 // 管理员名册写 (@1738): purgeExpiredAdmins 落盘用。键用 norm 后的 gid (与 getAdmins @1737 对齐)。
 void setAdmins(String groupId, List admins) { HOST.putString("admins_" + normGroupId(groupId), joinCsv(admins)); }
