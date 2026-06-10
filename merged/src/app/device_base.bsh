@@ -91,13 +91,13 @@ java.util.Map RP_LAST_MSG = java.util.Collections.synchronizedMap(new java.util.
 java.util.List sCachedFriendList = null;
 java.util.List sCachedGroupList = null;
 
-String HB_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/rp.log";   // 线上 @393
+String HB_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdminPlus/rp.log";   // 线上 @393; 合并隔离: 旧 RedPacketStats/→GroupAdminPlus/ (与 RP_DB_PATH/GA_DB_PATH/L3_DB_PATH 同隔离, VH-07 漏网第4常量)
 
 // ==================== v1.4.0: 轻量 perf 埋点 (仿 GroupAdmin; 为明早性能分析) (线上 @395-429) ====================
 // 热路径(onHandleMsg)只做 nanoTime + 整型累加, 绝不每条写文件/写 log (埋点不得反噬热路径)。
 // 聚合行由 rpWorkerTick 定时驱动落盘 (worker 必跑), 或窗口异常膨胀时兜底 flush。perf.log 与 rp.log 分开。
 // perf.log 只写耗时/计数, 绝不写 wxid/群名/群ID/消息内容。
-String PERF_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/perf.log";
+String PERF_LOG = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdminPlus/perf.log";   // 合并隔离: 旧 RedPacketStats/→GroupAdminPlus/ (VH-07 漏网第4/5常量, 与 HB_LOG 同)
 int  PERF_FLUSH_EVERY = 200;   // 每累计 N 条(或 worker tick)聚合落盘一行
 long PERF_N           = 0L;    // 当前窗口样本数 (onHandleMsg 调用数)
 long PERF_SUM_NS      = 0L;    // 窗口 onHandleMsg 累计耗时 (ns)
