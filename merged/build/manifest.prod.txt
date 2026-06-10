@@ -6,6 +6,7 @@ src/core/storage_android.bsh
 src/core/host_android.bsh
 src/core/clock_android.bsh
 src/domain/membership.bsh
+src/domain/csv_time_util.bsh
 src/domain/speak_store.bsh
 src/domain/speak.bsh
 src/domain/warning.bsh
@@ -20,6 +21,7 @@ src/app/redpacket_worker.bsh
 src/app/device_ui.bsh
 src/app/speak_buffer.bsh
 src/app/enable_state.bsh
+src/app/speak_baseline.bsh
 src/app/redpacket_app.bsh
 src/app/device_recv.bsh
 src/app/redpacket_send.bsh

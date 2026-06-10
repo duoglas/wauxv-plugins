@@ -1,0 +1,35 @@
+// ============================================================
+// domain/csv_time_util — 旧 lsg_/fsg_ 时间戳 CSV 的解析/构造 (纯字符串, 无端口依赖)。
+// 线上 plugins/group-admin/main.java:614-639 parseTimeCsv/buildTimeCsv 逐字保真。
+// 迁移 (l3MigrateCsvToDb) 读旧 CSV → Map 时用 parseTimeCsv。buildTimeCsv 暂无新调用方,
+//   随对仗一并搬入 (保真: 旧编码路径不丢)。
+// ============================================================
+
+// 时间戳 CSV: wxid|ts,wxid|ts,...  → Map<String wxid, Long ts>
+Map parseTimeCsv(String csv) {
+    Map m = new HashMap();
+    if (csv == null || csv.isEmpty()) return m;
+    String[] arr = csv.split(",");
+    for (int i = 0; i < arr.length; i++) {
+        String p = arr[i].trim();
+        if (p.isEmpty()) continue;
+        int sep = p.indexOf('|');
+        if (sep <= 0 || sep >= p.length() - 1) continue;
+        try { m.put(p.substring(0, sep), Long.valueOf(p.substring(sep + 1))); } catch (Exception e) {}
+    }
+    return m;
+}
+
+// Map<String wxid, Long ts> → "wxid|ts,wxid|ts,..."
+String buildTimeCsv(Map m) {
+    StringBuilder sb = new StringBuilder();
+    Iterator it = m.entrySet().iterator();
+    boolean first = true;
+    while (it.hasNext()) {
+        Map.Entry e = (Map.Entry) it.next();
+        if (!first) sb.append(',');
+        sb.append(e.getKey()).append('|').append(e.getValue());
+        first = false;
+    }
+    return sb.toString();
+}

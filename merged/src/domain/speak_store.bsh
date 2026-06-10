@@ -71,3 +71,49 @@ java.util.Map speakSnapshotAll(String grp) {
     }
     return snap;
 }
+
+// ============================================================
+// first_seen 基线 / 迁移所需的领域查询(线上 l3CountFirstSeen/l3ClearFirstSeen/l3CountGroup 的 SQL 逐字,
+//   只把 SQLiteDatabase rawQuery/execSQL 换成 STORAGE 端口)。
+// ============================================================
+
+// 该群有 first_seen 的行数 (基线是否已建立) — 线上 l3CountFirstSeen @235-245 SQL 逐字。
+SPEAK_COUNT_FIRSTSEEN_SQL = "SELECT count(*) FROM speak WHERE grp=? AND first_seen IS NOT NULL";
+int speakCountFirstSeen(String grp) {
+    Long n = STORAGE.queryLong(SPEAK_COUNT_FIRSTSEEN_SQL, new Object[]{ grp });
+    return (n == null) ? 0 : n.intValue();
+}
+
+// 清空该群 first_seen (保留 last_speak 行, 不删行) — 线上 l3ClearFirstSeen @286-293 SQL 逐字。
+SPEAK_CLEAR_FIRSTSEEN_SQL = "UPDATE speak SET first_seen=NULL WHERE grp=?";
+void speakClearFirstSeen(String grp) {
+    STORAGE.exec(SPEAK_CLEAR_FIRSTSEEN_SQL, new Object[]{ grp });
+}
+
+// 该群 last_speak / first_seen 各自非空的行数 (迁移校验用) — 线上 l3CountGroup @296-307 SQL 逐字。
+// 返回 int[]{ lastSpeakNonNull, firstSeenNonNull }。
+SPEAK_COUNT_GROUP_SQL =
+    "SELECT sum(last_speak IS NOT NULL), sum(first_seen IS NOT NULL) FROM speak WHERE grp=?";
+int[] speakCountGroup(String grp) {
+    int[] r = new int[]{ 0, 0 };
+    java.util.List rows = STORAGE.queryRows(SPEAK_COUNT_GROUP_SQL, new Object[]{ grp });
+    if (rows != null && !rows.isEmpty()) {
+        Object[] row = (Object[]) rows.get(0);
+        r[0] = (row[0] == null) ? 0 : ((Long) row[0]).intValue();
+        r[1] = (row[1] == null) ? 0 : ((Long) row[1]).intValue();
+    }
+    return r;
+}
+
+// 该群 first_seen NOT NULL 的 wxid 集合 (供 l3UpsertFirstSeen 算新增 delta — 对齐线上
+//   l3QueryFirstSeen @224-231 的 "已存在集合" 语义, 但只需 key 集合)。
+SPEAK_FIRSTSEEN_SET_SQL = "SELECT wxid FROM speak WHERE grp=? AND first_seen IS NOT NULL";
+java.util.Set speakFirstSeenSet(String grp) {
+    java.util.Set out = new java.util.HashSet();
+    java.util.List rows = STORAGE.queryRows(SPEAK_FIRSTSEEN_SET_SQL, new Object[]{ grp });
+    for (int i = 0; i < rows.size(); i++) {
+        Object[] r = (Object[]) rows.get(i);
+        if (r[0] != null) out.add(r[0].toString());
+    }
+    return out;
+}

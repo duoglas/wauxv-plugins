@@ -1,0 +1,130 @@
+// ============================================================
+// app/speak_baseline — first_seen 基线建立 + 旧 CSV→SQLite 一次性迁移。
+// 线上 plugins/group-admin/main.java 逐字保真抽出, 只把 DB 载体从直连 l3Db()(SQLiteDatabase)
+//   换成 StoragePort(全局 STORAGE) + domain/speak_store 已有函数。行为零改动。
+// 对应线上锚点:
+//   l3UpsertFirstSeen   @249-282   (单群批量 UPSERT first_seen, 返回新增人数)
+//   l3CountFirstSeen    @235-245   (薄调 speakCountFirstSeen)
+//   l3ClearFirstSeen    @286-293   (薄调 speakClearFirstSeen)
+//   initFirstSeenBaseline @745-752 (HOST.getGroupMemberList → l3UpsertFirstSeen)
+//   l3MigrateCsvToDb    @311-379   (lsg_/fsg_ CSV → speak 表, 守卫 + 校验 + 清旧 key)
+//
+// 依赖(均须先于本模块加载):
+//   src/domain/speak_store.bsh   : speakRecord / speakUpsertFirstSeen / speakCountFirstSeen /
+//                                  speakClearFirstSeen / speakCountGroup / speakFirstSeenSet
+//   src/domain/csv_time_util.bsh : parseTimeCsv
+//   src/app/speak_buffer.bsh     : FLUSH_LOCK (本模块持它串行化, 与后台 flush 互斥) + _l3Log 缝
+//   src/app/enable_state.bsh     : getEnabledGroups
+//   全局 HOST/STORAGE 已接线 (getGroupMemberList / getString / putString)
+// 注: 本模块用 synchronized(FLUSH_LOCK) → manifest 须在 speak_buffer 之后。
+//     诊断走 _l3Log 缝(speak_buffer 定义), 不在被测路径裸调 log()。
+// ============================================================
+
+// 单群批量 UPSERT first_seen (绝不改晚: 已有更早值不被覆盖) — 线上 l3UpsertFirstSeen @249-282。
+// 返回新增 (此前 DB 无 first_seen) 的人数。非热路径 (命令/onLoad), 持 FLUSH_LOCK 串行化, 与后台 flush 互斥。
+// 端口改写: l3Db()+compileStatement/bind/execute → speakUpsertFirstSeen(coalesce UPSERT, 取 min 不覆盖更早);
+//   "算 added" 的已存在集合 l3QueryFirstSeen → speakFirstSeenSet。coalesce 防 NULL 语义在 speak_store SQL。
+int l3UpsertFirstSeen(String groupId, List wxids, long ts) {
+    if (wxids == null || wxids.isEmpty()) return 0;
+    int added = 0;
+    synchronized (FLUSH_LOCK) {
+        try {
+            // 先查现有, 算 added (语义对齐旧 initFirstSeenBaseline 返回"新设置人数")
+            java.util.Set cur = speakFirstSeenSet(groupId);
+            for (int i = 0; i < wxids.size(); i++) {
+                String w = (String) wxids.get(i);
+                if (w == null || w.isEmpty()) continue;
+                if (!cur.contains(w)) added++;
+                speakUpsertFirstSeen(groupId, w, ts);   // first_seen=min(coalesce(...)), 不动 last_speak
+            }
+        } catch (Throwable t) { try { _l3Log("l3UpsertFirstSeen fail group=" + groupId + " " + t); } catch (Throwable t2) {} }
+    }
+    return added;
+}
+
+// 该群有 first_seen 的行数 (基线是否已建立) — 线上 l3CountFirstSeen @235-245, 薄调 speakCountFirstSeen。
+int l3CountFirstSeen(String groupId) {
+    return speakCountFirstSeen(groupId);
+}
+
+// 强制重建基线: 清空该群 first_seen — 线上 l3ClearFirstSeen @286-293, 薄调 speakClearFirstSeen。
+// 保留 last_speak 行 (不删行)。持 FLUSH_LOCK 串行化, 与后台 flush 互斥。
+void l3ClearFirstSeen(String groupId) {
+    synchronized (FLUSH_LOCK) {
+        try { speakClearFirstSeen(groupId); }
+        catch (Throwable t) { try { _l3Log("l3ClearFirstSeen fail: " + t); } catch (Throwable t2) {} }
+    }
+}
+
+// 把群里所有当前成员中没 first_seen 的人设为 now (建立基线) — 线上 initFirstSeenBaseline @745-752。
+// 返回新设置的人数 (此前 DB 无 first_seen 的人)。端口改写: getGroupMemberList→HOST.getGroupMemberList。
+int initFirstSeenBaseline(String groupId) {
+    if (groupId == null || groupId.isEmpty()) return 0;
+    List members = null;
+    try { members = HOST.getGroupMemberList(groupId); }
+    catch (Exception e) { try { _l3Log("baseline: getGroupMemberList fail " + groupId + " " + e); } catch (Throwable t2) {} }
+    if (members == null || members.isEmpty()) return 0;
+    // 批量 UPSERT first_seen 进 DB, 冲突取 min (不覆盖更早), 返回新增人数。命令路径, 非热路径。
+    return l3UpsertFirstSeen(groupId, members, CLOCK.now());
+}
+
+// T2′: 一次性迁移旧 lsg_/fsg_ CSV → speak 表 — 线上 l3MigrateCsvToDb @311-379。
+// migrated 标志守卫只迁一次。校验通过才清旧 key + 置 migrated。不可逆 (T0 已备份 config.prop)。
+// 仅在 onLoad 后台 delay 调用 (非热路径)。
+// 端口改写: getString/putString→HOST.*; l3Db()+compileStatement→speakRecord(last_speak)/speakUpsertFirstSeen(first_seen);
+//   l3CountGroup→speakCountGroup。守卫/校验/清理/migrated 置位逐字保真。
+void l3MigrateCsvToDb() {
+    if ("1".equals(HOST.getString("l3_sqlite_migrated", "0"))) return;   // 已迁过
+
+    List groups = getEnabledGroups();
+    int gOk = 0, gFail = 0;
+    boolean allOk = true;
+    synchronized (FLUSH_LOCK) {
+        for (int i = 0; i < groups.size(); i++) {
+            String g = (String) groups.get(i);
+            String lcsv = HOST.getString("lsg_" + g, "");
+            String fcsv = HOST.getString("fsg_" + g, "");
+            if (lcsv.isEmpty() && fcsv.isEmpty()) continue;   // 该群无旧数据
+            Map lm = parseTimeCsv(lcsv);
+            Map fm = parseTimeCsv(fcsv);
+            int srcLs = lm.size();
+            int srcFs = fm.size();
+            try {
+                Iterator it = lm.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry e = (Map.Entry) it.next();
+                    String w = (String) e.getKey(); Long ts = (Long) e.getValue();
+                    if (w == null || ts == null) continue;
+                    speakRecord(g, w, ts.longValue());   // last_speak=max, first_seen=min 初值
+                }
+                Iterator it2 = fm.entrySet().iterator();
+                while (it2.hasNext()) {
+                    Map.Entry e = (Map.Entry) it2.next();
+                    String w = (String) e.getKey(); Long ts = (Long) e.getValue();
+                    if (w == null || ts == null) continue;
+                    speakUpsertFirstSeen(g, w, ts.longValue());   // first_seen=min, 不动 last_speak
+                }
+                // 校验: DB 该群 last_speak/first_seen 行数 应 == 源 CSV 条目数
+                int[] cnt = speakCountGroup(g);
+                if (cnt[0] == srcLs && cnt[1] == srcFs) {
+                    HOST.putString("lsg_" + g, "");
+                    HOST.putString("fsg_" + g, "");
+                    gOk++;
+                    try { _l3Log("l3 migrate group=" + g + " OK: lsg " + srcLs + "→" + cnt[0] + ", fsg " + srcFs + "→" + cnt[1] + " (旧 key 已清)"); } catch (Throwable t2) {}
+                } else {
+                    allOk = false; gFail++;
+                    try { _l3Log("l3 migrate group=" + g + " 校验不过: lsg src=" + srcLs + " db=" + cnt[0] + ", fsg src=" + srcFs + " db=" + cnt[1] + " (保留旧 key)"); } catch (Throwable t2) {}
+                }
+            } catch (Throwable t) {
+                allOk = false; gFail++;
+                try { _l3Log("l3 migrate group=" + g + " 异常, 保留旧 key: " + t); } catch (Throwable t2) {}
+            }
+        }
+    }
+    if (allOk) {
+        HOST.putString("l3_sqlite_migrated", "1");
+        try { _l3Log("l3 migrate DONE: " + gOk + " 群迁入并清旧 key, migrated=1"); } catch (Throwable t2) {}
+    } else {
+        try { _l3Log("l3 migrate INCOMPLETE: ok=" + gOk + " fail=" + gFail + ", 不置 migrated (下次 onLoad 重试)"); } catch (Throwable t2) {}
+    }
+}

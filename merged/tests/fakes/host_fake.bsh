@@ -20,6 +20,7 @@ FAKE_QUOTED = new java.util.ArrayList();     // 捕获 sendQuote: Object[]{grp, 
 FAKE_KICKED = new java.util.ArrayList();    // 捕获 tryKickSilent 的 wxid
 FAKE_KICK_RESULT = true;                     // 可编程：tryKickSilent 返回值
 FAKE_NOW = 1000000L;                         // 可编程：CLOCK.now() 返回值
+FAKE_MEMBERS = new java.util.HashMap();      // grp -> List<String> wxid，getGroupMemberList 查它
 
 Object _mkFakeHost() {
     String getString(String key, String def) {
@@ -35,6 +36,11 @@ Object _mkFakeHost() {
     }
     void sendText(String grp, String msg) {
         FAKE_SENT.add(new Object[] { grp, msg });
+    }
+    // 群成员 wxid 列表: 查 FAKE_MEMBERS(可编程)，无则空 List。
+    java.util.List getGroupMemberList(String grp) {
+        Object v = FAKE_MEMBERS.get(grp);
+        return (v == null) ? new java.util.ArrayList() : (java.util.List) v;
     }
     void sendQuote(String grp, long msgid, String text) {
         FAKE_QUOTED.add(new Object[] { grp, new Long(msgid), text });

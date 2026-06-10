@@ -1,0 +1,67 @@
+// L2 集成：first_seen 基线 (initFirstSeenBaseline / l3UpsertFirstSeen / l3ClearFirstSeen) + sqlite-jdbc 真库。
+// 坐实 v1.20.0 coalesce NULL bug 的证明缝：
+//   先建 last_speak 行 first_seen=NULL(speakRecord 然后 clear)，再 baseline —— 若 UPSERT 去掉 coalesce,
+//   min(NULL,x)=NULL 会让 first_seen 永卡 NULL 补不进, 本测 (b)/(c) 变红。
+// 须 source speak_buffer 拿 FLUSH_LOCK/_l3Log; host_fake 编程 FAKE_MEMBERS。
+// 运行 cwd = merged/，classpath 含 sqlite-jdbc.jar。
+import java.sql.*;
+source("tests/_harness.bsh");
+source("src/domain/csv_time_util.bsh");
+source("src/domain/speak_store.bsh");
+source("src/domain/membership.bsh");
+source("src/app/speak_buffer.bsh");     // FLUSH_LOCK / _l3Log
+source("src/app/enable_state.bsh");     // getEnabledGroups
+source("src/app/speak_baseline.bsh");
+source("tests/fakes/host_fake.bsh");    // HOST + CLOCK + FAKE_MEMBERS
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(SPEAK_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+long T_NOW = 1749470000000L;
+FAKE_NOW = T_NOW;   // CLOCK.now() → baseline 写入的 ts
+
+// ---- (a) initFirstSeenBaseline 幂等 ----
+FAKE_MEMBERS.put("g", java.util.Arrays.asList(new String[]{ "a", "b", "c" }));
+int add1 = initFirstSeenBaseline("g");
+check("(a) 首次 baseline 新增 3 人", add1 == 3);
+check("(a) count first_seen == 3", l3CountFirstSeen("g") == 3);
+int add2 = initFirstSeenBaseline("g");
+check("(a) 第二次 baseline 新增 0 (幂等)", add2 == 0);
+check("(a) count 仍 == 3", l3CountFirstSeen("g") == 3);
+
+// ---- (b) coalesce 防 NULL: 先建 last_speak 行 first_seen=NULL → baseline 补上 ----
+// 造 member "d": 有 last_speak 行但 first_seen=NULL (speakRecord 建行后强制 clear 该列模拟旧 force-rebuild 残留)。
+speakRecord("g", "d", T_NOW - 100000L);     // d: last_speak 行, first_seen 初值=T_NOW-100000
+conn.createStatement().execute("UPDATE speak SET first_seen=NULL WHERE grp='g' AND wxid='d'");
+check("(b) 预置: d first_seen 为 NULL", speakQueryFirstSeen("g", "d") == null);
+check("(b) 预置: d last_speak 非空 (行存在)", speakQueryLastSpeak("g", "d").longValue() == T_NOW - 100000L);
+
+FAKE_MEMBERS.put("g", java.util.Arrays.asList(new String[]{ "a", "b", "c", "d" }));
+int add3 = initFirstSeenBaseline("g");
+// d 此前 first_seen=NULL (不在 firstSeenSet) → 算新增; a/b/c 已有 → 不算
+check("(b/c) baseline 仅补 d 一人 (NULL 行算新增)", add3 == 1);
+check("(b) d first_seen 被 coalesce 补成 T_NOW (NULL→值)",
+    speakQueryFirstSeen("g", "d").longValue() == T_NOW);
+check("(b) d last_speak 不动 (UPSERT first_seen 不碰 last_speak)",
+    speakQueryLastSpeak("g", "d").longValue() == T_NOW - 100000L);
+
+// 已有更早 first_seen 取 min 不覆盖: a 的 first_seen 已是 T_NOW, 用更晚 ts 再 baseline 不应改晚。
+long T_LATER = T_NOW + 500000L;
+FAKE_NOW = T_LATER;
+FAKE_MEMBERS.put("g", java.util.Arrays.asList(new String[]{ "a" }));
+initFirstSeenBaseline("g");
+check("(b) a first_seen 取 min 不被更晚 ts 覆盖", speakQueryFirstSeen("g", "a").longValue() == T_NOW);
+FAKE_NOW = T_NOW;
+
+// ---- (c) 计数 = 真正补进人数 ----
+check("(c) count first_seen == 4 (a,b,c,d)", l3CountFirstSeen("g") == 4);
+
+// ---- (d) l3ClearFirstSeen 后 count=0 ----
+l3ClearFirstSeen("g");
+check("(d) clear 后 count first_seen == 0", l3CountFirstSeen("g") == 0);
+check("(d) clear 不删行: d last_speak 仍在", speakQueryLastSpeak("g", "d").longValue() == T_NOW - 100000L);
+
+conn.close();
+done();

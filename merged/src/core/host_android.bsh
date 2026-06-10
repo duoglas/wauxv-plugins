@@ -20,6 +20,9 @@ String _hostGetLoginWxid()                     { return getLoginWxid(); }
 void   _hostSendText(String grp, String msg)   { sendText(grp, msg); }
 // 引用条发送缝: WAuxiliary 注入的 sendQuoteMsg(会话, 本地msgId, 文本) 内置全局。名字不同不会自递归。
 void   _hostSendQuote(String grp, long msgid, String text) { sendQuoteMsg(grp, msgid, text); }
+// 群成员列表缝: WAuxiliary 注入的 getGroupMemberList(会话) 内置全局, 返回 List<String> wxid。
+//   名字与内置 getGroupMemberList 不同(_前缀)不会自递归。TODO(P3-c): 真机验内置确返 wxid List。
+java.util.List _hostGetMemberList(String grp) { return getGroupMemberList(grp); }
 
 Object makeAndroidHost() {
     String getString(String key, String def) { return _hostGetString(key, def); }
@@ -33,6 +36,9 @@ Object makeAndroidHost() {
     }
     // 发文本到群会话: 直接转发 WAuxiliary 内置 sendText。
     void sendText(String grp, String msg) { _hostSendText(grp, msg); }
+    // 取群成员 wxid 列表: 转发 WAuxiliary 内置 getGroupMemberList (initFirstSeenBaseline 用)。
+    //   TODO(P3-c): 真机验内置确返 List<String> wxid (同 sendText 范式, 本地无运行时不可执行)。
+    java.util.List getGroupMemberList(String grp) { return _hostGetMemberList(grp); }
     // 引用条: 引用原红包消息发群规文本 (复刻线上 rpSendQuote 健壮性, main.java:1720-1736 逐字)。
     //   msgid>0 → 优先 sendQuoteMsg 引用原红包; 抛异常 → 回退 sendText(同一文本, 不带引用)。
     //   msgid<=0 → 直接 sendText。绝不因引用失败漏发 (达标≥1 必发一条群规)。
