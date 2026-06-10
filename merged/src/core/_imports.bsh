@@ -1,0 +1,24 @@
+// ============================================================
+// _imports — 装配体 import 头 (manifest 最前; 仅生产拼接, tests 不含)。
+//
+// 缘由 (VH-05 延伸): 合并装配体大部分代码用 FQN, 但从线上 RP 逐字搬来的设备层 UI 自动化
+//   (app/device_ui.bsh / app/device_recv.bsh) 与 RP onResume hook (app/hooks.bsh) 保留了
+//   裸类名 (XposedHelpers / XC_MethodHook / MethodHookParam / Activity / View / ViewGroup /
+//   Intent / TextView), 它们依赖线上 RP/GA 的 import; 合并"零 import 化"时漏 FQN 化这几片 →
+//   真机 onLoad 报 "Unknown class: XC_MethodHook", 连坐 RP worker 启动 (hooks.bsh 同 try 块)。
+// 修法 = 恢复线上 import 全集 (GA 通配 ∪ RP 专项), 逐字保真这些方法体, 不逐处 FQN 化 (易错)。
+//   解析门只查语法不查符号 → 这类缺 import 只真机暴露; tests 用 source() 单片加载不经本片, 不受影响。
+//
+// 来源对照: 线上 GA main.java @47-53 (7 条通配) + 线上 RP main.java @251-258 (Activity/Intent/View/
+//   ViewGroup/TextView 已被 GA 通配覆盖, 仅补 3 条 de.robv.android.xposed 专项)。
+// ============================================================
+import java.util.*;
+import android.app.*;
+import android.content.*;
+import android.view.*;
+import android.widget.*;
+import android.graphics.*;
+import android.graphics.drawable.*;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodHook.MethodHookParam;
+import de.robv.android.xposed.XposedHelpers;

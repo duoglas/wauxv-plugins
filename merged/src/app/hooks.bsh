@@ -33,8 +33,8 @@
 //                      initFirstSeenBaseline / isGroupEnabled / _logNativeRoleProbe / perfFlush。
 // ============================================================
 
-// ===== DB 落盘底座路径 (线上 @171 逐字) =====
-String L3_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdmin/groupadmin.db";
+// ===== DB 落盘底座路径 (线上 @171; 合并体独立归属: 统一插件 GroupAdminPlus 自带库, 与被替代的旧 GA/RP 目录隔离) =====
+String L3_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdminPlus/groupadmin.db";
 
 // 索引/WAL: 线上 l3Db @187-190 在懒开时一并建。建表本身经 STORAGE.exec(SPEAK_CREATE_SQL) 走端口;
 // 索引/PRAGMA 属底层连接级设置, 在打开 SQLiteDatabase 句柄那一步直接做 (端口契约只暴露 exec/queryLong)。
@@ -47,7 +47,9 @@ android.database.sqlite.SQLiteDatabase _hooksOpenDb() {
     android.database.sqlite.SQLiteDatabase db =
         android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(
             L3_DB_PATH, (android.database.sqlite.SQLiteDatabase.CursorFactory) null);
-    db.execSQL(SPEAK_INDEX_SQL);
+    // VH-05/C-ARCH-05: 索引建在 speak 表之后 → 移到 onLoad 建表后 (STORAGE.exec(SPEAK_INDEX_SQL))。
+    //   原先在此处 execSQL(SPEAK_INDEX_SQL) 早于 STORAGE.exec(SPEAK_CREATE_SQL) → "no such table: speak" 抛异常,
+    //   连坐同 try 块后续端口接线 (global.STORAGE/HOST/CLOCK/LEAF) 整段跳过 → 全 undefined。
     // WAL 必须走 rawQuery: 该 PRAGMA 返回一行, execSQL 会拒绝并抛 (线上 @188-189 spike 已确认)。
     try { android.database.Cursor c = db.rawQuery("PRAGMA journal_mode=WAL", (String[]) null); if (c != null) c.close(); } catch (Throwable t) {}
     try { db.execSQL("PRAGMA synchronous=NORMAL"); } catch (Throwable t) {}
@@ -74,7 +76,7 @@ void l3FlushLoop() {
 // ============================================================
 // onLoad — WAuxiliary 插件入口 (线上 @1941 逐字 + 端口接线)。
 //   (1) 端口接线 (生产装配点, 唯一): STORAGE/HOST/CLOCK = 各 core 工厂。
-//   (2) 建表: STORAGE.exec(SPEAK_CREATE_SQL) (speak 表; 索引/WAL 在 _hooksOpenDb 已建)。
+//   (2) 建表+索引: STORAGE.exec(SPEAK_CREATE_SQL) → STORAGE.exec(SPEAK_INDEX_SQL) → RP_CREATE_SQL (表先于索引, VH-05); WAL/synchronous 在 _hooksOpenDb 设。
 //   (3) 冷启动日志块 (C-PLUGIN-05: getLoginWxid 安全取值, 取不到用占位串, 整块 try/catch)。
 //   (4) 延迟基线调度块 (delay 5s → 一次性迁移 CSV→DB + 对所有已启用群补 first_seen 基线)。
 //   (5) 启动后台 L3 flush 循环 (防重复启动, 单独 try/catch 不被前面块连累)。
@@ -85,12 +87,18 @@ void onLoad() {
     // STORAGE 装配在最前 (后续建表 + 基线块 + flush 循环都依赖全局 STORAGE 已置)。
     try {
         android.database.sqlite.SQLiteDatabase db = _hooksOpenDb();
-        STORAGE = makeAndroidStorage(db);   // 端口接线: 生产 SQLite 适配器
-        HOST    = makeAndroidHost();         // 端口接线: WAuxiliary 宿主适配器
-        CLOCK   = makeAndroidClock();        // 端口接线: 墙钟适配器
-        LEAF    = makeAndroidLeaf();          // W6: 桥接 GA 动作 LEAF → 真实 do* (生产适配器, 收口片定义)
-        // 建表走端口 (与测试 jdbc 适配器跑同一份 CREATE SQL)。索引/WAL 已在 _hooksOpenDb 建。
+        // C-ARCH-05: 端口单例必须写穿全局命名空间。BeanShell 方法体内对"无顶层声明"变量裸赋值只建方法局部
+        //   (STORAGE/HOST/CLOCK 无顶层声明 → 真机 onHandleMsg 读 undefined, VH-05)。统一 global. 限定写全局,
+        //   onHandleMsg/isGroupEnabled 等其它方法才读得到 (实证 bsh-2.0b6: global.X= 跨方法可读)。LEAF 虽有顶层
+        //   noop 声明本可写穿, 一并 global. 限定保持一致并自证规则。
+        global.STORAGE = makeAndroidStorage(db);   // 端口接线: 生产 SQLite 适配器
+        global.HOST    = makeAndroidHost();         // 端口接线: WAuxiliary 宿主适配器
+        global.CLOCK   = makeAndroidClock();        // 端口接线: 墙钟适配器
+        global.LEAF    = makeAndroidLeaf();          // W6: 桥接 GA 动作 LEAF → 真实 do* (生产适配器, 收口片定义)
+        // 建表走端口 (与测试 jdbc 适配器跑同一份 CREATE SQL)。WAL/synchronous 已在 _hooksOpenDb 设。
         STORAGE.exec(SPEAK_CREATE_SQL, new Object[]{});
+        // VH-05: speak 索引必须建在 speak 表之后 (原先在 _hooksOpenDb 早建 → no such table 抛错连坐接线)。
+        STORAGE.exec(SPEAK_INDEX_SQL, new Object[]{});
         // W6: RP 表 (merged 适配: 线上 RP 用独立 RP_DB 懒建, merged 统一进 STORAGE=groupadmin.db 同库,
         //     故 onLoad 显式建 rp_record 表)。
         STORAGE.exec(RP_CREATE_SQL, new Object[]{});

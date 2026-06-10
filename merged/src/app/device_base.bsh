@@ -130,9 +130,9 @@ long PERF_EXTRACT_MAX_NS = 0L; // 窗口内 rpExtractTitle 最大单次耗时 (n
 long PERF_EXTRACT_N      = 0L; // 窗口内 rpExtractTitle 调用次数
 
 // v1.3.0 §17: 统计本地 SQLite (rp_record, 一红包一行)。库与 rp.log 同目录 (GroupAdmin 同级目录建库已验证可行)。(线上 @431-436)
-String RP_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/RedPacketStats/redpacket_stats.db";
-// v1.11.0 §25: GroupAdmin 库 (只读查 speak.last_speak, 与 RP 库同级目录)。
-String GA_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdmin/groupadmin.db";
+String RP_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdminPlus/redpacket_stats.db";
+// v1.11.0 §25: GroupAdmin 库 (只读查 speak.last_speak; 合并体与 L3_DB_PATH 同指 GroupAdminPlus/groupadmin.db)。
+String GA_DB_PATH = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/GroupAdminPlus/groupadmin.db";
 android.database.sqlite.SQLiteDatabase RP_DB = null;   // 连接单例 (懒打开)
 Object RP_DB_LOCK = new Object();                       // 打开连接串行化 (防并发各 open 一次泄漏)
 
