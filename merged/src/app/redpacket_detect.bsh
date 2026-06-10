@@ -149,11 +149,48 @@ void rpEnqueue(Object[] job) {
     } catch (Throwable t) { hbBgLog("[RP] " + hbNow() + " enqueue err: " + t); }
 }
 
-// ==================== 排除名单 @ 增删命令 seam (线上 rpHandleExcludeCmd @1122) ====================
-// ★真实实现属 T7 (排除名单 @ 增删 + toast)。本片置 leaf 占位 (参照 commands.bsh LEAF / hooks.bsh _msgGetXxx)。
-//   返回 true=已处理(调用方 return 消费, 不当红包/不发群回执); false=不是排除命令(继续走红包检测)。
-//   占位恒返 false (= 不消费), 让解析门通过 + 调用骨架成立; T7 接真实实现。
-boolean rpHandleExcludeCmd(String groupId, String content, java.util.List atList) { return false; }
+// ==================== 排除名单 @ 增删命令 (线上 rpHandleExcludeCmd @1122-1158 逐字) ====================
+// 处理 "@某人 红包排除 / 取消红包排除" 命令 (v1.0.6 §12, 走 onHandleMsg 路径)。
+// 返回 true=已处理(调用方 return, 不当红包/不发群回执, 只 toast); false=不是排除命令(继续走红包检测)。
+// atList = bot @ 的 wxid 列表(去掉 bot 自己)。命令文本本身会显示在群里(一次性设置, 可接受); 处理后只 toast 不发群。
+//   ★合并改名: getLoginWxid→HOST.getLoginWxid; 键同源走 addExclude/removeExclude(内部 normGroupId, 与读侧 getExcludeList 一致)。
+boolean rpHandleExcludeCmd(String groupId, String content, java.util.List atList) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty() || g.indexOf("@chatroom") < 0) return false;   // 仅群聊
+        if (content == null) return false;
+
+        // 收集 @ 目标 wxid, 去掉 bot 自己。
+        String me = null;
+        try { me = HOST.getLoginWxid(); } catch (Throwable t) { me = null; }
+        java.util.List wxids = new java.util.ArrayList();
+        for (int i = 0; i < atList.size(); i++) {
+            Object o = atList.get(i);
+            if (o == null) continue;
+            String w = o.toString().trim();
+            if (w.isEmpty()) continue;
+            if (me != null && w.equals(me)) continue;   // 去掉 bot 自己
+            wxids.add(w);
+        }
+        if (wxids.isEmpty()) return false;   // 只 @ 了自己 / 无有效目标 → 不当排除命令
+
+        boolean isCancel = (content.indexOf("取消红包排除") >= 0) || (content.indexOf("红包取消排除") >= 0);
+        if (isCancel) {
+            int n = removeExclude(g, wxids);
+            try { toast("✅ 已移出红包排除名单: " + n + " 人 (恢复正常 @ 提醒)"); } catch (Throwable t) {}
+            hbBgLog("[RP] " + hbNow() + " exclude-cmd: removed " + n + " from group exclude list (count target=" + wxids.size() + ").");
+            return true;
+        }
+        // 含 "红包排除" 且非取消 → 加入
+        int n = addExclude(g, wxids);
+        try { toast("✅ 已加入红包排除名单: " + n + " 人 (此后红包提醒不再 @ TA)"); } catch (Throwable t) {}
+        hbBgLog("[RP] " + hbNow() + " exclude-cmd: added " + n + " to group exclude list (count target=" + wxids.size() + ").");
+        return true;
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " exclude-cmd err: " + t);
+        return false;
+    }
+}
 
 // ==================== 红包检测 + 入队 (线上 onHandleMsgBody @1234-1320 红包检测分支) ====================
 // 由 hooks.onHandleMsgBody 在 GA 采集/路由之外并行调用 (一条消息同时过 GA 与 RP, 互不破坏)。

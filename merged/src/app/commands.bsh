@@ -410,3 +410,318 @@ boolean routeCommand(String groupId, String sender, String content,
     dispatchAction(groupId, sender, quoteTarget, actionTok, qDays);
     return true;
 }
+
+// ================================================================
+// ===== RedPacketStats 文字命令层 (线上 plugins/redpacket-stats/main.java W4 逐字保真移植) =====
+//   移植: rpCurrentTalker(@1569)/rpCurrentGroupOrToast(@1578)/rpStatusText(@1587)/rpOnClickSendBtn(@1333 onClickSendBtn)。
+//   ★行为零改, 仅换载体 + 改名: getString/putString→HOST.*; enableGroup/disableGroup→rpEnableGroup/rpDisableGroup;
+//     isGroupEnabled→rpIsGroupEnabled; tiersKey/tiersCustomKey→rpTiersKey/rpTiersCustomKey;
+//     cfgExportTarget/cfgExportTargetName→rpCfgExportTarget/rpCfgExportTargetName;
+//     K_DELAY/K_RETRY1-3→RP_K_DELAY/RP_K_RETRY1-3; K_AT_LIMIT/K_RULE_PREFIX/K_FREELOADER_SINCE_PREFIX 不变;
+//     K_FREELOADER_ON_PREFIX/K_FREELOADER_WIN_PREFIX→RP_K_*; onClickSendBtn→rpOnClickSendBtn (避与 GA onClickSendBtn 撞名)。
+//   ★入口接入留 T8 (撞名收口), 本片只产出函数, 不接 onClickSendBtn 真入口。
+//   所有命令字符串/toast 文案/格式提示逐字不动。
+// ================================================================
+
+// 当前会话 talker (群=@chatroom; 非群聊返回原值)。仿 GroupAdmin getTargetTalker()。
+String rpCurrentTalker() {
+    try {
+        String t = getTargetTalker();
+        if (t != null && !t.isEmpty()) return normGroupId(t);
+    } catch (Throwable t) {}
+    return null;
+}
+
+// 取当前群 id; 不在群聊里则 toast 提示并返回 null (调用方据此放弃, 但仍 return true 不发群)。
+String rpCurrentGroupOrToast() {
+    String t = rpCurrentTalker();
+    if (t == null || t.indexOf("@chatroom") < 0) {
+        try { toast("请在目标群里发该命令"); } catch (Throwable t2) {}
+        return null;
+    }
+    return t;
+}
+
+String rpStatusText(String groupId) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("📊 红包统计 v1.11.2\n");
+    sb.append("本群: ").append(rpIsGroupEnabled(groupId) ? "✅ 已启用" : "🔴 未启用").append("\n");
+    sb.append("本群每日定时: ").append(isDailyEnabled(groupId) ? ("✅ 开 (每天" + cfgDailyHour() + "点)") : "🔴 关").append("\n");
+    // v1.6.0: 每群独立 1-4 档 (未配置则回退全局默认三档)。
+    List _tiers = getTiers(groupId);
+    boolean _custom = false;
+    try { String _raw = HOST.getString(rpTiersKey(groupId), ""); _custom = (_raw != null && !_raw.trim().isEmpty()); } catch (Throwable t) {}
+    sb.append("本群档位 (").append(_tiers.size()).append("档").append(_custom ? "" : ",全局默认").append("): ").append(rpTiersSummary(_tiers)).append("\n");
+    // v1.7.0 §22.4: 定制包维度状态。
+    boolean _customOn = isCustomOn(groupId);
+    sb.append("定制开关: ").append(_customOn ? "✅ 开" : "🔴 关 (仅 Dialog 可改)").append("\n");
+    String _kw = getCustomKw(groupId);
+    sb.append("定制关键字: ").append((_kw == null || _kw.isEmpty()) ? "(未设)" : _kw).append("\n");
+    boolean _customTiersSet = false;
+    try { String _rawc = HOST.getString(rpTiersCustomKey(groupId), ""); _customTiersSet = (_rawc != null && !_rawc.trim().isEmpty()); } catch (Throwable t) {}
+    List _ct = getTiersByType(groupId, true);
+    sb.append("定制档位 (").append(_ct.size()).append("档").append(_customTiersSet ? "" : ",回退普通").append("): ").append(rpTiersSummary(_ct)).append("\n");
+    // v1.7.1 §22.6: 定制包第一条群规前缀。
+    sb.append("定制群规前缀: ").append(cfgCustomRulePrefix(groupId)).append("\n");
+    sb.append("命令: 红包阈值 a b.. / 红包文案K 文字 / 红包增加档 阈值 动作 / 红包减少档 / 定制阈值.. / 定制文案K.. / 定制增加档.. / 定制减少档 / 定制关键字 <kw> / 定制群规前缀 <文字>\n");
+    sb.append("延迟: 首次:").append(cfgDelay()).append("秒 重试1:").append(cfgRetry1()).append("秒 重试2:").append(cfgRetry2()).append("秒 重试3:").append(cfgRetry3()).append("秒 (±抖动)\n");
+    sb.append("at上限: ").append(cfgAtLimit()).append(" (超过则发无@群规消息)\n");
+    // v1.11.0 §25: 伸手党治理 (按群)。
+    sb.append("伸手党治理: ").append(cfgFreeloaderOn(groupId) ? ("✅ 开 (抢到前" + cfgFreeloaderWin(groupId) + "分钟未发言→警告)") : "🔴 关").append("\n");
+    sb.append("同群限频: ").append(cfgMsgGap()).append("秒\n");
+    sb.append("本群排除名单: ").append(getExcludeList(groupId).size()).append(" 人\n");
+    // v1.9.1 §24.5: 转发对象 (按群): 有群上下文显示该群目标 (未设回退全局默认), 无群上下文显示全局默认。
+    sb.append("转发对象: ");
+    boolean _hasGrp = (normGroupId(groupId).length() > 0);
+    String et = _hasGrp ? cfgExportTargetFor(groupId) : rpCfgExportTarget();
+    String etn = _hasGrp ? cfgExportTargetNameFor(groupId) : rpCfgExportTargetName();
+    sb.append((etn != null && !etn.isEmpty()) ? etn : "(未命名)");
+    sb.append(rpTargetIsGroup(et) ? "（群）" : "（好友）");
+    sb.append("尾4: ");
+    sb.append((et != null && et.length() >= 4) ? et.substring(et.length() - 4) : et);
+    if (!_hasGrp) sb.append(" (全局默认)");
+    return sb.toString();
+}
+
+// ================================================================
+// ============ rpOnClickSendBtn: 拦截配置命令 (不发群) (线上 onClickSendBtn @1333-1566) ============
+// ================================================================
+// v1.0.2: bot 在输入框打配置命令点发送 → 本方法拦截。命中即就地执行 + toast 本地提示 + return true
+//         (return true 阻止该消息发到群里, 不污染群)。不命中 return false (正常发送, 不影响普通聊天)。
+// 当前会话群: getTargetTalker() (仿 GroupAdmin onClickSendBtn)。本方法运行在 UI 线程上下文,
+// getTopActivity() 拿得到前台 Activity, 故 `红包统计设置` 能正常弹 Dialog (修复在消息线程弹失败)。
+//   ★函数名改 rpOnClickSendBtn (避与 GA onClickSendBtn 撞名); 真入口收口留 T8。本片只产出函数。
+boolean rpOnClickSendBtn(String text) {
+    try {
+        if (text == null) return false;
+        String content = text.trim();
+        if (content.isEmpty()) return false;
+
+        // 设置入口: 弹本群配置 Dialog (UI 线程, getTopActivity)
+        if (content.equals("红包统计设置")) {
+            String groupId = rpCurrentTalker();
+            showConfigDialog(groupId);   // groupId 可能为 null(非群聊) → Dialog 走全局配置分支
+            return true;
+        }
+        if (content.equals("开启红包统计")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            rpEnableGroup(groupId);
+            try { toast("✅ 已开启本群红包统计 (领完后按金额分档 @ 圈人)"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.equals("关闭红包统计")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            rpDisableGroup(groupId);
+            try { toast("🔕 已关闭本群红包统计"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.equals("红包统计状态")) {
+            String groupId = rpCurrentTalker();
+            try { toast(rpStatusText(groupId)); } catch (Throwable t) {}
+            return true;
+        }
+        // v1.4.0 §20: 每日定时按群开关 (对当前群; 拦截不发群, toast 反馈)。
+        if (content.equals("开启红包定时")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            enableDailyGroup(groupId);
+            try { toast("✅ 已开启本群每日定时统计 (每天" + cfgDailyHour() + "点私聊汇总过去24h)"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.equals("关闭红包定时")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            disableDailyGroup(groupId);
+            try { toast("🔕 已关闭本群每日定时统计"); } catch (Throwable t) {}
+            return true;
+        }
+        // v1.4.0 §20: 手动测试每日发送 (bot 自己; 立即按过去24h对 daily_groups 跑一次 → 私聊 ACCT_REDACTED)。
+        if (content.equals("红包每日测试")) {
+            try { rpDailyTest(); toast("📤 已触发每日测试 (过去24h → 私聊, 看 rp.log)"); } catch (Throwable t) { try { toast("❌ 测试失败: " + t); } catch (Throwable t2) {} }
+            return true;
+        }
+        // ========== v1.7.0 §22.4: 定制包档表命令 (作用当前群, 复用普通解析器 isCustom=true) ==========
+        // 顺序: 定制* 必须在 红包* 之前不必, 因前缀不同; 但 定制关键字 要先于 定制(若有其它). 这里各自独立 startsWith/equals。
+        if (content.startsWith("定制关键字")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            String kw = content.substring("定制关键字".length()).trim();
+            try {
+                setCustomKw(groupId, kw);
+                if (kw.isEmpty()) toast("✅ 已清空本群定制关键字 (定制将回退普通包)");
+                else toast("✅ 本群定制关键字(包含匹配祝福语): " + kw + (isCustomOn(groupId) ? "" : "\n⚠️ 定制开关未开, 请在『红包统计设置』Dialog 开启"));
+            } catch (Throwable t) { try { toast("❌ 格式: 定制关键字 恭喜发财"); } catch (Throwable t2) {} }
+            return true;
+        }
+        // v1.7.1 §22.6: 定制包第一条群规前缀 (当前群, 单值原样存储/发送), 仿 红包群规前缀。
+        if (content.startsWith("定制群规前缀")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            String v = content.substring("定制群规前缀".length()).trim();
+            try { if (!v.isEmpty()) { HOST.putString(customRulePrefixKey(groupId), v); toast("✅ 本群定制群规前缀(原样发送): " + v); } else toast("❌ 格式: 定制群规前缀 定制包请按要求执行"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.startsWith("定制增加档")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            String rest = content.substring("定制增加档".length()).trim();
+            try { toast(rpAddTierCmd(groupId, rest, true)); } catch (Throwable t) { try { toast("❌ 格式: 定制增加档 20 发视频"); } catch (Throwable t2) {} }
+            return true;
+        }
+        if (content.equals("定制减少档")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            try { toast(rpDelTopTierCmd(groupId, true)); } catch (Throwable t) { try { toast("❌ 操作失败"); } catch (Throwable t2) {} }
+            return true;
+        }
+        if (content.startsWith("定制阈值")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            String rest = content.substring("定制阈值".length()).trim();
+            try { toast(rpSetThresholdsCmd(groupId, rest, true)); } catch (Throwable t) { try { toast("❌ 格式: 定制阈值 5 10 (1-" + RP_MAX_TIERS + "个递增正整数)"); } catch (Throwable t2) {} }
+            return true;
+        }
+        if (content.startsWith("定制文案")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            try {
+                String afterPrefix = content.substring("定制文案".length());
+                int di = 0;
+                while (di < afterPrefix.length() && di < 2 && afterPrefix.charAt(di) >= '0' && afterPrefix.charAt(di) <= '9') di++;
+                if (di == 0) { try { toast("❌ 格式: 定制文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} return true; }
+                String kStr = afterPrefix.substring(0, di);
+                int k = Integer.parseInt(kStr);
+                if (k < 1 || k > RP_MAX_TIERS) { try { toast("❌ 档号需 1-" + RP_MAX_TIERS); } catch (Throwable t2) {} return true; }
+                String v = afterPrefix.substring(di).trim();
+                if (v.isEmpty()) { try { toast("❌ 格式: 定制文案" + k + " 爆照 (动作不能为空)"); } catch (Throwable t2) {} return true; }
+                try { toast(rpSetTierActionCmd(groupId, k, v, true)); } catch (Throwable t) { try { toast("❌ 格式: 定制文案" + k + " 爆照"); } catch (Throwable t2) {} }
+            } catch (Throwable t) { try { toast("❌ 格式: 定制文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} }
+            return true;
+        }
+        // v1.6.0: 红包增加档 <阈值> <动作> — 当前群追加一档 (需档数 <4)。
+        if (content.startsWith("红包增加档")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            String rest = content.substring("红包增加档".length()).trim();
+            try { toast(rpAddTierCmd(groupId, rest)); } catch (Throwable t) { try { toast("❌ 格式: 红包增加档 20 发视频"); } catch (Throwable t2) {} }
+            return true;
+        }
+        // v1.6.0: 红包减少档 — 删当前群最高档 (档数需 >1)。
+        if (content.equals("红包减少档")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            try { toast(rpDelTopTierCmd(groupId)); } catch (Throwable t) { try { toast("❌ 操作失败"); } catch (Throwable t2) {} }
+            return true;
+        }
+        // v1.6.1: 红包阈值 a [b ...] — 接受 1-RP_MAX_TIERS 个正整数, 作用当前群; 自动升序、拒重复。
+        //   新档数 > 原档数: 新增档动作留空(沿用旧动作或提示设置); 新档数 < 原档数: 截断多余档动作。
+        if (content.startsWith("红包阈值")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            String rest = content.substring("红包阈值".length()).trim();
+            try { toast(rpSetThresholdsCmd(groupId, rest)); } catch (Throwable t) { try { toast("❌ 格式: 红包阈值 5 10 (1-" + RP_MAX_TIERS + "个递增正整数)"); } catch (Throwable t2) {} }
+            return true;
+        }
+        // v1.6.1: 红包文案K 文字 (K=1..RP_MAX_TIERS) — 设当前群第 K 档动作。
+        //   解析前导整数(1-2位)作 K, 其余 trim 作动作 v。修 v1.6.0 charAt(0) 只认 '1'-'4' 的两位数 bug
+        //   (旧: "红包文案10 发红包" → K=1 动作="0 发红包"; 新: K=10 动作="发红包")。
+        if (content.startsWith("红包文案")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            try {
+                String afterPrefix = content.substring("红包文案".length());
+                // 取开头连续数字 (1-2 位) 作 K
+                int di = 0;
+                while (di < afterPrefix.length() && di < 2 && afterPrefix.charAt(di) >= '0' && afterPrefix.charAt(di) <= '9') di++;
+                if (di == 0) { try { toast("❌ 格式: 红包文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} return true; }
+                String kStr = afterPrefix.substring(0, di);
+                int k = Integer.parseInt(kStr);
+                if (k < 1 || k > RP_MAX_TIERS) { try { toast("❌ 档号需 1-" + RP_MAX_TIERS); } catch (Throwable t2) {} return true; }
+                String v = afterPrefix.substring(di).trim();
+                if (v.isEmpty()) { try { toast("❌ 格式: 红包文案" + k + " 爆照 (动作不能为空)"); } catch (Throwable t2) {} return true; }
+                try { toast(rpSetTierActionCmd(groupId, k, v)); } catch (Throwable t) { try { toast("❌ 格式: 红包文案" + k + " 爆照"); } catch (Throwable t2) {} }
+            } catch (Throwable t) { try { toast("❌ 格式: 红包文案1 爆照 (档号 1-" + RP_MAX_TIERS + ")"); } catch (Throwable t2) {} }
+            return true;
+        }
+        // v1.0.7 §14: >上限通用群规消息前缀, 单值原样存储/发送 (不随机)。
+        if (content.startsWith("红包群规前缀")) {
+            String v = content.substring("红包群规前缀".length()).trim();
+            try { if (!v.isEmpty()) { HOST.putString(K_RULE_PREFIX, v); toast("✅ 群规前缀(原样发送): " + v); } else toast("❌ 格式: 红包群规前缀 领红包请遵守群规执行"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.startsWith("红包延迟")) {
+            String v = content.substring("红包延迟".length()).trim();
+            try {
+                if (v.isEmpty()) {
+                    toast("当前延迟(秒): 首次=" + cfgDelay() + " 重试1=" + cfgRetry1() + " 重试2=" + cfgRetry2() + " 重试3=" + cfgRetry3());
+                } else {
+                    String[] parts = v.split("\\s+");
+                    if (parts.length == 1) {
+                        long s = Long.parseLong(parts[0]); HOST.putString(RP_K_DELAY, String.valueOf(s));
+                        toast("✅ 首次开页延迟: " + s + "秒");
+                    } else if (parts.length >= 4) {
+                        // v1.10.0 §4: 四参 = 首次/重试1/重试2/重试3 (秒)
+                        long s0 = Long.parseLong(parts[0]); long s1 = Long.parseLong(parts[1]); long s2 = Long.parseLong(parts[2]); long s3 = Long.parseLong(parts[3]);
+                        HOST.putString(RP_K_DELAY, String.valueOf(s0)); HOST.putString(RP_K_RETRY1, String.valueOf(s1)); HOST.putString(RP_K_RETRY2, String.valueOf(s2)); HOST.putString(RP_K_RETRY3, String.valueOf(s3));
+                        toast("✅ 延迟(秒): 首次=" + s0 + " 重试1=" + s1 + " 重试2=" + s2 + " 重试3=" + s3);
+                    } else if (parts.length == 3) {
+                        long s0 = Long.parseLong(parts[0]); long s1 = Long.parseLong(parts[1]); long s2 = Long.parseLong(parts[2]);
+                        HOST.putString(RP_K_DELAY, String.valueOf(s0)); HOST.putString(RP_K_RETRY1, String.valueOf(s1)); HOST.putString(RP_K_RETRY2, String.valueOf(s2));
+                        toast("✅ 延迟(秒): 首次=" + s0 + " 重试1=" + s1 + " 重试2=" + s2);
+                    } else {
+                        toast("❌ 格式: 红包延迟 120 (秒) 或 120 300 600 (首次/重试1/重试2) 或 120 300 600 3600 (含重试3 秒)");
+                    }
+                }
+            }
+            catch (Exception e) { try { toast("❌ 格式: 红包延迟 120 (秒) 或 120 300 600 (首次/重试1/重试2) 或 120 300 600 3600 (含重试3 秒)"); } catch (Throwable t) {} }
+            return true;
+        }
+        if (content.startsWith("红包at上限")) {
+            String v = content.substring("红包at上限".length()).trim();
+            try { int n = Integer.parseInt(v); HOST.putString(K_AT_LIMIT, String.valueOf(n)); toast("✅ 达标总人数上限: " + n + " (超过则改发无@群规消息)"); }
+            catch (Exception e) { try { toast("❌ 格式: 红包at上限 20"); } catch (Throwable t) {} }
+            return true;
+        }
+        // v1.11.0 §25: 伸手党治理 (作用当前群)。注意 "伸手党窗口" 必须先于 "伸手党" 判定 (前缀包含关系)。
+        if (content.startsWith("伸手党窗口")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            String v = content.substring("伸手党窗口".length()).trim();
+            try {
+                int n = Integer.parseInt(v);
+                if (n < 1 || n > 1440) { toast("❌ 窗口需 1-1440 分钟"); return true; }
+                HOST.putString(RP_K_FREELOADER_WIN_PREFIX + groupId, String.valueOf(n));
+                toast("✅ 本群伸手党窗口: " + n + " 分钟 (抢到前此窗口内未发言 → 警告)");
+            } catch (Exception e) { try { toast("❌ 格式: 伸手党窗口 30 (分钟, 1-1440)"); } catch (Throwable t) {} }
+            return true;
+        }
+        if (content.equals("伸手党 开") || content.equals("伸手党开")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            try {
+                boolean wasOn = cfgFreeloaderOn(groupId);   // v1.11.3 §25.9: 仅 OFF→ON 写 since, 不重置宽限
+                HOST.putString(RP_K_FREELOADER_ON_PREFIX + groupId, "1");
+                if (!wasOn) HOST.putString(K_FREELOADER_SINCE_PREFIX + normGroupId(groupId), String.valueOf(System.currentTimeMillis()));   // v1.11.4: key 经 normGroupId 与读一致
+                toast("✅ 已开启本群伸手党治理 (开后" + cfgFreeloaderWin(groupId) + "分钟内全员豁免, 之后抢到前未发言 → 发群管警告)");
+            } catch (Throwable t) {}
+            return true;
+        }
+        if (content.equals("伸手党 关") || content.equals("伸手党关")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            try { HOST.putString(RP_K_FREELOADER_ON_PREFIX + groupId, ""); toast("🔕 已关闭本群伸手党治理"); } catch (Throwable t) {}
+            return true;
+        }
+        if (content.equals("伸手党")) {
+            String groupId = rpCurrentGroupOrToast();
+            if (groupId == null) return true;
+            try { toast("🖐 本群伸手党治理: " + (cfgFreeloaderOn(groupId) ? "✅ 开" : "🔴 关") + "\n窗口: " + cfgFreeloaderWin(groupId) + " 分钟\n命令: 伸手党 开/关 | 伸手党窗口 N"); } catch (Throwable t) {}
+            return true;
+        }
+    } catch (Throwable t) {
+        try { log("RedPacketStats onClickSendBtn err: " + t); } catch (Throwable t2) {}
+    }
+    return false;   // 非配置命令: 正常发送, 不影响普通聊天/红包
+}

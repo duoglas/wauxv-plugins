@@ -267,3 +267,116 @@ String renderTierRuleLine(String prefix, List tiers) {
     }
     return ruleSb.toString();
 }
+
+// ==================== 档表 文字命令 (线上 @685-832 逐字; tiersCustomKey→rpTiersCustomKey, 余不变) ====================
+//   依赖 getTiers/getTiersByType/setTiers/setTiersToKey/rpTiersSummary/sanitizeTierAction/RP_MAX_TIERS (本片/seam 已有)。
+//   每个 *Cmd 各有 2 参转发版 + 3 参 isCustom 版 (线上既有重载, 非撞名)。
+
+// 红包阈值 a [b ...]: 设当前群 1-RP_MAX_TIERS 个递增阈值。保留原各档动作 (按档次对位), 新增档动作留空提示。
+String rpSetThresholdsCmd(String groupId, String rest) { return rpSetThresholdsCmd(groupId, rest, false); }
+// v1.7.0 §22.4: isCustom=true → 操作 rp_tiers_custom_<gid> (读回退普通档表, 写定制键); 文案前缀按类型切换。逻辑与普通逐行一致。
+String rpSetThresholdsCmd(String groupId, String rest, boolean isCustom) {
+    String cmdName = isCustom ? "定制阈值" : "红包阈值";
+    String actCmd = isCustom ? "定制文案" : "红包文案";
+    if (rest == null) rest = "";
+    String trimmed = rest.trim();
+    if (trimmed.isEmpty()) return "❌ 格式: " + cmdName + " 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
+    String[] parts = trimmed.split("\\s+");
+    List nums = new java.util.ArrayList();
+    for (int i = 0; i < parts.length; i++) {
+        String p = parts[i].trim();
+        if (p.isEmpty()) continue;
+        int v;
+        try { v = Integer.parseInt(p); } catch (Throwable t) { return "❌ 阈值需整数: " + cmdName + " 5 10 20"; }
+        if (v <= 0) return "❌ 阈值需正整数";
+        nums.add(Integer.valueOf(v));
+    }
+    if (nums.isEmpty()) return "❌ 格式: " + cmdName + " 5 10 20 (1-" + RP_MAX_TIERS + " 个递增正整数)";
+    if (nums.size() > RP_MAX_TIERS) return "❌ 最多 " + RP_MAX_TIERS + " 档";
+    // 升序排序 + 拒绝重复/相等
+    for (int i = 0; i < nums.size(); i++) {
+        for (int j = i + 1; j < nums.size(); j++) {
+            if (((Integer) nums.get(i)).intValue() == ((Integer) nums.get(j)).intValue()) return "❌ 阈值不能重复";
+        }
+    }
+    // 简单升序
+    for (int i = 1; i < nums.size(); i++) {
+        Integer cur = (Integer) nums.get(i); int cv = cur.intValue(); int k = i - 1;
+        while (k >= 0 && ((Integer) nums.get(k)).intValue() > cv) { nums.set(k + 1, nums.get(k)); k--; }
+        nums.set(k + 1, cur);
+    }
+    // 旧档表 (按档次对位保留动作)。定制: 读 getTiersByType(true) (未配回退普通档表), 写定制键。
+    List old = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    List out = new java.util.ArrayList();
+    int missingFrom = -1;
+    for (int i = 0; i < nums.size(); i++) {
+        int thr = ((Integer) nums.get(i)).intValue();
+        String act = "";
+        if (i < old.size()) act = (String) ((Object[]) old.get(i))[1];
+        if (act == null) act = "";
+        act = sanitizeTierAction(act);
+        if (act.isEmpty() && missingFrom < 0) missingFrom = i + 1;   // 1-based
+        out.add(new Object[]{ Integer.valueOf(thr), act.isEmpty() ? "未设" : act });
+    }
+    if (isCustom) setTiersToKey(rpTiersCustomKey(groupId), out); else setTiers(groupId, out);
+    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    String msg = "✅ 本群" + (isCustom ? "定制" : "") + "已设 " + saved.size() + " 档: " + rpTiersSummary(saved);
+    if (missingFrom > 0) msg += "\n⚠️ 档" + missingFrom + "起动作未设, 请发 " + actCmd + missingFrom + " <动作> 设置";
+    return msg;
+}
+
+// 红包文案K 文字: 设当前群第 K 档动作。
+String rpSetTierActionCmd(String groupId, int k, String v) { return rpSetTierActionCmd(groupId, k, v, false); }
+// v1.7.0 §22.4: isCustom=true → 操作定制档表 (读 getTiersByType(true), 写定制键)。
+String rpSetTierActionCmd(String groupId, int k, String v, boolean isCustom) {
+    String txtCmd = isCustom ? "定制文案" : "红包文案";
+    String addCmd = isCustom ? "定制增加档" : "红包增加档";
+    if (v == null || v.trim().isEmpty()) return "❌ 格式: " + txtCmd + k + " 爆照";
+    List tiers = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    if (k < 1 || k > tiers.size()) return "❌ 当前仅 " + tiers.size() + " 档, 请先发 " + addCmd + " <阈值> <动作> 增加档";
+    String act = sanitizeTierAction(v);
+    if (act.isEmpty()) return "❌ 动作不能为空";
+    Object[] e = (Object[]) tiers.get(k - 1);
+    e[1] = act;
+    if (isCustom) setTiersToKey(rpTiersCustomKey(groupId), tiers); else setTiers(groupId, tiers);
+    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    return "✅ " + (isCustom ? "定制" : "") + "档" + k + "动作(原样,措辞随机): " + act + "\n当前: " + rpTiersSummary(saved);
+}
+
+// 红包增加档 <阈值> <动作>: 当前群追加一档。
+String rpAddTierCmd(String groupId, String rest) { return rpAddTierCmd(groupId, rest, false); }
+// v1.7.0 §22.4: isCustom=true → 追加到定制档表 (读 getTiersByType(true), 写定制键)。
+String rpAddTierCmd(String groupId, String rest, boolean isCustom) {
+    String addCmd = isCustom ? "定制增加档" : "红包增加档";
+    if (rest == null) rest = "";
+    rest = rest.trim();
+    int sp = rest.indexOf(' ');
+    if (sp < 0) return "❌ 格式: " + addCmd + " 30 发红包";
+    String tStr = rest.substring(0, sp).trim();
+    String act = sanitizeTierAction(rest.substring(sp + 1));
+    int thr;
+    try { thr = Integer.parseInt(tStr); } catch (Throwable t) { return "❌ 阈值需整数: " + addCmd + " 30 发红包"; }
+    if (thr <= 0) return "❌ 阈值需正整数";
+    if (act.isEmpty()) return "❌ 格式: " + addCmd + " 30 发红包";
+    List tiers = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    if (tiers.size() >= RP_MAX_TIERS) return "❌ 最多 " + RP_MAX_TIERS + " 档";
+    for (int i = 0; i < tiers.size(); i++) {
+        if (((Integer) ((Object[]) tiers.get(i))[0]).intValue() == thr) return "❌ 该阈值已存在";
+    }
+    tiers.add(new Object[]{ Integer.valueOf(thr), act });
+    if (isCustom) setTiersToKey(rpTiersCustomKey(groupId), tiers); else setTiers(groupId, tiers);
+    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    return "✅ 已增加" + (isCustom ? "定制" : "") + "档 (>" + thr + "元 " + act + "), 当前 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
+}
+
+// 红包减少档: 删当前群最高档 (档数需 >1)。
+String rpDelTopTierCmd(String groupId) { return rpDelTopTierCmd(groupId, false); }
+// v1.7.0 §22.4: isCustom=true → 删定制档表最高档 (读 getTiersByType(true), 写定制键)。
+String rpDelTopTierCmd(String groupId, boolean isCustom) {
+    List tiers = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    if (tiers.size() <= 1) return "❌ 至少保留 1 档, 无法再减少";
+    Object[] removed = (Object[]) tiers.remove(tiers.size() - 1);
+    if (isCustom) setTiersToKey(rpTiersCustomKey(groupId), tiers); else setTiers(groupId, tiers);
+    List saved = isCustom ? getTiersByType(groupId, true) : getTiers(groupId);
+    return "✅ 已删除" + (isCustom ? "定制" : "") + "最高档 (>" + ((Integer) removed[0]).intValue() + "元 " + (String) removed[1] + "), 剩 " + saved.size() + " 档:\n" + rpTiersSummary(saved);
+}

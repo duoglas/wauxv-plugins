@@ -63,6 +63,25 @@ int removeExclude(String groupId, List wxids) {
     return removed;
 }
 
+// 排除名单加入 (命令路径 rpHandleExcludeCmd 用; 线上 addExclude @1044-1059 逐字)。
+//   ★键同源: 复用读侧 rpExcludeKey(=K_EXCLUDE_PREFIX+normGroupId) + getExcludeList/joinCsv, 不另起键名/规整。
+//   putString→HOST.putString。返回新增数量。
+int addExclude(String groupId, List wxids) {
+    String g = normGroupId(groupId);
+    if (g.isEmpty() || wxids == null || wxids.isEmpty()) return 0;
+    List l = getExcludeList(g);
+    int added = 0;
+    for (int i = 0; i < wxids.size(); i++) {
+        String w = ((String) wxids.get(i)).trim();
+        if (w.isEmpty()) continue;
+        boolean exist = false;
+        for (int j = 0; j < l.size(); j++) if (w.equals(((String) l.get(j)).trim())) { exist = true; break; }
+        if (!exist) { l.add(w); added++; }
+    }
+    if (added > 0) HOST.putString(rpExcludeKey(g), joinCsv(l));
+    return added;
+}
+
 // ==================== 定制包判定 (v1.7.0/v1.7.1, 线上 @568-619 逐字) ====================
 String rpCustomOnKey(String groupId) { return RPQ_K_CUSTOM_ON_PREFIX + normGroupId(groupId); }
 // 定制开关: 键值 trim 后 =="1" 为开(线上 @575); 无效 gid/异常 → 关(false)。

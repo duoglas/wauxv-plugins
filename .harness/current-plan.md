@@ -45,8 +45,18 @@ P3-b 全程纯本地产出 + 解析 + 审查。adb push / 改 per-group 配置 /
     - 符号改名表对齐合并命名空间（cfgInt→rpCfgInt / K_*→RP_K_* / tiersCustomKey→rpTiersCustomKey / putString·getString·sendText→HOST.*）；键全部读写同源（rpCustomOnKey/rpExcludeKey/RP_K_ENABLED/K_DAILY_GROUPS）。
     - **2 处非纯改名（语义等价/收口）**：① rpExportToday 端口化（rpQueryToday+HOST.sendText 镜像 rpDailySend，文案/脱敏日志逐字）；② RP 本群启用写路径 rpEnableGroup/rpDisableGroup 提前落地（rp 前缀避撞 GA enableGroup，与读侧 rpIsGroupEnabled 同源，§20 enableDailyGroup 副作用保留）——**T8 isGroupEnabled 同源收口时复核**。
     - **验证 GREEN（我独立复跑）**：build EXIT=0(6308行) / check.sh 21/21 / uniq -d 仅 3 个已知 arity 重载(dispatchAction/doWarn/hbTierAndSend) 无新撞名 / 基础页正确接 rp 前缀路径不与 GA 交叉 / 0 敏感泄漏。
-  - 🔄 **W4 待做**：RP 文字命令路由（routeRpCommand：阈值/文案/档/定制/延迟/排除/转发/伸手党 + 红包排除 handler）→ commands.bsh；onClickSendBtn 撞名先抽 rpOnClickSendBtn（合并收口留 T8）。
-  - ⏳ **W6 待做**：独立 Code Review 对照线上 §22-§25 逐子页保真 + 热路径/ANR 审。
+  - ✅ **W4 完成**（RP 文字命令层并入，Implementer Agent 移植 + 我独立复核）：
+    - `commands.bsh`(+315)：`rpOnClickSendBtn`（线上 onClickSendBtn @1333-1566 改名，**未接真入口，撞名收口留 T8**）+ rpCurrentTalker/rpCurrentGroupOrToast/rpStatusText。
+    - `redpacket_tiers.bsh`(+113)：档表命令 rpSetThresholdsCmd/rpSetTierActionCmd/rpAddTierCmd/rpDelTopTierCmd（各 2 签名=合法 arity 重载）。
+    - `redpacket_qualify.bsh`：addExclude（与 removeExclude/getExcludeList 同 rpExcludeKey 同源）。
+    - `redpacket_send.bsh`：rpDailyTest（过去24h窗口→rpDailySend 纯转发）。
+    - `redpacket_detect.bsh`：rpHandleExcludeCmd 占位 `{return false}` → 真实体（@1122-1158，HOST.getLoginWxid + add/removeExclude），调用点已在检测路径。
+    - **验证 GREEN（我独立复跑）**：build EXIT=0(6806行) / check.sh 21/21 / uniq -d 仅 4 个新预期 arity 重载 + 3 个已知，rpOnClickSendBtn 与 GA onClickSendBtn 各 1 不撞 / 键读写同源 / 0 泄漏。
+  - ✅ **W6 完成（独立 Code Review，Layer 3，author-bias 消除）**：对照线上 §22-§25 逐子页 + rpOnClickSendBtn 每命令分支 → **READY，0 CRITICAL / 0 MAJOR / 2 MINOR**（均非 actionable）：
+    - MINOR-1（排除命令 normGroupId vs rpNormGroupId）：我复核后判定 **当前代码正确**——整个排除子系统(rpExcludeKey/getExcludeList/addExclude/removeExclude/rpHandleExcludeCmd)一致用 membership `normGroupId`(trim+去空格)，读写同源；改 detect.bsh:159 单点为 rpNormGroupId 反而破坏一致性。群 id 无空格，两者等价。不改。
+    - MINOR-2：注释精度，可忽略。
+    - **Layer 4 (Santa 双审) 跳过**：T7=设置 UI+命令路由，非消息热路径/非破坏性群管/非刷模块 → 按 qa-standards 降级豁免，记录在案。
+  - ✅ **T7 完成**：RP 设置 UI(主菜单+7子页) + rp_ 文字命令 + 每日定时写侧 全部逐字保真并入，与 GA 共存无撞名，装配体解析 EXIT=0 + check.sh 21/21 + 独立 Review 0 CRITICAL。零真机。**剩 onClickSendBtn 双入口合一收口 = T8。**
 
 ## T7 W1 盘点结果（2026-06-10，line refs = 线上 plugins/redpacket-stats/main.java）
 **总规模 ≈ 1000+ 行逐字移植（P3-b 最大单任务）。建议 W2-W4 在 fresh context 跑。**

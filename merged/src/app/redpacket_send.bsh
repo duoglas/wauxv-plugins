@@ -441,3 +441,17 @@ void rpExportToday() {
         try { toast("❌ 导出失败: " + t); } catch (Throwable t2) {}
     }
 }
+
+// ==================== 手动测试每日发送 (线上 rpDailyTest @2598-2607 逐字) ====================
+//   命令「红包每日测试」触发: 按过去 24h 窗口立即跑一次 rpDailySend(manual=true) → 私聊汇总。
+//   ★合并适配: 与线上一致纯转发 rpDailySend(windowStart, now, true); 端口化已在 rpDailySend 内完成, 本函数零改。
+void rpDailyTest() {
+    try {
+        long now = System.currentTimeMillis();
+        long windowStart = now - 24L * 3600L * 1000L;
+        hbBgLog("[RP] " + hbNow() + " daily-test: manual trigger, window=past 24h.");
+        rpDailySend(windowStart, now, true);
+    } catch (Throwable t) {
+        hbBgLog("[RP] " + hbNow() + " daily-test err: " + t);
+    }
+}
