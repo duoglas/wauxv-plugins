@@ -31,12 +31,18 @@ int l3UpsertFirstSeen(String groupId, List wxids, long ts) {
         try {
             // 先查现有, 算 added (语义对齐旧 initFirstSeenBaseline 返回"新设置人数")
             java.util.Set cur = speakFirstSeenSet(groupId);
+            // C-PERF-05: 构造 List<Object[]> binds 一次性单事务批量写, 取代逐行 speakUpsertFirstSeen
+            //   (每行各自 auto-commit=一次 fsync, 大群 UI 线程 N 次 fsync → ANR, VH-06)。
+            //   每行 = {groupId, w, Long ts}, 复用 speak_store 同一条 first_seen UPSERT SQL 常量
+            //   (min(coalesce(...)) 语义一字不差, 绝不改晚, 不动 last_speak)。
+            java.util.List binds = new java.util.ArrayList();
             for (int i = 0; i < wxids.size(); i++) {
                 String w = (String) wxids.get(i);
                 if (w == null || w.isEmpty()) continue;
                 if (!cur.contains(w)) added++;
-                speakUpsertFirstSeen(groupId, w, ts);   // first_seen=min(coalesce(...)), 不动 last_speak
+                binds.add(new Object[]{ groupId, w, new Long(ts) });
             }
+            STORAGE.execBatch(SPEAK_UPSERT_FIRSTSEEN_SQL, binds);   // 单事务 N 行 1 次 fsync
         } catch (Throwable t) { try { _l3Log("l3UpsertFirstSeen fail group=" + groupId + " " + t); } catch (Throwable t2) {} }
     }
     return added;
@@ -90,20 +96,30 @@ void l3MigrateCsvToDb() {
             int srcLs = lm.size();
             int srcFs = fm.size();
             try {
+                // C-PERF-05: 两段 while 逐行 speakRecord/speakUpsertFirstSeen → 各攒成 List<Object[]>
+                //   各一次单事务批量写 (减少 fsync, 大群迁移不再 N 次 fsync)。SQL 复用 speak_store 同一条
+                //   last_speak/first_seen UPSERT 常量 (max/min coalesce 语义一字不差)。
+                //   校验 (speakCountGroup 比对) 在两次 execBatch 提交后才跑 → 语义不破坏。
+                java.util.List lsBinds = new java.util.ArrayList();
                 Iterator it = lm.entrySet().iterator();
                 while (it.hasNext()) {
                     Map.Entry e = (Map.Entry) it.next();
                     String w = (String) e.getKey(); Long ts = (Long) e.getValue();
                     if (w == null || ts == null) continue;
-                    speakRecord(g, w, ts.longValue());   // last_speak=max, first_seen=min 初值
+                    // speakRecord 绑定: 1=grp 2=wxid 3=ts(last_speak) 4=ts(first_seen 初值)
+                    lsBinds.add(new Object[]{ g, w, new Long(ts.longValue()), new Long(ts.longValue()) });
                 }
+                STORAGE.execBatch(SPEAK_UPSERT_LASTSEEN_SQL, lsBinds);   // last_speak=max, first_seen=min 初值
+                java.util.List fsBinds = new java.util.ArrayList();
                 Iterator it2 = fm.entrySet().iterator();
                 while (it2.hasNext()) {
                     Map.Entry e = (Map.Entry) it2.next();
                     String w = (String) e.getKey(); Long ts = (Long) e.getValue();
                     if (w == null || ts == null) continue;
-                    speakUpsertFirstSeen(g, w, ts.longValue());   // first_seen=min, 不动 last_speak
+                    // speakUpsertFirstSeen 绑定: 1=grp 2=wxid 3=ts(first_seen)
+                    fsBinds.add(new Object[]{ g, w, new Long(ts.longValue()) });
                 }
+                STORAGE.execBatch(SPEAK_UPSERT_FIRSTSEEN_SQL, fsBinds);   // first_seen=min, 不动 last_speak
                 // 校验: DB 该群 last_speak/first_seen 行数 应 == 源 CSV 条目数
                 int[] cnt = speakCountGroup(g);
                 if (cnt[0] == srcLs && cnt[1] == srcFs) {

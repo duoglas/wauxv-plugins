@@ -6,6 +6,13 @@ FAKE_ROWS_RET = null;                           // 可编程返回(queryRows: Li
 
 Object _mkFakeStorage() {
     void exec(String sql, Object[] binds) { FAKE_EXEC_CALLS.add(new Object[]{ sql, binds }); }
+    // 单事务批量写 (镜像生产 execBatch): 把每行 binds 都按现有 exec 记法记入 FAKE_EXEC_CALLS,
+    //   保持单测可逐行断言 (每行 = 一项 {sql, binds})。
+    void execBatch(String sql, java.util.List bindsList) {
+        if (bindsList == null) return;
+        for (int r = 0; r < bindsList.size(); r++)
+            FAKE_EXEC_CALLS.add(new Object[]{ sql, (Object[]) bindsList.get(r) });
+    }
     Long queryLong(String sql, Object[] binds) { return FAKE_QUERY_RET; }
     java.util.List queryRows(String sql, Object[] binds) {
         return (FAKE_ROWS_RET == null) ? new java.util.ArrayList() : FAKE_ROWS_RET;

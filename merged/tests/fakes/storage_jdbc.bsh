@@ -17,6 +17,26 @@ Object makeJdbcStorage(Connection conn) {
         ps.executeUpdate();
         ps.close();
     }
+    // 单事务批量写 (镜像生产 execBatch, 语义等价): 关 autocommit, 一个 PreparedStatement
+    //   逐行 addBatch, executeBatch, commit, finally 恢复 autocommit。正确性一致即可(本地不计性能)。
+    void execBatch(String sql, java.util.List bindsList) {
+        if (bindsList == null || bindsList.isEmpty()) return;
+        boolean prevAuto = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        PreparedStatement ps = conn.prepareStatement(sql);
+        try {
+            for (int r = 0; r < bindsList.size(); r++) {
+                Object[] binds = (Object[]) bindsList.get(r);
+                _bind(ps, binds);
+                ps.addBatch();
+            }
+            ps.executeBatch();
+            conn.commit();
+        } finally {
+            ps.close();
+            conn.setAutoCommit(prevAuto);
+        }
+    }
     Long queryLong(String sql, Object[] binds) {
         PreparedStatement ps = conn.prepareStatement(sql);
         _bind(ps, binds);
