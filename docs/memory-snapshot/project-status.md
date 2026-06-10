@@ -7,7 +7,7 @@ metadata:
   originSessionId: 3cbb9098-fbe3-4e37-8615-e1be36f085db
 ---
 
-**截至 2026-06-09。换机器/新 session 先看这条接上工作。**
+**截至 2026-06-10。换机器/新 session 先看这条接上工作。**
 
 ## 大工程进行中:GroupAdmin + RedPacketStats 合并(方案 B + 强制本地测试)
 用户要把红包统计合并进群管,成**一个**插件、直接共享数据/逻辑(伸手党→直接 doWarn,免读库/发命令往返)。约束:不要单一巨型 main.java,**领域模型设计 + 所有功能必须本地单测+集成测试**。
@@ -30,13 +30,41 @@ metadata:
     - **T1** `merged/src/app/device_base.bsh`(197行):RP 设备层共享声明逐字保真(UI常量/RP_QUEUE+JOB_*10槽索引/SEEN/DONE/OPENED/COVER_ACT/IN_FLIGHT/CUR_JOB/FREELOADER_SNAP/PERF_*全套埋点/RP_DB句柄/hbBgLog/hbNow/hbJitter)。**刻意未搬**(domain已声明,避顶层重声明):FREELOADER_MAX_WARN(在 freeloader.bsh:22)+全部 K_*/DEF_*(tiers/qualify/export 用 RP_K_*/RPQ_K_*)。
     - **T2 最高风险·检测热路径合一** `redpacket_detect.bsh`+改 hooks.bsh:`rpDetectAndEnqueue` 并入 onHandleMsgBody, **一条消息同时过 GA(recordSpeak发包人+routeCommand)与 RP(检测入队)互不破坏**——红包content空→GA非文本空content分支记发包人;content含nativeurl(非空)→落routeCommand主路径@2217记发包人;两种都记到,与线上GA逐字一致。RP 用**独立 `rpIsGroupEnabled`(rp_enabled_groups+RP_ENABLED_CACHE TTL60s)**与GA `isGroupEnabled`(enabled_groups)解耦不撞名。热路径O(1):type/indexOf/缓存查/去重/入队≤50,零XML解析,getLoginWxid仅content含"红包排除"才调。**不搬 v1.11.5 检测时快照线程(@1281-1318)**——合并版改T5 in-process T_snap拍照。onHandleMsg包装层纳入RP A/B分类计时(PERF_LAST_RP)。
     - **T3** `redpacket_worker.bsh`(397行)+L1测:`rpWorkerTick`(单飞tick+看门狗30s强清+dueAt<=now挑最早出队+finally自重调度绝不停摆)/`hbProcess`(attempt0:专属早退exclusive_recv_username→nativeurl→rpExtractTitle回填JOB_TITLE+PERF_EXTRACT计时→rpIsCustom回填JOB_ISCUSTOM→开封面页)/`afterCoverNoDetail`三段重试阶梯(放弃点attempt>=3,attempt0→retry1/1→retry2/2→retry3末档1h,hbJitter±25%)/`rpExtractTitle`+`hbGetElement`(XML,纯函数,加了L1单测14断言)/`perfFlush`真实落盘(收口hooks占位,装配体单定义)/`rpDailyCheck`(日期闸门真实移植,发送部分置seam→T6)。
-  - **seam 待后续接**:UI启动器`rpOpenCover`/封面finish`rpFinishCover`(T4)、反射领取者hbDetailExtract+onResume链路(T4/T5)、~~发送`rpDailySend`/hbTierAndSend/rpSendQuote/rpSendAt(T6)~~✅、`rpHandleExcludeCmd`(T7)、isGroupEnabled同源收口(T8)。
+  - **seam 待后续接**:UI启动器`rpOpenCover`/封面finish`rpFinishCover`(T4)、反射领取者hbDetailExtract+onResume链路(T4/T5)、~~发送`rpDailySend`/hbTierAndSend/rpSendQuote/rpSendAt(T6)~~✅、~~`rpHandleExcludeCmd`(T7)~~✅、isGroupEnabled同源收口(T8)。
   - **✅ T6 完成(2026-06-09 深夜, 纯本地零真机, commit 待定)**:发送层逐字保真移植 —— 新 `merged/src/app/redpacket_send.bsh`(发送层主体): `rpRecordStats`(写库, 选档用getTiers普通档@2224, 达标复用domain rpComputeQualified, 落库走STORAGE rpRecord) + `hbTierAndSend`(3参/4参重载, 分档+两条提醒: 引用群规条HOST.sendQuote/@条HOST.sendText, 限频cfgMsgGap+RP_LAST_MSG, >atLimit汇总notice vs ≤逐档@, 随机语气pickConnector/pickActionPhrase, 两条间隔cfgTwoMsgGap延迟delay, 选档用getTiersByType@2993 — **写库getTiers/发送getTiersByType刻意非对称, 线上原样保留不修**) + appendTierLine + rpGroupName/rpSenderName(反射leaf) + getDailyGroups + rpDailySend(每日定时, 窗口查询走新domain rpQueryWindow/STORAGE, 组装domain rpBuildGroupedMsgs, 按群路由cfgExportTargetFor); 改 `host_android.sendQuote`接健壮回退(msgid>0引用→异常fallback sendText/msgid≤0直接sendText, 复刻线上rpSendQuote@1720-1736, 端口层无日志依赖); 加 domain `redpacket_store.rpQueryWindow`(ts范围+grp IN动态占位, trim规范化对齐线上@2557, SQL@2560逐字); 删两处leaf(device_recv rpDeliverReceivers / worker rpDailySend), 装配体唯一定义。check.sh GREEN 21/21(新增 redpacket_query_window_integration L2: ts边界>=/<严格+grp IN过滤+ORDER BY+trim+空列表心跳), 装配体解析EXIT=0(5313行), uniq -d仅有意arity重载(doWarn/dispatchAction/setWarnKick/hbTierAndSend), 跨模块依赖手工grep全存在, Security干净。**独立 Code Review PASS: 0 CRITICAL/0 MAJOR/1 MINOR**(MINOR=合并版发送在关页前 vs 线上发送在关页后, T5已commit结构device_recv.bsh:327, 发消息目标群会话与finishDetailAndCover正交不阻塞, 可接受)。**端口映射**: rpSendQuote→HOST.sendQuote/rpSendAt→HOST.sendText/写库→STORAGE/窗口查询→STORAGE.queryRows。
+  - **✅ T7 完成(2026-06-10, 纯本地零真机, commit 929813b[W2+W3]+a8913d3[W4])**:RP 设置层全套逐字保真并入(线上 §22-§25)。**两 Implementer Agent 移植 + 我每步独立复跑 gate + 独立 Code Reviewer(Layer3) author-bias 复核**。
+    - **W2+W3(设置 UI, +995行/0删)**:`dialogs.bsh`(+815, _rp* UI helper + showConfigDialog 主菜单 + 7子页 Basic/NormalTiers/Custom/Delay/Freeloader/Exclude/Forward + rpPickTarget/rpApplyForwardTarget/sendForwardNotice 后台getFriendList/getGroupList+Handler防ANR + rpRebuildExcludeRows + saveInt/Long/StrField), `redpacket_send.bsh`(+71, isDailyEnabled/enable·disableDailyGroup/rpExportToday端口化), `redpacket_qualify.bsh`(+33, setCustomOn/setCustomKw/removeExclude), `redpacket_tiers.bsh`(+51, cfgT1-3/cfgTxt1-3/rpParseTierBox), `redpacket_detect.bsh`(+25, rpEnableGroup/rpDisableGroup)。
+    - **W4(命令层, +~440行)**:`commands.bsh`(+315, `rpOnClickSendBtn`=线上 onClickSendBtn@1333-1566 改名, 全 RP 配置命令 + rpCurrentTalker/rpCurrentGroupOrToast/rpStatusText), `redpacket_tiers.bsh`(+113, 档表命令 rpSetThresholds/SetTierAction/AddTier/DelTopTierCmd 各2签名), `redpacket_qualify.bsh`(addExclude), `redpacket_send.bsh`(rpDailyTest), `redpacket_detect.bsh`(rpHandleExcludeCmd 占位→真实体)。
+    - **关键决策**:① `rpEnableGroup/rpDisableGroup` 提前落地(rp前缀避撞 GA enableGroup, 写 RP_K_ENABLED 与读侧 rpIsGroupEnabled 同源, §20 enableDailyGroup 副作用保留)——T8 isGroupEnabled 同源收口时复核。② rpExportToday/rpDailyTest 端口化(rpQueryToday/rpQueryWindow + HOST.sendText 镜像 rpDailySend, 文案/脱敏日志逐字)。③ **`rpOnClickSendBtn` 未接真入口**:与 GA `onClickSendBtn` 撞名, 双入口合一收口=T8(本期各存一份不撞)。
+    - **符号改名表**(线上→合并):cfgInt→rpCfgInt / K_*→RP_K_* / tiersCustomKey→rpTiersCustomKey / enableGroup→rpEnableGroup / getString·putString·sendText·getLoginWxid→HOST.*。键全部读写同源。
+    - **验证**:build EXIT=0(6806行) + check.sh 21/21 + uniq-d 仅 4 新预期 arity 重载(档表4命令)+3已知(dispatchAction/doWarn/hbTierAndSend), rpOnClickSendBtn 与 GA onClickSendBtn 各1不撞, 键同源, 0泄漏。独立 Review **READY 0 CRITICAL/0 MAJOR/2 MINOR**(非actionable: MINOR-1 排除命令 normGroupId 复核后判定当前正确——整个排除子系统一致用 membership normGroupId 读写同源, 改单点反破坏; 群id无空格两者等价)。Layer4 Santa降级豁免(非热路径/非破坏性)。
+    - **★T7 给 T8 的盯点**: T8 onLoad/hook 合一时须把 RP `rpOnClickSendBtn` 接进真实 `onClickSendBtn`(同时认 GA「群管」触发词 + RP「红包统计设置」等), 解决双入口撞名; 并把 rpEnableGroup/rpIsGroupEnabled 与 GA enable/isGroupEnabled 的同源收口一并扫(rpHandleExcludeCmd 调用点已在检测路径, 无需再接)。
   - **★给T5的协调点**:合并版hbProcess执行时本包尚无FREELOADER_SNAP(改in-process T_snap=packetMs+G,晚于hbProcess);T3已删hbProcess三处终结路径(专属早退@1775/无hostCtx abort@1815/放弃点@2083)的`FREELOADER_SNAP.remove`并留注释;**T5实现freeloaderRunForPacket须自带快照拍照+清理(含终结路径兜底清/泄漏防护),不依赖worker侧remove**。
   - **教训(贯穿T4-T8)**:BeanShell解析门只查语法**不查符号解析**,跨模块缺失函数(parseCsv/rpNormGroupId类)解析仍EXIT=0且17测试不覆盖设备热路径函数→静默功能断裂。每个device模块完成后须**手工grep核实跨模块运行期依赖真存在**(本次已核 parseCsv@membership/rpNormGroupId@tiers + 全装配体uniq -d查重复定义,doWarn/dispatchAction是有意arity重载非误引入)。
   - **当前装配体**:check.sh GREEN 18/18,去final全文解析EXIT=0(4133行),Security干净。
-  - **下一步 T7(设置UI并入)**:RP showConfigDialog + 子页(Basic/NormalTiers/Custom/Delay/Exclude/Forward/伸手党)并入合并dialogs(与GA dialogs共存), rp_文字命令接commands LEAF路由; enableDailyGroup/disableDailyGroup(写rp_daily_groups)在此或T8接(T6只移了读侧getDailyGroups)。然后T8(onLoad合一+seam收口: GA端口接线+l3FlushLoop+RP worker tick启动+旧毫秒键清理+冷启动日志, 接commands占位_cmdGroupEnabled↔hooks isGroupEnabled同源)/T9验收(Santa双审热路径合一)。再 **P3-c 灰度真机E2E**(GroupAdminPlus只对1测试群+旧RP关该群破死结,scrcpy用户在场,Santa双审)→全绿后跑P2-b cutover全量切。**T7-T8仍是长阶段,接力时先 bootstrap + 读本快照 + 读 .harness/current-plan.md**。
+  - **下一步 T8(onLoad合一+seam收口)**:GA端口接线(makeAndroidStorage/Host/Clock)+l3FlushLoop+RP worker tick启动+旧毫秒键清理+冷启动日志; **接 commands 占位 `_cmdGroupEnabled`↔hooks isGroupEnabled 同源**; **RP `rpOnClickSendBtn` 接进真实 `onClickSendBtn` 双入口合一(撞名收口, 同认 GA「群管」+ RP「红包统计设置」等)**; rpEnableGroup/rpIsGroupEnabled 与 GA enable/isGroupEnabled 同源收口扫一遍。然后 T9 验收(Santa双审热路径合一)。再 **P3-c 灰度真机E2E**(GroupAdminPlus只对1测试群+旧RP关该群破死结,scrcpy用户在场,Santa双审)→全绿后跑P2-b cutover全量切。**T8仍是长阶段,接力时先 bootstrap + 读本快照 + 读 .harness/current-plan.md**。
+    - **★挂起需求(2026-06-10, 见下方"挂起需求"节)在 T9 前或 T8 期间一并落地**:发包人豁免(伸手党+@条) + 伸手党警告文案重写(含时间/红包标识)。触及 T6 send + T7 命令 + device_recv/redpacket_app, 实现时需用户拍板文案模板 + 确认是否从统计排除发包人。
     - **★T6给T7的盯点**: hbTierAndSend用cfgCustomRulePrefix(键rp_custom_rule_prefix_<rpNormGroupId>)/cfgRulePrefix/cfgAtLimit/cfgMsgGap/cfgTwoMsgGap全在redpacket_send.bsh已定义, T7设置UI写这些键须同源(尤其定制群规前缀键用rpNormGroupId=trim, 与读侧一致)。
+
+## 挂起需求(用户 2026-06-10 记录, 合并工程内落地, 未实现)
+**F1 原话**:
+1. 「伸手党治理和红包提醒，发包的人不需要提醒」
+2. 「伸手党警告文案，简短些，但要说清是什么时间哪个红包，X分钟未发言领红包，所以警告」
+
+**F2 分类 = 工具层(插件逻辑)。触及已做的 T6 发送 + 伸手党判定, 在合并工程内落地(非旧线上插件)。**
+
+**需求 1 — 发包人豁免(伸手党 + 红包提醒 @条 都不针对发包人本人)**:
+- 触点 a(红包提醒 @条):`redpacket_send.bsh hbTierAndSend` 分档 @ 时, 把发包人 wxid(`job[JOB_SENDER]`)排除, 不 @ 发包人(类比排除名单 excl 的剔除位 @hbTierAndSend 分档循环)。
+- 触点 b(伸手党判定):`device_recv.bsh hbDetailExtract` 组 wxids / `redpacket_app.freeloaderRunWithSnapshot` 判定时, 把发包人 wxid 排除, 绝不把发包人判成伸手党。发包人 wxid 需从 device_recv 透传进判定(当前 freeloaderRunWithSnapshot 入参只有 receivers wxids + excludeSet, 可把 senderWxid 加进 excludeSet 或单列豁免参)。
+- ⚠️ 待澄清(实现时定):是否也从**统计写库 qualifiers/qualified_count** 排除发包人(还是只豁免 @/警告)?正常微信发包人不抢自己的包(不会出现在 receivers), 但用户明确提了 → 实现时确认是"防御性排除"还是确有发包人进 receivers 的包类型。
+- 落地任务:可作 T6 补丁 或 并入 T9 前的收尾(T6 send 模块 + device_recv/redpacket_app 三处)。
+
+**需求 2 — 伸手党警告文案重写(简短 + 信息全)**:
+- 现状:`device_recv.bsh` reason = `win + "分钟内未发言"`, doWarn auto 拼 ` · 理由`(线上 @2794 "警告 {N}分钟内未发言"); 通知无红包时间/标识。
+- 目标:简短但说清 **什么时间 + 哪个红包 + X分钟未发言领红包 + 所以警告**。需把红包信息(检测时刻 `packetMs`→HH:mm / 红包标题或时间标识)带进 reason。
+- 触点:reason 串生成处(device_recv 调 freeloaderRunWithSnapshot 前构造 reason); 需把 packetMs(已有)格式化 HH:mm + 可选 title(job[JOB_TITLE], 写库已用)拼进文案。doWarn 拼接格式可能要调(理由含多信息)。
+- ⚠️ 待澄清(实现时定):文案确切模板(例:`{HH:mm}红包·{X}分钟未发言领取·警告`)请用户最终拍板;"哪个红包"用时间还是标题标识。
+- 落地任务:同需求 1, 一并做。
 
 ## 后续项(伸手党收尾时浮现)——均已完成 ✅
 1. ✅ **#潜水 新成员豁免改固定 1 天**:GA v1.20.0 已做(`LURK_NEWMEMBER_EXEMPT_MS`)。
