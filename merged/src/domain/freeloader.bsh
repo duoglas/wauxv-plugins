@@ -18,7 +18,7 @@
 // ---- 默认配置常量(本片仅声明；per-group 覆盖与运行期夹取属 P3 接线) ----
 FREELOADER_WIN_DEFAULT = 30;                 // 前看窗口 N，单位分钟(默认 30min)
 FREELOADER_GRACE_AFTER_MS = 3000L;           // 事后宽限 G，默认 3s(D1，per-group 可配)。★不进判定式比较。
-FREELOADER_NEWMEMBER_EXEMPT_MS = 86400000L;  // 新人豁免期 EXEMPT，默认 1 天(对齐 GA #潜水)
+FREELOADER_NEWMEMBER_EXEMPT_MS = 86400000L;  // [VH-08, 2026-06-11: 不再喂伸手党] 旧"新人豁免期"24h(对齐 GA #潜水)。生产判定改 exemptMs=发言窗口 winMs(device_recv), 此 24h 值仅留作历史/潜水语义参照。
 FREELOADER_MAX_WARN = 10;                     // 单包最多警告数，超出 capped 留痕不静默截断
 // 多伸手党警告间隔(防刷屏，spec §4 不变项，线上 Thread.sleep(800))。仅 P3 设备侧 doWarn 循环用；
 // 本地测试置 0 以免拖慢(测只验判定结果，不验真机限速)。0 = 不 sleep。
@@ -36,7 +36,7 @@ FL_EXEMPT_NEW = 2;   // 从未/超窗发言但是新人 → 豁免
 // snapFs      : T_snap 那一刻此人的 first_seen(可为 null)。
 // packetMs    : 红包基准时刻 P(重试包=原始检测时刻，由调用方透传)。
 // winMs       : 前看窗口 N，毫秒。
-// exemptMs    : 新人豁免期 EXEMPT，毫秒。
+// exemptMs    : 新人豁免期，毫秒。★生产传 = 发言窗口 winMs (非 24h; VH-08): 进群<winMs没发言→EXEMPT_NEW豁免, >winMs→WARN。
 int freeloaderDecide(boolean present, Long snapLs, Long snapFs, long packetMs, long winMs, long exemptMs) {
     if (!present) return FL_SKIP;                                  // 快照无此人 → 绝不判(§4.1)
     long thr = packetMs - winMs;                                  // 前看窗口下界(G 不参与)

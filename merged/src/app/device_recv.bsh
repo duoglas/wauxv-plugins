@@ -412,8 +412,13 @@ void hbDetailExtract(Object root, String key) {
                     reason = _hm + "红包 · " + win + "分钟未发言领取";
                 } catch (Throwable _rErr) { reason = win + "分钟内未发言"; }
                 // 操作人=bot 自己(群主); doWarn auto 分支对管理员/群主/白名单/保护静默豁免, canActOn(bot→target)成立。
+                // ★新人豁免期 = 发言窗口 winMs 本身 (不是潜水的 24h FREELOADER_NEWMEMBER_EXEMPT_MS) —— VH-08 (2026-06-11 真机诊断):
+                //   语义: 进群 <X 分钟没发言→豁免(还没满一个窗口, 没机会发言); 进群 >X 分钟、窗口内没发言→判伸手党。
+                //   first_seen 的 24h 豁免是【潜水踢人 doKickInactive】概念, 不该串进伸手党 (真机群B群 exemptNew=3 全员静默失效)。
+                //   exemptMs=winMs 同时根治"合成基线(enableGroupWithBaseline 全员 first_seen=now)撞 24h 全员豁免": 10min 内自动老化。
+                long winMs = (long) win * 60000L;
                 java.util.Map sum = freeloaderRunWithSnapshot(talker, wxids, HOST.getLoginWxid(), packetMs,
-                    (long) win * 60000L, FREELOADER_NEWMEMBER_EXEMPT_MS, exSet, FREELOADER_MAX_WARN, reason, snap);
+                    winMs, winMs, exSet, FREELOADER_MAX_WARN, reason, snap);
                 // 恒定 summary 日志 (spec §4, 脱敏: 仅计数; sent=实发=toWarn.size, warned=判伸手党总数含capped)。
                 java.util.List tw = (java.util.List) sum.get("toWarn");
                 boolean snapFailed = false;

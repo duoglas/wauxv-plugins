@@ -63,6 +63,20 @@ check("present + snapLs==null + snapFs==null → WARN(无 first_seen 不豁免)"
 check("snapLs=thr-1(略超窗) 非新人 → WARN",
     freeloaderDecide(true, L(thr - 1), oldFs, P, N, EX) == FL_WARN);
 
+// ---- ★生产语义 (VH-08, 2026-06-11): 新人豁免期 = 发言窗口 (exemptMs==winMs==N) ----
+//   device_recv 生产传 exemptMs=winMs → 新人边界与发言窗口下界 thr 重合。
+//   进群<窗口(first_seen>thr)没发言 → EXEMPT_NEW; 进群>=窗口(first_seen<=thr)没发言 → WARN。
+//   根治"潜水 24h 豁免串进伸手党 + 合成基线撞 24h 全员静默"(真机群B群 exemptNew=3)。
+check("[VH-08] exemptMs==N: 进群不到窗口(first_seen=thr+1)从未发言 → EXEMPT_NEW(豁免)",
+    freeloaderDecide(true, null, L(thr + 1), P, N, N) == FL_EXEMPT_NEW);
+check("[VH-08] exemptMs==N: 进群恰满窗口(first_seen=thr, >严格)从未发言 → WARN(判)",
+    freeloaderDecide(true, null, L(thr), P, N, N) == FL_WARN);
+check("[VH-08] exemptMs==N: 进群超窗口(first_seen=thr-1)从未发言 → WARN(判)",
+    freeloaderDecide(true, null, L(thr - 1), P, N, N) == FL_WARN);
+// 对照: 老 24h 语义下同一个"进群超窗口"的人会被 EXEMPT(这正是要消除的 bug 行为)。
+check("[VH-08] 对照: exemptMs=24h 时 first_seen=thr-1 会误豁免 EXEMPT_NEW (旧行为, 已弃用)",
+    freeloaderDecide(true, null, L(thr - 1), P, N, EX) == FL_EXEMPT_NEW);
+
 // ---- 确认四码都被打到(自检) ----
 check("四码覆盖: SKIP/ACTIVE/WARN/EXEMPT_NEW 常量值正确",
     FL_SKIP == -1 && FL_ACTIVE == 0 && FL_WARN == 1 && FL_EXEMPT_NEW == 2);
