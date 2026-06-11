@@ -72,7 +72,7 @@ boolean gaOnClickSendBtn(String text) {
             return true;
         }
         _logNativeRoleProbe(talker);
-        showGroupConfigDialog(talker);
+        showMergedGroupConfig(talker);   // UI 重建 2026-06-11: 群内打「群管」直进当前群合并配置 (跳过选群); 原 showGroupConfigDialog 降为其「群管详细设置」子页。
         return true;
     }
     return false;
@@ -1067,11 +1067,282 @@ void _rpSpacer(android.widget.LinearLayout root, Activity ctx, int h) {
     root.addView(v);
 }
 
-// WAuxiliary 设置入口 (线上 @3273-3279 逐字)。
+// ================================================================
+// ===== UI 重建 (2026-06-11): 群管 + 红包 设置合并 + 全局开关 顶层 =====
+//   设计: 不重写两棵现有菜单树 (showGroupConfigDialog=GA / showConfigDialog=RP), 它们原样留作「功能子页」;
+//         本节只加合并父页 (showMergedHome) + 选群 (pickGroupForConfig) + 合并群配置 (showMergedGroupConfig)。
+//   全局开关 = 一票否决: setGaGlobal/setRpGlobal (enable_state.bsh / redpacket_detect.bsh), 空键=开 (升级安全)。
+//   入口: openSettings (设置按钮) → showMergedHome; gaOnClickSendBtn「群管」→ showMergedGroupConfig(本群)。
+//   UI helper 复用 GA 侧 (_gaBtn/_gaRound/_gaC/_gaSpacer); 选群复用 rpPickTarget 的群分支范式 (后台 getGroupList → 单选)。
+// ================================================================
+
+// ----- 顶层合并主页: 两个全局开关 + 选群入口 + 红包全局默认 -----
+void showMergedHome() {
+    Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("⚙️ GroupAdminPlus 设置");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(18);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    final boolean gaG = gaGlobalOn();
+    final boolean rpG = rpGlobalOn();
+
+    android.widget.TextView summ = new android.widget.TextView(ctx);
+    StringBuilder sb = new StringBuilder();
+    sb.append("全局开关 = 一票否决: 关→该功能所有群停用; 开→按单群设置。\n");
+    sb.append("群管全局: ").append(gaG ? "✅ 开" : "🔴 关").append("\n");
+    sb.append("红包全局: ").append(rpG ? "✅ 开" : "🔴 关");
+    summ.setText(sb.toString());
+    summ.setTextColor(_gaC("#7C828E"));
+    summ.setTextSize(12);
+    summ.setLineSpacing(0, 1.4f);
+    summ.setPadding(0, 0, 0, 12 * dp);
+    root.addView(summ);
+
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    android.widget.Button gaTgl = _gaBtn(ctx, gaG ? "🛡 群管全局: 开 → 点击关闭" : "🛡 群管全局: 关 → 点击开启", gaG ? "#FF6B6B" : "#5CB6FF");
+    gaTgl.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            setGaGlobal(!gaG);
+            toast(!gaG ? "群管全局已开启" : "群管全局已关闭 (所有群群管停用)");
+            if (dh[0] != null) dh[0].dismiss();
+            showMergedHome();
+        }
+    });
+    root.addView(gaTgl);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button rpTgl = _gaBtn(ctx, rpG ? "🧧 红包全局: 开 → 点击关闭" : "🧧 红包全局: 关 → 点击开启", rpG ? "#FF6B6B" : "#5CB6FF");
+    rpTgl.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            setRpGlobal(!rpG);
+            toast(!rpG ? "红包全局已开启" : "红包全局已关闭 (所有群红包停用)");
+            if (dh[0] != null) dh[0].dismiss();
+            showMergedHome();
+        }
+    });
+    root.addView(rpTgl);
+    _gaSpacer(root, ctx, 14 * dp);
+
+    android.widget.Button pickBtn = _gaBtn(ctx, "📂 选群配置 (群管 + 红包)", "#252934");
+    pickBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            pickGroupForConfig();
+        }
+    });
+    root.addView(pickBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button rpDefBtn = _gaBtn(ctx, "🧧 红包全局默认 (阈值/文案/延迟)", "#252934");
+    rpDefBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showConfigDialog(null);
+        }
+    });
+    root.addView(rpDefBtn);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx)
+        .setView(sv)
+        .setNegativeButton("关闭", null)
+        .create();
+    dh[0].show();
+}
+
+// ----- 选群入口: 后台 getGroupList → 单选 → showMergedGroupConfig (复用 rpPickTarget 群分支范式, §7 ANR 只 setItems) -----
+void pickGroupForConfig() {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+    try {
+        try { toast("正在加载群列表…"); } catch (Throwable t) {}
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    if (sCachedGroupList == null) { try { sCachedGroupList = getGroupList(); } catch (Throwable t) { sCachedGroupList = null; } }
+                    final java.util.List list = sCachedGroupList;
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        public void run() {
+                            try {
+                                if (list == null || list.isEmpty()) { try { toast("未获取到群列表"); } catch (Throwable t) {} return; }
+                                final int n = list.size();
+                                // F1 (Santa): 跳过 getRoomId 反射失败/非 @chatroom 的条目, 不把空 id 暴露给用户(选中后会弹「无效群」)。
+                                java.util.List idList = new java.util.ArrayList();
+                                java.util.List itemList = new java.util.ArrayList();
+                                for (int i = 0; i < n; i++) {
+                                    Object info = list.get(i);
+                                    String id = ""; String nm = "";
+                                    try { Object r = info.getClass().getMethod("getRoomId").invoke(info); if (r != null) id = r.toString(); } catch (Throwable t) {}
+                                    try { Object nn = info.getClass().getMethod("getName").invoke(info); if (nn != null) nm = nn.toString(); } catch (Throwable t) {}
+                                    if (id == null || !id.contains("@chatroom")) continue;   // 无效群 id 不入列
+                                    if (nm == null || nm.trim().isEmpty()) nm = id;
+                                    itemList.add("🏠 " + nm + "\nID:" + id);
+                                    idList.add(id);
+                                }
+                                if (idList.isEmpty()) { try { toast("未获取到可配置的群"); } catch (Throwable t) {} return; }
+                                final String[] ids = (String[]) idList.toArray(new String[0]);
+                                final String[] items = (String[]) itemList.toArray(new String[0]);
+                                new android.app.AlertDialog.Builder(ctx)
+                                    .setTitle("👥 选群配置")
+                                    .setItems(items, new android.content.DialogInterface.OnClickListener() {
+                                        public void onClick(android.content.DialogInterface d, int which) {
+                                            try {
+                                                if (which < 0 || which >= ids.length) return;
+                                                showMergedGroupConfig(ids[which]);
+                                            } catch (Throwable t) { try { toast("打开失败: " + t); } catch (Throwable t2) {} }
+                                        }
+                                    })
+                                    .setNegativeButton("取消", null)
+                                    .create()
+                                    .show();
+                            } catch (Throwable t) { try { toast("弹窗失败: " + t); } catch (Throwable t2) {} }
+                        }
+                    });
+                } catch (Throwable t) {
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        public void run() { try { toast("加载失败"); } catch (Throwable t2) {} }
+                    });
+                }
+            }
+        }).start();
+    } catch (Throwable t) { try { toast("加载失败: " + t); } catch (Throwable t2) {} }
+}
+
+// ----- 合并群配置页: 该群 群管/红包 启用态 + 两个本群开关 + 两个详细设置入口 -----
+//   ★本群启用态直读 enabled_groups / rp_enabled_groups (忽略全局门), 诚实反映存储设置;
+//     另显示全局态, 全局关时给 ⚠️ 提示「本群设置暂不生效」。
+void showMergedGroupConfig(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+    if (groupId == null || !groupId.contains("@chatroom")) { toast("无效群 (需群聊)"); return; }
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    // 本群成员态直读 (忽略全局一票否决门)
+    boolean gaOn = false;
+    java.util.List _gel = getEnabledGroups();
+    String _ng = normGroupId(groupId);
+    for (int i = 0; i < _gel.size(); i++) if (_ng.equals(normGroupId((String) _gel.get(i)))) { gaOn = true; break; }
+    boolean rpOn = false;
+    java.util.List _rel = rpGetEnabledGroups();
+    String _rng = rpNormGroupId(groupId);
+    for (int i = 0; i < _rel.size(); i++) if (_rng.equals(rpNormGroupId((String) _rel.get(i)))) { rpOn = true; break; }
+    boolean gaG = gaGlobalOn();
+    boolean rpG = rpGlobalOn();
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("⚙️ 本群配置 (群管 + 红包)");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(18);
+    title.setPadding(0, 0, 0, 4 * dp);
+    root.addView(title);
+
+    android.widget.TextView gIdView = new android.widget.TextView(ctx);
+    gIdView.setText(groupId);
+    gIdView.setTextColor(_gaC("#7C828E"));
+    gIdView.setTextSize(11);
+    gIdView.setPadding(0, 0, 0, 12 * dp);
+    root.addView(gIdView);
+
+    android.widget.LinearLayout statusCard = new android.widget.LinearLayout(ctx);
+    statusCard.setOrientation(android.widget.LinearLayout.VERTICAL);
+    statusCard.setPadding(12 * dp, 12 * dp, 12 * dp, 12 * dp);
+    statusCard.setBackground(_gaRound("#1A1D24", 12));
+    StringBuilder st = new StringBuilder();
+    st.append("群管: 本群 ").append(gaOn ? "✅ 已启用" : "🔴 未启用");
+    if (!gaG) st.append("  ⚠️ 全局已关, 本群设置暂不生效");
+    st.append("\n");
+    st.append("红包: 本群 ").append(rpOn ? "✅ 已启用" : "🔴 未启用");
+    if (!rpG) st.append("  ⚠️ 全局已关, 本群设置暂不生效");
+    android.widget.TextView statusText = new android.widget.TextView(ctx);
+    statusText.setText(st.toString());
+    statusText.setTextColor(_gaC("#E8E9EC"));
+    statusText.setTextSize(13);
+    statusText.setLineSpacing(0, 1.4f);
+    statusCard.addView(statusText);
+    root.addView(statusCard);
+    _gaSpacer(root, ctx, 12 * dp);
+
+    final String fG = groupId;
+    final boolean fGaOn = gaOn;
+    final boolean fRpOn = rpOn;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    android.widget.Button gaToggle = _gaBtn(ctx, fGaOn ? "🔕 禁用本群群管" : "✅ 启用本群群管", fGaOn ? "#FF6B6B" : "#5CB6FF");
+    gaToggle.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (fGaOn) { disableGroup(fG); toast("已禁用本群群管"); }
+            else { int nb = enableGroupWithBaseline(fG); toast("已启用本群群管 (基线 " + nb + " 人)"); }
+            if (dh[0] != null) dh[0].dismiss();
+            showMergedGroupConfig(fG);
+        }
+    });
+    root.addView(gaToggle);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button rpToggle = _gaBtn(ctx, fRpOn ? "🔕 禁用本群红包" : "✅ 启用本群红包", fRpOn ? "#FF6B6B" : "#5CB6FF");
+    rpToggle.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (fRpOn) { rpDisableGroup(fG); toast("已禁用本群红包"); }
+            else { rpEnableGroup(fG); toast("已启用本群红包"); }
+            if (dh[0] != null) dh[0].dismiss();
+            showMergedGroupConfig(fG);
+        }
+    });
+    root.addView(rpToggle);
+    _gaSpacer(root, ctx, 14 * dp);
+
+    android.widget.Button gaDetail = _gaBtn(ctx, "🛡 群管详细设置", "#252934");
+    gaDetail.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showGroupConfigDialog(fG);
+        }
+    });
+    root.addView(gaDetail);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button rpDetail = _gaBtn(ctx, "🧧 红包详细设置", "#252934");
+    rpDetail.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showConfigDialog(fG);
+        }
+    });
+    root.addView(rpDetail);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx)
+        .setView(sv)
+        .setNegativeButton("关闭", null)
+        .create();
+    dh[0].show();
+}
+
+// WAuxiliary 设置入口 (UI 重建 2026-06-11: 改入合并主页 showMergedHome; 原直开 showConfigDialog(null) 降级为主页内「红包全局默认」按钮)。
 void openSettings() {
     try {
-        // 无 groupId 上下文 → 全局配置 Dialog (启用开关那一行用提示文字代替)
-        showConfigDialog(null);
+        showMergedHome();
     } catch (Throwable t) { try { toast("打开设置失败: " + t); } catch (Throwable t2) {} }
 }
 

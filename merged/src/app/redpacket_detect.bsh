@@ -22,6 +22,7 @@
 // ---- RP 配置键 + 默认 (逐字保真线上 @261/@275/@278/@318) ----
 //   ★ 这些键属 RP 设备层; GroupAdmin 同名键不同 (GA 用 enabled_groups, RP 用 rp_enabled_groups) → 两闸门独立。
 String RP_K_ENABLED            = "rp_enabled_groups";   // 线上 K_ENABLED @261 (≠ GA enabled_groups)
+String RP_K_GLOBAL             = "rp_global_on";        // 红包全局开关 (UI重建 2026-06-11; 空键=开, 升级安全)
 String RP_K_DELAY              = "rp_first_sec";        // 线上 K_DELAY @275
 long   RP_DEF_DELAY            = 120L;                  // 线上 DEF_DELAY @318 (首次延迟 120s)
 String RP_K_FREELOADER_ON_PREFIX = "rp_freeloader_on_"; // 线上 K_FREELOADER_ON_PREFIX @278 (默认关)
@@ -54,6 +55,32 @@ long RP_ENABLED_TTL_MS   = 60000L;           // 缓存 TTL: 外部改 config.pro
 // RP 已启用群 CSV → List (线上 getEnabledGroups @991, 走 RP 自己的键)。
 java.util.List rpGetEnabledGroups() { return parseCsv(HOST.getString(RP_K_ENABLED, "")); }
 
+// ============================================================
+// 红包全局开关 (UI 重建 2026-06-11): 一票否决门 —— 全局关→所有群红包停用; 全局开→回到按单群判定。
+//   与 GA 侧 gaGlobalOn (enable_state.bsh) 对称: 空键=开 (升级安全), 存 "1"/"0", 热路径 O(1) 走缓存。
+//   ★rpIsGroupEnabled 在红包检测热路径 (onHandleMsg) 调 → 全局门也必须缓存, 不每条红包读 FUSE config.prop。
+//   ★降级安全: 缓存/读盘异常默认开 (true), 与「空键=开」一致, 绝不因读失败静默全局停用。
+java.lang.Boolean RP_GLOBAL_CACHE = null;   // null=尚未加载
+long RP_GLOBAL_CACHE_TS = 0L;               // 上次加载毫秒 (复用 RP_ENABLED_TTL_MS 60s)
+boolean rpGlobalOn() {
+    try {
+        long now = CLOCK.now();
+        if (RP_GLOBAL_CACHE == null || (now - RP_GLOBAL_CACHE_TS) > RP_ENABLED_TTL_MS) {
+            RP_GLOBAL_CACHE = new java.lang.Boolean(!"0".equals(HOST.getString(RP_K_GLOBAL, "1")));
+            RP_GLOBAL_CACHE_TS = now;
+        }
+        return RP_GLOBAL_CACHE.booleanValue();
+    } catch (Throwable t) {
+        try { log("rpGlobalOn cache error, fallback to direct read: " + t); } catch (Throwable t2) {}
+        try { return !"0".equals(HOST.getString(RP_K_GLOBAL, "1")); } catch (Throwable t2) { return true; }
+    }
+}
+void setRpGlobal(boolean on) {
+    HOST.putString(RP_K_GLOBAL, on ? "1" : "0");
+    RP_GLOBAL_CACHE = new java.lang.Boolean(on);   // 变更即时失效: 设置后下一个红包立即按新态判定
+    RP_GLOBAL_CACHE_TS = CLOCK.now();
+}
+
 // 从 config.prop 读 RP_K_ENABLED, 全量 norm 后原子替换缓存。失败保留旧缓存只 log (线上 rpLoadEnabledCache @976)。
 void rpLoadEnabledCache() {
     try {
@@ -72,6 +99,7 @@ void rpLoadEnabledCache() {
 
 // RP 本群启用判定 (线上 isGroupEnabled @992)。热路径调: 命中缓存 = O(1) 内存查, 不碰 FUSE。
 boolean rpIsGroupEnabled(String groupId) {
+    if (!rpGlobalOn()) return false;                   // ★全局一票否决门 (空键=开, 升级安全)
     String g = rpNormGroupId(groupId);
     if (g.isEmpty()) return false;
     try {

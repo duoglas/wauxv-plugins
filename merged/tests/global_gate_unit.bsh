@@ -1,0 +1,51 @@
+// L1 单测: 群管全局开关「一票否决门」+ 升级安全 (UI 重建 2026-06-11)。
+// 验证 enable_state.bsh 的 gaGlobalOn/setGaGlobal/isGroupEnabled 顶部前置门:
+//   · 空键 = 开 (升级安全, config-key-written-on-transition-upgrade-gap): 老用户升级后默认不静默全停。
+//   · "0" = 关 → isGroupEnabled 一票否决返回 false (即便本群仍在 enabled_groups 名单)。
+//   · "1"/setGaGlobal(true) = 开 → 回到按单群名单判定。
+// RP 侧 rpGlobalOn/setRpGlobal/rpIsGroupEnabled 是本门逐字对称代码 (redpacket_detect.bsh),
+//   依赖更重 (redpacket_tiers/qualify + enableDailyGroup…), 由结构对称 + 真机 VERIFY 覆盖, 此处只钉 GA 门。
+// 运行 cwd = merged/ 。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");          // HOST(fake) KV + CLOCK(FAKE_NOW 固定)
+source("src/domain/membership.bsh");           // normGroupId/parseCsv/joinCsv
+void log(String s) {}                          // enable_state 仅 catch 路径用
+int initFirstSeenBaseline(String g) { return 0; }  // enableGroupWithBaseline 占位(本测不调)
+source("src/app/enable_state.bsh");
+
+String gid = "g@chatroom";
+HOST.putString("enabled_groups", gid);         // 本群在启用名单
+
+// ---- 1) 空键 = 开 (升级安全) ----
+FAKE_KV.remove("ga_global_on");
+GA_GLOBAL_CACHE = null; ENABLED_CACHE = null;  // 清缓存强制重读
+check("空键 → gaGlobalOn()=ON (升级安全, 不静默全停)", gaGlobalOn() == true);
+check("全局开 + 本群在名单 → isGroupEnabled=true", isGroupEnabled(gid) == true);
+
+// ---- 2) 全局关 = 一票否决 (本群仍在名单也 false) ----
+setGaGlobal(false);
+GA_GLOBAL_CACHE = null; ENABLED_CACHE = null;
+check("setGaGlobal(false) → gaGlobalOn()=OFF", gaGlobalOn() == false);
+check("全局关一票否决 → isGroupEnabled=false (本群仍在 enabled_groups)", isGroupEnabled(gid) == false);
+
+// ---- 3) 显式存 "0" 关 ----
+FAKE_KV.put("ga_global_on", "0");
+GA_GLOBAL_CACHE = null;
+check("ga_global_on=\"0\" → OFF", gaGlobalOn() == false);
+
+// ---- 4) 显式 "1" / setGaGlobal(true) 开 → 回到按单群判定 ----
+setGaGlobal(true);
+GA_GLOBAL_CACHE = null; ENABLED_CACHE = null;
+check("setGaGlobal(true) → ON", gaGlobalOn() == true);
+check("全局开恢复 → isGroupEnabled=true", isGroupEnabled(gid) == true);
+
+// ---- 5) 全局开但本群不在名单 → false (门只前置, 不绕过单群判定) ----
+check("全局开 + 本群不在名单 → isGroupEnabled=false", isGroupEnabled("other@chatroom") == false);
+
+// ---- 6) setGaGlobal 写后即时生效 (不靠 TTL 等待; 写时直接刷缓存) ----
+setGaGlobal(false);                            // 不清缓存, 验证 set 自身刷新
+check("setGaGlobal(false) 写后缓存即时失效 → gaGlobalOn()=OFF", gaGlobalOn() == false);
+setGaGlobal(true);
+check("setGaGlobal(true) 写后缓存即时失效 → gaGlobalOn()=ON", gaGlobalOn() == true);
+
+done();

@@ -53,7 +53,37 @@ void loadEnabledCache() {
 }
 
 List getEnabledGroups() { return parseCsv(HOST.getString("enabled_groups", "")); }
+
+// ============================================================
+// 群管全局开关 (UI 重建 2026-06-11): 一票否决门 —— 全局关→所有群 GA 停用; 全局开→回到按单群判定。
+//   ★升级安全 (config-key-written-on-transition-upgrade-gap): 空键 = 开 (默认 "1")。
+//     存储约定与本仓库一致 (commands.bsh _cmdStrictModeOn): "1"/"0", "0"=关, 其它(含空)=开。
+//   ★热路径 O(1) (C-PERF-01): gaGlobalOn 每条消息经 isGroupEnabled 调一次 → 必须走缓存, 不每条读 FUSE config.prop。
+//     缓存语义同 ENABLED_CACHE: TTL 60s 兜底外部 adb 改键; setGaGlobal 写后立即刷缓存保即时生效。
+//   ★降级安全: 缓存/读盘异常时默认开 (true) —— 与「空键=开」一致, 绝不因读失败静默全局停用。
+java.lang.Boolean GA_GLOBAL_CACHE = null;   // null=尚未加载; 缓存当前全局开关态
+long GA_GLOBAL_CACHE_TS = 0L;               // 上次加载毫秒 (复用 ENABLED_TTL_MS 60s)
+boolean gaGlobalOn() {
+    try {
+        long now = CLOCK.now();
+        if (GA_GLOBAL_CACHE == null || (now - GA_GLOBAL_CACHE_TS) > ENABLED_TTL_MS) {
+            GA_GLOBAL_CACHE = new java.lang.Boolean(!"0".equals(HOST.getString("ga_global_on", "1")));
+            GA_GLOBAL_CACHE_TS = now;
+        }
+        return GA_GLOBAL_CACHE.booleanValue();
+    } catch (Throwable t) {
+        log("gaGlobalOn cache error, fallback to direct read: " + t);
+        try { return !"0".equals(HOST.getString("ga_global_on", "1")); } catch (Throwable t2) { return true; }
+    }
+}
+void setGaGlobal(boolean on) {
+    HOST.putString("ga_global_on", on ? "1" : "0");
+    GA_GLOBAL_CACHE = new java.lang.Boolean(on);   // 变更即时失效: 设置后下一条消息立即按新态判定
+    GA_GLOBAL_CACHE_TS = CLOCK.now();
+}
+
 boolean isGroupEnabled(String groupId) {
+    if (!gaGlobalOn()) return false;                   // ★全局一票否决门 (空键=开, 升级安全)
     String g = normGroupId(groupId);
     if (g.isEmpty()) return false;
     try {
