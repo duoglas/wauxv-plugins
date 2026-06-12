@@ -78,6 +78,7 @@
 |---|---|---|---|
 | C-HARNESS-01 | Harness hook 的纪律拦截（first-call 阶段声明守门等）只施加在**有副作用的工具**（Edit/Write/Agent/写或执行类 Bash）上；**无副作用的只读探索**（Read/Grep/Glob/WebFetch/WebSearch、只读 Bash）不得被拦，且不消耗"首次调用"计数——把强制声明留到第一个真正动手的工具。 | 守门目的是在动手前对齐阶段，不是阻止看代码。每个新 session 开头拦只读探索会被感知成"工具调用出错/任务中断"，纯噪音，还削弱对守门本身的信任。 | 新 session 开头只读探索被拦一次，体感"总是格式出错中断"；用户绕过或关 Harness。 |
 | C-HARNESS-02 | 结构化输入工具（尤其 `AskUserQuestion`）的数组字段（`questions`/`options`）必须是**真数组**，绝不整体序列化成 JSON 字符串；option `description` 写短，**不在 `preview` 里塞带转义引号的多行 shell/git 命令**，大问题拆成多个小问题。 | payload 过大、过深嵌套（长描述 + preview 多行转义命令）会让模型把整个数组折叠成（且常已损坏的）字符串，触发 `type expected array provided string` 校验错误、浪费一轮、看着像卡住。 | AskUserQuestion 调用被拒、自动重试，交互卡顿；payload 越大越频繁。 |
+| C-HARNESS-03 | **每个涉及代码改动的迭代，REVIEW 阶段必须包含至少一个独立 agent 的 code review（≠ 实现该改动的 agent/主循环），不可跳过、不可由作者自审替代。** PLAN 拆解里必须显式列出独立 code review 作为一个阶段/任务（不是埋在"真机准出"里的附属）。热路径/破坏性/反检测等高风险改动在此基础上再加 Santa 双独立审（qa-standards Layer 4）。**唯一可降级**：纯文档/注释/只读诊断脚本（降级需在 REVIEW 留一行记录）。独立 reviewer 输出结构化 PASS/FAIL，有 FAIL 进 Fix Cycle 复审通过才算 done。 | 作者自审有 author-bias，看不见自己的盲区（端口写穿、callee 闭合、SQL NULL、热路径 O(N) 这些"门禁盲区逃逸"类问题恰恰最需要第二双眼）；把 review 埋进真机阶段会被赶进度时悄悄跳过。固化成 PLAN 里的独立阶段 + 不可跳过，才能"始终"成立。 | 带 author-bias 的改动直接上真机/交付，盲区问题逃逸到生产（VH-05/VH-07 类装配盲区本可被独立 review 拦下）。 |
 
 ## [CTX]
 
