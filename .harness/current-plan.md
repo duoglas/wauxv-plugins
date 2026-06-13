@@ -1,34 +1,36 @@
-# 计划: 排行榜 v1 — 发言榜端到端 (gated 单群灰度 + 真机准出) — 2026-06-12
+# 计划: LLM 对接(OpenAI 兼容) + 排行榜润色 — 2026-06-14
 
-设计源: `docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md`
+## 需求(用户确认)
+- 给 GroupAdminPlus 加**可配置 LLM 客户端**(OpenAI 兼容: url/path/key/model/system)。
+- 用 LLM **每次润色排行榜**(默认开, 有 key 就用)。
+- 后续(不在本迭代): 群管智能回复。
 
-## 本迭代范围 (有意收窄, 先打通管道)
-- **只做发言相关**: 总发言榜(话痨王 COUNT) + 水王(字数 SUM val) + 潜水冠军(复用 speak 表)。
-- 红包/拍一拍/转账 metric + 趣味之最全套 + rollup → **留后续迭代**(管道通了再逐个加 metric, 增量低风险)。
-- **A 逐条事件 msg_event 全量保留** 的底座本迭代落地; B 先直接查 A(rollup 下迭代)。
+## 已确认决策
+- **默认配置 auto-seed**: 从兄弟插件「自动回复配置版」config.prop 读 `zhilia_ai_api_url/api_path/api_key/model_name` → 写进 GroupAdminPlus 自己的 `ga_llm_*`(仅设备运行时, key 留设备)。
+- **润色默认开**(有 key 即用), LLM 失败/超时 → 回退朴素榜(永不卡出榜)。
+- **隐私接受**(真昵称发外部 API, 与自动回复同源)。
 
-## 关键安全决策
-- **采集挂热路径 = medium+ 风险**: onHandleMsgBody 每条消息 append, 必须 O(1) 内存(C-PERF-01), Santa 双审 + 真机实测。
-- **gated 灰度**: 加 `rank` 单群开关(仿 enable_state, 默认 OFF, 60s TTL 缓存)。**先只在一个安静测试群启用**, 不blanket全群, 防生产 482 人群写爆/拖慢。
-- **type 用自归一码, 不用 msg.getType()**(返大数不可靠, 见 [[waux-msg-detect-gettype-unreliable]]): v1 只分 text(=1,val=字数)/nontext(=0,val=NULL), 细类后续。
-- 真机有 24h 监测在跑: 灰度后看 norm_avg 不回归。
+## 安全红线 (C-SEC)
+- **API key 绝不进 main.java / 不进 git / 不进任何日志**。只存设备 config.prop, 从兄弟插件 seed。Security grep 必须 0。
 
-## 任务拆解 (每个 ≤15min 可独立验证)
+## 现状锚点
+- 自动回复配置: url=`https://LLM_HOST_REDACTED/v1` path=`/chat/completions` model=`gpt-5.5`, 标准 OpenAI Bearer + messages, org.json 解析。
+- org.json 是 Android 类(**bsh-2.0b6 测试 classpath 无**) → llm.bsh 的 HTTP+JSON 属设备缝(L4 真机验, 仿反射缝); 可测的是"润色失败回退"逻辑。
 
-- **T1 domain/rank.bsh (纯离线)**: msg_event 建表 SQL `(grp,wxid,type,ts,val)`+索引(grp,ts); rankInsertEvent; rankTopNCount(grp,sinceTs,n)→COUNT 榜; rankTopNSum(grp,sinceTs,type,n)→SUM(val) 榜(coalesce 兜 NULL, [[sqlite-upsert-coalesce-null-guard]]); rankFirst(LIMIT1)。L1 单测(fake)+L2 集成(sqlite-jdbc 真库验 SUM/COUNT/NULL)。done: check.sh 新测 GREEN。
-- **T2 app/rank_collect.bsh (离线+装配)**: RANK_DIRTY 内存缓冲(List)+rankRecordEvent O(1) append; rankFlush 单事务批量 INSERT(复用 STORAGE 批量); rank 单群门 rankIsGroupEnabled(rank_enabled_groups, 默认OFF, TTL缓存)+enable/disable。done: 解析过 + 缓冲累积/flush 单测。
-- **T3 热路径接线 (hooks.bsh)**: onHandleMsgBody 共通点(recordSpeak 旁)加 `if(rankIsGroupEnabled(grp)) rankRecordEvent(grp,sender,isText?1:0,ts,isText?len:NULL)` O(1); onLoad 建 msg_event 表; rankFlush 接入 l3FlushLoop 节拍; manifest 登记 rank.bsh/rank_collect.bsh。done: 解析 + check.sh GREEN + callee 闭合扫描。
-- **T4 展示+命令 (rank_render.bsh + commands.bsh)**: 命令「发言榜」/「群龙榜」→后台线程→rankTopNCount/Sum→反射解析昵称(getGroupMemberList, 后台+缓存)→渲染趣味文案(👑话痨王/💧水王/🤿潜水冠军 🥇🥈🥉)→sendText 发群。done: 解析 + check.sh GREEN。
-- **T5 构建准出**: check.sh GREEN(build+解析+L1/L2+新测) + callee 闭合扫描 + Security grep。
-- **T6 独立 agent code review (C-HARNESS-03, 不可跳过, 真机前)**: 派**独立 reviewer agent(≠实现 agent/主循环)** 对 T1-T4 改动做 code review——规格符合 spec + 正确性 + callee 闭合 + SQL NULL/coalesce + gate 默认OFF + 热路径 O(1)。热路径采集属 medium+ → **叠加 Santa 双独立审**(A: 热路径 O(1)+采集正确+不阻塞消息 / B: BeanShell 陷阱(global.限定/自递归)+rank gate+SQL/NULL)。输出结构化 PASS/FAIL; 有 FAIL → Fix Cycle 复审 NICE 才 done。done: 独立 review PASS + Santa NICE。
-- **T7 真机准出**: 部署→force-stop 重载→**仅一个测试群** rankEnable→发若干消息→验 msg_event 入行(拉库查)+「发言榜」命令输出排名正确(话痨/水王/潜水)+热路径 norm_avg 不回归(看 perf.log/监测)+无异常+Security。done: 真机实测 PASS。
+## 任务拆解 (每个 ≤15min)
+- **T1 llm.bsh 客户端(设备缝)**: 配置键 `ga_llm_url/path/key/model/system/rank_on`; `llmEnabled()`(key 非空 + rank_on); `_llmHttpPost(url,key,body)`(HttpURLConnection POST, Bearer, 超时10s, 全 try/catch 返 null) ; `llmChat(system,user)`(org.json 建 messages + 解析 choices[0].message.content, 失败 null); `llmSeedDefaults()`(GA ga_llm_url 空时读兄弟 config.prop 拷键)。done: 解析过(去 final)。
+- **T2 排行榜润色接线(rank_render)**: `rankShowLeaderboard` 后台线程内 build 朴素榜 → `llmEnabled()` 则 `rankLlmPolish(board)`(llmChat 润色, 返 null 回退朴素) → sendText。**润色逻辑(失败回退/禁用直发)抽成可测纯函数 + 假 llmChat 单测**。done: check.sh 含新测 GREEN。
+- **T3 onLoad seed + manifest + 命令**: onLoad 调 llmSeedDefaults(独立 try/catch); manifest 登记 llm.bsh(rank_render 前); 命令 `榜单润色 开/关`(owner) 写 ga_llm_rank_on。done: 解析 + check.sh GREEN + callee 闭合。
+- **T4 构建准出**: check.sh GREEN + 闭合扫描 + **Security grep 0(尤其 key/Bearer 不在源码)**。
+- **T5 独立 code review (C-HARNESS-03, 不可跳过)**: 独立 reviewer 审 —— key 不入源码/不入日志、HTTP 超时+全 try/catch 不卡线程、润色失败回退、JSON 健壮、seed 跨插件读安全。网络外部依赖属 medium → 叠 Santa 双审(A 安全/降级 / B JSON/边界/回退)。done: 独立 review PASS + Santa NICE。
+- **T6 真机准出**: 部署→seed 验证(GA config.prop 出现 ga_llm_* 非空)→测试群发「群龙榜」→看 LLM 润色版出榜 + 关 key/断网 → 回退朴素榜(降级实测)+ logcat 无异常 + 热路径不回归(润色全在后台)。done: 实测 PASS(含降级)。
 
-## 风险 / 不可逆动作
-- 热路径 medium+: 必 Santa + 真机。
-- 真机部署 force-stop com.tencent.mm(标准动作)。
-- 启用即开始写 msg_event(磁盘增长): 仅测试群灰度, 体积看门狗下迭代; 本迭代人工看 db 增速。
+## 风险 / 不可逆
+- 外部网络调用(从真机插件)：超时/失败必须不卡出榜、不碰消息热路径。
+- key 处理：seed 到设备 config.prop(可逆), 绝不入 git。
+- 真机 force-stop 重载(标准)。
 
 ## 验收标准
-- check.sh GREEN + callee 闭合 + Security 0。
-- 真机: 测试群启用后 msg_event 正确入行 + 「发言榜」输出话痨/水王/潜水正确 + 热路径不回归。
-- **独立 agent code review PASS（C-HARNESS-03, 不可跳过）+ Santa 双审 NICE**。
+- check.sh GREEN + 闭合 + **Security 0(key 不在源码/日志)**。
+- 真机: seed 成功 + 群龙榜 LLM 润色出榜 + 降级(无 key/断网)回退朴素 + 热路径不回归。
+- 独立 code review PASS + Santa 双审 NICE。

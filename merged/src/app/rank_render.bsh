@@ -100,8 +100,22 @@ String rankBuildBoard(String groupId) {
     return sb.toString();
 }
 
-// 手动出榜入口(命令调): 后台线程构建 + 发群。
+// 榜单 LLM 润色 system prompt(板子润色用, 不用通用人设)。
+String RANK_POLISH_SYS = "你是群「群龙榜」的毒舌主持人。我给你一份群排行榜, 请改写得更有梗、更好玩、更有网感(可加吐槽/外号/emoji)。硬性要求: 1)保留全部人名和数字, 绝不编造或改动任何数据; 2)保持简洁, 适合群里直接发; 3)只输出改写后的榜单本身, 不要任何解释或前后缀。";
+
+// 榜单润色: 启用且 LLM 成功 → 润色版; 未启用/失败/空 → 原朴素榜(永不卡出榜)。llmEnabled/llmChat 在 app/llm.bsh。
+String rankLlmPolish(String board) {
+    try {
+        if (board == null) return null;
+        if (!llmEnabled()) return board;
+        String out = llmChat(RANK_POLISH_SYS, board);
+        return (out != null && out.trim().length() > 0) ? out : board;
+    } catch (Throwable t) { return board; }
+}
+
+// 手动出榜入口(命令调): 后台线程构建 + (可选)LLM 润色 + 发群。
 //   注: BeanShell 匿名类捕获外层 namespace 不要求 final(去 final 保 bsh-2.0b6 单测可 source); 设备 BeanShell 同样捕获。
+//   LLM 润色全程在本后台线程(不上消息热路径); 失败回退朴素榜。
 void rankShowLeaderboard(String groupId, String content) {
     try {
         new Thread(new Runnable() {
@@ -112,6 +126,7 @@ void rankShowLeaderboard(String groupId, String content) {
                         try { HOST.sendText(groupId, "📊 本群暂无排行榜数据 (管理员发「排行榜开启」开始统计)"); } catch (Throwable t) {}
                         return;
                     }
+                    board = rankLlmPolish(board);
                     HOST.sendText(groupId, board);
                 } catch (Throwable t) {
                     try { HOST.sendText(groupId, "排行榜生成失败"); } catch (Throwable t2) {}

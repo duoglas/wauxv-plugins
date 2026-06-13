@@ -1,0 +1,132 @@
+// ============================================================
+// app/llm — OpenAI 兼容 LLM 客户端 (设备缝)。GroupAdminPlus 接大模型能力。
+// 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md (LLM 增量)
+// 协议: 标准 Chat Completions —— POST {url}{path}, Authorization: Bearer {key}, body{model,messages}, 解析 choices[0].message.content。
+//
+// ★设备缝: 用 java.net.HttpURLConnection(always-present, 免 okhttp 类加载) + org.json(Android 自带)。
+//   org.json 在 bsh-2.0b6 本地测试 classpath 不存在 → 本片**绝不被单测 source**(会 ClassNotFound), 靠 L4 真机验;
+//   解析门(bsh.Parser 去 final)只查语法不解析类 → 可过(同既有 android.* 引用)。
+// ★安全红线(C-SEC): API key 只存设备 config.prop(ga_llm_key), 从兄弟插件「自动回复配置版」seed; 绝不入源码/git/日志。
+// ★降级: 全程后台线程调(rank_render 后台), 超时(连接10s/读15s) + 全 try/catch → 任何失败返 null, 调用方回退。绝不上消息热路径。
+//
+// 配置键(GroupAdminPlus config.prop, HOST.getString/putString):
+//   ga_llm_url(如 https://host/v1) / ga_llm_path(默认 /chat/completions) / ga_llm_key / ga_llm_model(默认 gpt-5.5)
+//   ga_llm_system(通用人设, 预留智能回复) / ga_llm_rank_on(榜单润色开关, 默认 1=开)
+// ============================================================
+
+// 底层 HTTP POST(设备缝)。成功(2xx)返响应体, 否则/异常返 null。绝不抛。
+String _llmHttpPost(String urlStr, String apiKey, String jsonBody) {
+    java.net.HttpURLConnection conn = null;
+    try {
+        java.net.URL u = new java.net.URL(urlStr);
+        conn = (java.net.HttpURLConnection) u.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setConnectTimeout(10000);
+        conn.setReadTimeout(15000);
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+        conn.setRequestProperty("Authorization", "Bearer " + apiKey);
+        java.io.OutputStream os = conn.getOutputStream();
+        try { os.write(jsonBody.getBytes("UTF-8")); os.flush(); } finally { os.close(); }
+        int code = conn.getResponseCode();
+        java.io.InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+        if (is == null) return null;
+        java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(is, "UTF-8"));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        try { while ((line = br.readLine()) != null) sb.append(line); } finally { br.close(); }
+        if (code < 200 || code >= 300) return null;   // 非 2xx 视为失败
+        return sb.toString();
+    } catch (Throwable t) {
+        return null;
+    } finally {
+        try { if (conn != null) conn.disconnect(); } catch (Throwable t2) {}
+    }
+}
+
+// 一轮对话: system+user → assistant content。任何失败(未配置/网络/解析/空)返 null。
+String llmChat(String system, String user) {
+    try {
+        String url = HOST.getString("ga_llm_url", "").trim();
+        String path = HOST.getString("ga_llm_path", "/chat/completions").trim();
+        String key = HOST.getString("ga_llm_key", "").trim();
+        String model = HOST.getString("ga_llm_model", "gpt-5.5").trim();
+        if (url.length() == 0 || key.length() == 0) return null;
+        if (path.length() == 0) path = "/chat/completions";
+        if (model.length() == 0) model = "gpt-5.5";
+        // 规整拼接防双斜杠(Santa I1: seed 来源 url 可能尾带 /, url+path → //chat/completions 调用失败)。
+        if (url.endsWith("/")) url = url.substring(0, url.length() - 1);
+        if (!path.startsWith("/")) path = "/" + path;
+
+        org.json.JSONObject body = new org.json.JSONObject();
+        body.put("model", model);
+        org.json.JSONArray msgs = new org.json.JSONArray();
+        if (system != null && system.length() > 0) {
+            org.json.JSONObject ms = new org.json.JSONObject();
+            ms.put("role", "system"); ms.put("content", system);
+            msgs.put(ms);
+        }
+        org.json.JSONObject mu = new org.json.JSONObject();
+        mu.put("role", "user"); mu.put("content", user);
+        msgs.put(mu);
+        body.put("messages", msgs);
+
+        String resp = _llmHttpPost(url + path, key, body.toString());
+        if (resp == null) return null;
+        org.json.JSONObject obj = new org.json.JSONObject(resp);
+        if (!obj.has("choices")) return null;
+        org.json.JSONArray choices = obj.optJSONArray("choices");
+        if (choices == null || choices.length() == 0) return null;
+        org.json.JSONObject c0 = choices.optJSONObject(0);
+        if (c0 == null) return null;
+        org.json.JSONObject m = c0.optJSONObject("message");
+        if (m == null) return null;
+        String content = m.optString("content", "");
+        return (content != null && content.trim().length() > 0) ? content : null;
+    } catch (Throwable t) {
+        return null;
+    }
+}
+
+// 榜单润色是否启用: 有 key + ga_llm_rank_on != "0"(默认开)。
+boolean llmEnabled() {
+    try {
+        String key = HOST.getString("ga_llm_key", "").trim();
+        if (key.length() == 0) return false;
+        return !"0".equals(HOST.getString("ga_llm_rank_on", "1"));
+    } catch (Throwable t) { return false; }
+}
+
+// 设置榜单润色开关(命令调)。
+void llmSetRankOn(boolean on) { HOST.putString("ga_llm_rank_on", on ? "1" : "0"); }
+
+// 默认配置 seed: GA ga_llm_url 空时, 从兄弟插件「自动回复配置版」config.prop 拷 url/path/key/model/system。
+//   key 留设备(此处只把它从一个 config.prop 搬到另一个, 不入源码/git)。onLoad 调一次, 已配置则不覆盖。
+//   用 java.util.Properties + UTF-8 Reader(处理 Properties 转义 \: 与中文 system_prompt)。
+void llmSeedDefaults() {
+    try {
+        if (HOST.getString("ga_llm_url", "").trim().length() > 0) return;   // 已配置不覆盖
+        String sib = "/storage/emulated/0/Android/media/com.tencent.mm/WAuxiliary/Plugin/自动回复配置版/config.prop";
+        java.io.File f = new java.io.File(sib);
+        if (!f.exists()) return;
+        java.util.Properties p = new java.util.Properties();
+        java.io.FileInputStream fis = new java.io.FileInputStream(f);
+        try {
+            java.io.InputStreamReader r = new java.io.InputStreamReader(fis, "UTF-8");
+            try { p.load(r); } finally { r.close(); }
+        } finally { try { fis.close(); } catch (Throwable t2) {} }
+        String url = p.getProperty("zhilia_ai_api_url", "");
+        String path = p.getProperty("zhilia_ai_api_path", "/chat/completions");
+        String key = p.getProperty("zhilia_ai_api_key", "");
+        String model = p.getProperty("zhilia_ai_model_name", "gpt-5.5");
+        String sys = p.getProperty("zhilia_ai_system_prompt", "");
+        if (url != null && url.length() > 0) HOST.putString("ga_llm_url", url);
+        if (path != null && path.length() > 0) HOST.putString("ga_llm_path", path);
+        if (key != null && key.length() > 0) HOST.putString("ga_llm_key", key);
+        if (model != null && model.length() > 0) HOST.putString("ga_llm_model", model);
+        if (sys != null && sys.length() > 0) HOST.putString("ga_llm_system", sys);
+    } catch (Throwable t) {
+        // Santa I2: seed 失败留痕(可观测性)。异常是文件读/解析错, 不含 key, 安全可 log。
+        try { log("llm seed read fail: " + t); } catch (Throwable t2) {}
+    }
+}

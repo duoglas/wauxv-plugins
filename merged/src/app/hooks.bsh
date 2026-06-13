@@ -210,6 +210,9 @@ void onLoad() {
     } catch (Throwable t) {
         try { log("RedPacketStats onLoad block fail: " + t); } catch (Throwable t2) {}
     }
+
+    // ---- (7) LLM 默认配置 seed (从兄弟插件「自动回复配置版」拷 url/key/model; 已配置则不覆盖)。独立 try/catch。----
+    try { llmSeedDefaults(); } catch (Throwable t) { try { log("llm seed fail: " + t); } catch (Throwable t2) {} }
 }
 
 // ============================================================

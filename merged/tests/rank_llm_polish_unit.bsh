@@ -1,0 +1,33 @@
+// L1 单测: rank_render.rankLlmPolish 润色回退逻辑(桩 llmEnabled/llmChat, 不碰真 LLM/org.json)。
+// 在 source rank_render 前定义可控桩; rankLlmPolish 调用时解析到桩。运行 cwd = merged/。
+source("tests/_harness.bsh");
+
+boolean FAKE_LLM_ENABLED = false;
+String FAKE_LLM_RESULT = null;
+boolean llmEnabled() { return FAKE_LLM_ENABLED; }
+String llmChat(String system, String user) { return FAKE_LLM_RESULT; }
+
+source("src/app/rank_render.bsh");
+
+String BOARD = "🏆 原始朴素榜 🏆";
+
+// 1) 未启用 → 原样朴素榜
+FAKE_LLM_ENABLED = false;
+check("未启用 LLM → 返回原朴素榜", BOARD.equals(rankLlmPolish(BOARD)));
+
+// 2) 启用 + 成功 → 润色版
+FAKE_LLM_ENABLED = true; FAKE_LLM_RESULT = "✨ 润色后 ✨";
+check("启用+成功 → 润色版", "✨ 润色后 ✨".equals(rankLlmPolish(BOARD)));
+
+// 3) 启用 + llmChat 返 null → 回退朴素
+FAKE_LLM_ENABLED = true; FAKE_LLM_RESULT = null;
+check("启用+LLM失败(null) → 回退朴素榜", BOARD.equals(rankLlmPolish(BOARD)));
+
+// 4) 启用 + llmChat 返空白 → 回退朴素
+FAKE_LLM_ENABLED = true; FAKE_LLM_RESULT = "   ";
+check("启用+LLM返空白 → 回退朴素榜", BOARD.equals(rankLlmPolish(BOARD)));
+
+// 5) board=null → null(无榜可润)
+check("board null → null", rankLlmPolish(null) == null);
+
+done();

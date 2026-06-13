@@ -232,6 +232,18 @@ boolean routeCommand(String groupId, String sender, String content,
         rankShowLeaderboard(groupId, content);
         return true;
     }
+    if (content.equals("榜单润色开") || content.equals("榜单润色 开")) {
+        if (!isOwner(sender)) return true;
+        llmSetRankOn(true);
+        HOST.sendText(groupId, "✨ 榜单 LLM 润色已开启 (需已配置 key, 失败自动回退朴素榜)");
+        return true;
+    }
+    if (content.equals("榜单润色关") || content.equals("榜单润色 关")) {
+        if (!isOwner(sender)) return true;
+        llmSetRankOn(false);
+        HOST.sendText(groupId, "已关闭榜单 LLM 润色 (恢复朴素榜)");
+        return true;
+    }
 
     // ---- 没启用就静默忽略其他所有命令 (@2206) ----
     if (!_cmdGroupEnabled(groupId)) return false;
