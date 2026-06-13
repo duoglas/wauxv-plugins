@@ -1,11 +1,12 @@
 // ============================================================
 // app/rank_render — 排行榜展示: 查询 A → 解析昵称 → 趣味文案 → 后台线程发群(手动出榜)。
 // 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md
-// 依赖: domain/rank.bsh(rankTopNCount/rankTopNSum) + 全局 HOST(lookupName/sendText)。
+// 依赖: domain/rank.bsh(rankTopNCount/CountType/Sum/LurkChampion/RpKing) + 全局 HOST(getLoginWxid/lookupName/sendText) + CLOCK。
 //
 // 红线: 出榜由命令手动触发, 全程后台线程(查询+反射昵称都不上消息热路径, 防 ANR §7); 整段 try/catch。
-//   v1 趣味类目: 👑话痨榜(COUNT top5) + 💧水王(字数 SUM top1)。潜水冠军/红包/拍一拍/转账 之最 → 后续增量。
-//   时间窗 v1 = 总榜(累计, since=0..MAX); 今日/本周窗 → 后续。
+//   ★排除机器人自己(getLoginWxid): 机器人发的群规/警告/榜单不进榜。
+//   v1.1 类目: 🗣️话痨榜(COUNT top5) + 💧水王(字数) + 📷图王(非文本) + 🧧红包王(rp_record) + 🤿潜水冠军(speak)。
+//     拍一拍/转账/熬夜 → 后续增量(需先采集那些事件类型)。时间窗 v1 = 总榜(累计)。
 // ============================================================
 
 // wxid → 群昵称(取不到回退 wxid)。HOST.lookupName 是反射缝(后台线程调)。
@@ -14,31 +15,88 @@ String _rankName(String wxid, String grp) {
     return (wxid == null) ? "?" : wxid;
 }
 
-// 纯构建榜文本(可测; 无线程/无 sendText)。无数据返回 null。
+// 大数格式化: >=1万 显示 "X.X万"。
+String _rankFmtNum(long n) {
+    if (n >= 10000L) {
+        long w = n / 10000L;
+        long r = (n % 10000L) / 1000L;
+        return (r > 0) ? ("" + w + "." + r + "万") : ("" + w + "万");
+    }
+    return "" + n;
+}
+// 时长格式化(ms → 分/小时/天)。
+String _rankFmtAgo(long ms) {
+    long mins = ms / 60000L;
+    if (mins < 60L) return "" + (mins < 1L ? 1L : mins) + " 分钟";
+    long hours = mins / 60L;
+    if (hours < 24L) return "" + hours + " 小时";
+    return "" + (hours / 24L) + " 天";
+}
+
+// 纯构建榜文本(可测; 无线程/无 sendText)。无发言数据返回 null。
 String rankBuildBoard(String groupId) {
     long SINCE = 0L;
     long UNTIL = Long.MAX_VALUE;   // v1 总榜(累计)
-    java.util.List cnt = rankTopNCount(groupId, SINCE, UNTIL, 5);
+    String bot = "";
+    try { String b = HOST.getLoginWxid(); if (b != null) bot = b; } catch (Throwable t) {}
+
+    java.util.List cnt = rankTopNCount(groupId, SINCE, UNTIL, bot, 5);
     if (cnt == null || cnt.isEmpty()) return null;
 
     StringBuilder sb = new StringBuilder();
-    sb.append("🏆 群龙榜 🏆\n\n【话痨榜】谁在屠屏\n");
-    String[] medals = { "🥇", "🥈", "🥉", "4️⃣", "5️⃣" };
+    sb.append("🏆 群 龙 榜 🏆\n");
+    sb.append("━━━━━━━━━━━━\n");
+    sb.append("🗣️ 话痨榜 · 谁在屠屏\n");
+    String[] medals = { "🥇", "🥈", "🥉", "④", "⑤" };
     for (int i = 0; i < cnt.size() && i < medals.length; i++) {
         Object[] r = (Object[]) cnt.get(i);
         sb.append(medals[i]).append(" ").append(_rankName((String) r[0], groupId))
-          .append("  ").append(((Long) r[1]).longValue()).append(" 条\n");
+          .append(" · ").append(((Long) r[1]).longValue()).append(" 条\n");
     }
-    // 💧 水王(字数冠军)
-    java.util.List water = rankTopNSum(groupId, RANK_TYPE_TEXT, SINCE, UNTIL, 1);
-    if (water != null && !water.isEmpty()) {
-        Object[] w = (Object[]) water.get(0);
-        long chars = ((Long) w[1]).longValue();
-        if (chars > 0) {
-            sb.append("\n💧 水王: ").append(_rankName((String) w[0], groupId))
-              .append(" 敲了 ").append(chars).append(" 字，多喝水");
+
+    // 单项之最(各自独立 try/catch: 某表缺/查询错只跳过该项, 不毁整榜)。
+    StringBuilder best = new StringBuilder();
+    try {
+        java.util.List water = rankTopNSum(groupId, RANK_TYPE_TEXT, SINCE, UNTIL, bot, 1);
+        if (water != null && !water.isEmpty()) {
+            Object[] w = (Object[]) water.get(0);
+            long c = ((Long) w[1]).longValue();
+            if (c > 0) best.append("💧 水  王  ").append(_rankName((String) w[0], groupId)).append(" · ").append(_rankFmtNum(c)).append(" 字\n");
         }
+    } catch (Throwable t) {}
+    try {
+        java.util.List pic = rankTopNCountType(groupId, RANK_TYPE_OTHER, SINCE, UNTIL, bot, 1);
+        if (pic != null && !pic.isEmpty()) {
+            Object[] p = (Object[]) pic.get(0);
+            long c = ((Long) p[1]).longValue();
+            if (c > 0) best.append("📷 图  王  ").append(_rankName((String) p[0], groupId)).append(" · ").append(c).append(" 张\n");
+        }
+    } catch (Throwable t) {}
+    try {
+        java.util.List rp = rankRpKing(groupId, bot, 1);
+        if (rp != null && !rp.isEmpty()) {
+            Object[] k = (Object[]) rp.get(0);
+            long c = ((Long) k[1]).longValue();
+            if (c > 0) best.append("🧧 红包王  ").append(_rankName((String) k[0], groupId)).append(" · ").append(c).append(" 个\n");
+        }
+    } catch (Throwable t) {}
+    try {
+        java.util.List lurk = rankLurkChampion(groupId, bot);
+        if (lurk != null && !lurk.isEmpty()) {
+            Object[] l = (Object[]) lurk.get(0);
+            if (l[1] != null) {
+                long ago = CLOCK.now() - ((Long) l[1]).longValue();
+                if (ago > 0) best.append("🤿 潜水冠军 ").append(_rankName((String) l[0], groupId)).append(" · ").append(_rankFmtAgo(ago)).append("没冒泡\n");
+            }
+        }
+    } catch (Throwable t) {}
+
+    if (best.length() > 0) {
+        sb.append("━━━━━━━━━━━━\n");
+        sb.append("✨ 单项之最\n");
+        sb.append(best.toString());
     }
+    sb.append("━━━━━━━━━━━━");
     return sb.toString();
 }
 

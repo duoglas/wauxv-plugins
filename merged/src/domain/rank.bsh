@@ -35,24 +35,51 @@ void rankInsertBatch(java.util.List bindsList) {
 }
 
 // ---- 聚合榜(B 从 A 派生)。窗口 [sinceTs, untilTs); 总榜传 since=0, until=Long.MAX。----
+//   ★所有榜都带 exclWxid 排除项(排除机器人自己, 传 "" = 不排除)。机器人发的群规/警告/榜单不应进榜。
 
-// 话痨榜: 某群窗口内按"消息条数"(任意 type) topN。返回 List<Object[]>: [0]=wxid(String) [1]=count(Long)。
-// 平票按 wxid 升序稳定排序。
+// 话痨榜: 某群窗口内按"消息条数"(任意 type) topN。返回 List<Object[]>: [0]=wxid(String) [1]=count(Long)。平票按 wxid 升序稳定。
 RANK_TOPN_COUNT_SQL =
-    "SELECT wxid, COUNT(*) c FROM msg_event WHERE grp=? AND ts>=? AND ts<? "
+    "SELECT wxid, COUNT(*) c FROM msg_event WHERE grp=? AND wxid<>? AND ts>=? AND ts<? "
     + "GROUP BY wxid ORDER BY c DESC, wxid ASC LIMIT ?";
-java.util.List rankTopNCount(String grp, long sinceTs, long untilTs, int n) {
+java.util.List rankTopNCount(String grp, long sinceTs, long untilTs, String exclWxid, int n) {
     return STORAGE.queryRows(RANK_TOPN_COUNT_SQL,
-        new Object[]{ grp, new Long(sinceTs), new Long(untilTs), new Long((long) n) });
+        new Object[]{ grp, (exclWxid == null ? "" : exclWxid), new Long(sinceTs), new Long(untilTs), new Long((long) n) });
+}
+
+// 按 type 计数榜(图王=非文本数 等): 某群某 type 窗口内按条数 topN。返回 [0]=wxid [1]=count(Long)。
+RANK_TOPN_COUNT_TYPE_SQL =
+    "SELECT wxid, COUNT(*) c FROM msg_event WHERE grp=? AND wxid<>? AND type=? AND ts>=? AND ts<? "
+    + "GROUP BY wxid ORDER BY c DESC, wxid ASC LIMIT ?";
+java.util.List rankTopNCountType(String grp, int type, long sinceTs, long untilTs, String exclWxid, int n) {
+    return STORAGE.queryRows(RANK_TOPN_COUNT_TYPE_SQL,
+        new Object[]{ grp, (exclWxid == null ? "" : exclWxid), new Long((long) type), new Long(sinceTs), new Long(untilTs), new Long((long) n) });
 }
 
 // 求和榜(水王=字数 / 金额): 某群某 type 窗口内按 SUM(val) topN。
-//   coalesce(SUM(val),0) 兜 NULL(全 NULL 组返 0 不返 NULL, sqlite-upsert-coalesce-null-guard)。
-//   返回 [0]=wxid(String) [1]=sum(Long)。
+//   coalesce(SUM(val),0) 兜 NULL(全 NULL 组返 0, sqlite-upsert-coalesce-null-guard)。返回 [0]=wxid [1]=sum(Long)。
 RANK_TOPN_SUM_SQL =
-    "SELECT wxid, coalesce(SUM(val),0) s FROM msg_event WHERE grp=? AND type=? AND ts>=? AND ts<? "
+    "SELECT wxid, coalesce(SUM(val),0) s FROM msg_event WHERE grp=? AND wxid<>? AND type=? AND ts>=? AND ts<? "
     + "GROUP BY wxid ORDER BY s DESC, wxid ASC LIMIT ?";
-java.util.List rankTopNSum(String grp, int type, long sinceTs, long untilTs, int n) {
+java.util.List rankTopNSum(String grp, int type, long sinceTs, long untilTs, String exclWxid, int n) {
     return STORAGE.queryRows(RANK_TOPN_SUM_SQL,
-        new Object[]{ grp, new Long((long) type), new Long(sinceTs), new Long(untilTs), new Long((long) n) });
+        new Object[]{ grp, (exclWxid == null ? "" : exclWxid), new Long((long) type), new Long(sinceTs), new Long(untilTs), new Long((long) n) });
+}
+
+// 潜水冠军: speak 表里(本群,排除机器人,曾发过言)last_speak 最早=沉默最久者。返回 [0]=wxid [1]=last_speak(Long, ms)。无则空。
+//   speak 表与 msg_event 同库(groupadmin.db)。只取曾发言(last_speak 非 NULL); 从没发言者(纯 first_seen)不参与本榜。
+RANK_LURK_SQL =
+    "SELECT wxid, last_speak FROM speak WHERE grp=? AND wxid<>? AND last_speak IS NOT NULL "
+    + "ORDER BY last_speak ASC LIMIT 1";
+java.util.List rankLurkChampion(String grp, String exclWxid) {
+    return STORAGE.queryRows(RANK_LURK_SQL, new Object[]{ grp, (exclWxid == null ? "" : exclWxid) });
+}
+
+// 红包王: rp_record 表里(本群,排除机器人)按发包条数 topN。返回 [0]=sender_wxid [1]=count(Long)。无则空。
+//   rp_record 与 msg_event 同库; 列 sender_wxid/grp(domain/redpacket_store)。
+RANK_RP_KING_SQL =
+    "SELECT sender_wxid, COUNT(*) c FROM rp_record WHERE grp=? AND sender_wxid<>? "
+    + "GROUP BY sender_wxid ORDER BY c DESC, sender_wxid ASC LIMIT ?";
+java.util.List rankRpKing(String grp, String exclWxid, int n) {
+    return STORAGE.queryRows(RANK_RP_KING_SQL,
+        new Object[]{ grp, (exclWxid == null ? "" : exclWxid), new Long((long) n) });
 }
