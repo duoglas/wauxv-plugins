@@ -105,3 +105,33 @@ src/app/rank_render.bsh     查询 + 名字解析 + 趣味渲染(后台线程)
 4. 逐个加 metric 采集：红包（worker 旁）→ 拍一拍（content 判据）→ 转账（wcpayinfo 解析，transferid 去重）。
 5. 趣味"之最"类目配置 + rollup 物化 + 体积看门狗。
 6. 真机准出 + Santa 双审（热路径采集属 medium+）。
+
+---
+
+## 10. LLM 对接 + 排行榜润色（2026-06-14 已落地）
+
+### 10.1 已实现状态
+- v1 发言榜（话痨/水王）→ v1.1（排除机器人 + 图王/红包王/潜水冠军 5 类 + 美化）→ LLM 润色，均已上真机（gated）。
+- 灰度群 `GROUP_A_ID@chatroom`；每个增量过独立 code review（C-HARNESS-03）+ Santa 双审 + 真机。
+
+### 10.2 LLM 客户端 `app/llm.bsh`（设备缝）
+- 协议：OpenAI 兼容 Chat Completions。`_llmHttpPost`（`java.net.HttpURLConnection` POST，`Authorization: Bearer {key}`，连接 10s/读 15s 超时，全 try/catch 返 null，资源 finally close）+ `llmChat(system,user)`（org.json 建 `{model,messages}`，解析 `choices[0].message.content`，逐层 null 兜底）。
+- ★`org.json` 是 Android 类、**bsh-2.0b6 测试 classpath 无** → llm.bsh **绝不被单测 source**（会 ClassNotFound），靠 L4 真机验；解析门只查语法可过。可测的是"润色回退"逻辑（桩 `llmEnabled`/`llmChat`）。
+- URL 拼接防双斜杠（seed 来源 url 可能尾带 `/`）：trim url 尾 `/` + 确保 path 以 `/` 开头（Santa I1）。
+
+### 10.3 配置键（GroupAdminPlus config.prop）
+`ga_llm_url`(如 `https://host/v1`) / `ga_llm_path`(默认 `/chat/completions`) / `ga_llm_key` / `ga_llm_model`(默认 `gpt-5.5`) / `ga_llm_system`(通用人设, 预留智能回复) / `ga_llm_rank_on`(榜单润色开关, 默认 1=开)。
+
+### 10.4 默认配置 seed（`llmSeedDefaults`，onLoad 调）
+- GA `ga_llm_url` 空时，读兄弟插件「自动回复配置版」`config.prop`（`zhilia_ai_api_url/api_path/api_key/model_name/system_prompt`）→ 写进 GA 的 `ga_llm_*`。用 `java.util.Properties` + UTF-8 `Reader`（处理 `\:` 转义 + 中文 system_prompt）。已配置则不覆盖；文件不存在/读失败 log 留痕（Santa I2，异常不含 key 安全）。
+
+### 10.5 安全红线（C-SEC，必须保持）
+- **API key 绝不进 main.java / git / 任何 log / 异常串**。只存设备 config.prop，从兄弟插件 seed（key 仅在设备 config.prop 间搬运）。每次准出 `grep -rniE "key值/endpoint" src/` 必须 0 命中。
+
+### 10.6 排行榜润色 `rankLlmPolish`
+- `rankShowLeaderboard` 后台线程内：build 朴素榜 → `llmEnabled()` 则 `llmChat(RANK_POLISH_SYS, 朴素榜)` → 润色版；**未启用/失败/空 → 回退朴素榜（永不卡出榜）**。全程后台线程，绝不上消息热路径。
+- `RANK_POLISH_SYS` = 毒舌主持人提示（保留全部人名+数字不得编造、简洁、只输出榜单本身）。换风格只改此常量。
+- 命令「榜单润色 开/关」(owner) → `llmSetRankOn`。
+
+### 10.7 后续（LLM 方向）
+- 群管智能回复（用户"后续想"）：复用 `llmChat` + `ga_llm_system` 人设；需设计触发条件（@机器人/关键词）+ 频控 + 热路径只判定不调用（调用走后台/worker）。
