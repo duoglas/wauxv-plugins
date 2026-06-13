@@ -1,0 +1,72 @@
+// L2 集成: domain/rank 聚合榜 + sqlite-jdbc 真库 —— 验真 SQL(窗口 WHERE/GROUP BY/ORDER BY/LIMIT/coalesce NULL)。
+// 建表 → 多群/多 type/跨窗口录入 → 话痨榜(COUNT 任意 type) + 水王榜(SUM 字数) + LIMIT + 平票 + 空窗口 + 批量。
+// 运行 cwd = merged/, classpath 含 sqlite-jdbc.jar。
+import java.sql.*;
+source("tests/_harness.bsh");
+source("src/domain/rank.bsh");
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(RANK_CREATE_SQL);
+conn.createStatement().execute(RANK_INDEX_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+String G = "gA@chatroom";
+String G2 = "gB@chatroom";
+long T = 1749470000000L;
+long SINCE = T;           // 窗口 [T, T+1000)
+long UNTIL = T + 1000L;
+
+// 群A: wxA 3 条文本(字数 2/3/10), wxB 1 条文本(字数 100) + 1 条非文本(val null)
+rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 1, new Long(2L));
+rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 2, new Long(3L));
+rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 3, new Long(10L));
+rankInsertEvent(G, "wxB", RANK_TYPE_TEXT, T + 4, new Long(100L));
+rankInsertEvent(G, "wxB", RANK_TYPE_OTHER, T + 5, null);
+// 群B: wxC 1 条(不应进群A榜)
+rankInsertEvent(G2, "wxC", RANK_TYPE_TEXT, T + 6, new Long(7L));
+// 窗口外(早于 since)的群A: 不应计入
+rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T - 100000L, new Long(50L));
+
+// ---- 话痨榜(COUNT 任意 type): wxA=3, wxB=2(文本+非文本都算发言) ----
+java.util.List cnt = rankTopNCount(G, SINCE, UNTIL, 10);
+check("话痨榜 2 人(群A窗口内, 不含群B/窗口外)", cnt.size() == 2);
+Object[] c0 = (Object[]) cnt.get(0);
+Object[] c1 = (Object[]) cnt.get(1);
+check("话痨第一 = wxA", "wxA".equals(c0[0]));
+check("wxA 消息数 = 3 (窗口外那条不计)", ((Long) c0[1]).longValue() == 3L);
+check("话痨第二 = wxB", "wxB".equals(c1[0]));
+check("wxB 消息数 = 2 (文本+非文本都算发言)", ((Long) c1[1]).longValue() == 2L);
+
+// ---- 水王榜(type=text SUM 字数): wxA=15(2+3+10), wxB=100 ----
+java.util.List sum = rankTopNSum(G, RANK_TYPE_TEXT, SINCE, UNTIL, 10);
+Object[] s0 = (Object[]) sum.get(0);
+Object[] s1 = (Object[]) sum.get(1);
+check("水王第一 = wxB (字数100)", "wxB".equals(s0[0]) && ((Long) s0[1]).longValue() == 100L);
+check("水王第二 = wxA 字数=15 (窗口外50不计)", "wxA".equals(s1[0]) && ((Long) s1[1]).longValue() == 15L);
+
+// ---- LIMIT: topN=1 只回冠军 ----
+java.util.List top1 = rankTopNCount(G, SINCE, UNTIL, 1);
+check("LIMIT 1 → 1 行", top1.size() == 1);
+check("冠军 = wxA", "wxA".equals(((Object[]) top1.get(0))[0]));
+
+// ---- coalesce NULL: 全 NULL val 的 type 求和 → 0 不返 NULL ----
+java.util.List sumOther = rankTopNSum(G, RANK_TYPE_OTHER, SINCE, UNTIL, 10);
+check("非文本求和 1 行(wxB)", sumOther.size() == 1);
+check("全 NULL val SUM coalesce → 0", ((Long) ((Object[]) sumOther.get(0))[1]).longValue() == 0L);
+
+// ---- 空窗口 ----
+java.util.List empty = rankTopNCount(G, T + 5000L, T + 6000L, 10);
+check("空窗口 → 空列表", empty.isEmpty());
+
+// ---- 批量录入后查询一致 ----
+java.util.List bl = new java.util.ArrayList();
+bl.add(new Object[]{ G2, "wxD", new Long((long) RANK_TYPE_TEXT), new Long(T + 10L), new Long(9L) });
+bl.add(new Object[]{ G2, "wxD", new Long((long) RANK_TYPE_TEXT), new Long(T + 11L), new Long(8L) });
+rankInsertBatch(bl);
+java.util.List g2cnt = rankTopNCount(G2, SINCE, UNTIL, 10);
+Object[] g2c0 = (Object[]) g2cnt.get(0);
+check("批量后群B话痨第一 = wxD(2条)", "wxD".equals(g2c0[0]) && ((Long) g2c0[1]).longValue() == 2L);
+
+conn.close();
+done();

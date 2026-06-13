@@ -1,0 +1,93 @@
+// ============================================================
+// app/rank_collect — 排行榜事件采集 L3 infra: 热路径 O(1) 内存缓冲 + 后台批量 flush + 单群门 + 降级。
+// 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md
+// 依赖: domain/rank.bsh(rankInsertBatch) + domain/membership.bsh(normGroupId/parseCsv/joinCsv) + 全局 HOST/CLOCK/STORAGE。
+//
+// 红线:
+//   - rankRecordEvent 热路径**只内存 append**(C-PERF-01/03), 绝不碰 getString/DB/磁盘; 仿 speak_buffer.recordSpeak。
+//   - 降级(C-ARCH-02): 缓冲到顶 / flush 连续失败 → RANK_DEGRADED, 采集入口直接丢弃, **绝不反向影响消息收发**。
+//   - 单群门**默认 OFF**(灰度): 仅显式 rankEnableGroup 的群才采集; 60s TTL 缓存避免热路径读 FUSE(waux-getstring-fuse-io-cache-hotpath)。
+// ============================================================
+
+// ===== 单群门(默认 OFF; 仿 enable_state, 60s TTL 缓存) =====
+String RANK_K_ENABLED       = "rank_enabled_groups";   // CSV; 空=无群启用(默认 OFF, 灰度安全)
+java.util.HashSet RANK_ENABLED_CACHE = null;            // null=未加载
+long   RANK_ENABLED_TS      = 0L;
+long   RANK_ENABLED_TTL_MS  = 60000L;
+
+void rankLoadEnabledCache() {
+    java.util.HashSet s = new java.util.HashSet();
+    try {
+        java.util.List l = parseCsv(HOST.getString(RANK_K_ENABLED, ""));
+        for (int i = 0; i < l.size(); i++) { String g = normGroupId((String) l.get(i)); if (!g.isEmpty()) s.add(g); }
+    } catch (Throwable t) {}
+    RANK_ENABLED_CACHE = s;
+    RANK_ENABLED_TS = CLOCK.now();
+}
+// 热路径调: 命中缓存 O(1) 内存查, 不碰 FUSE。降级安全: 任何异常默认 OFF(不采集, 不影响消息)。
+boolean rankIsGroupEnabled(String groupId) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty()) return false;
+        long now = CLOCK.now();
+        if (RANK_ENABLED_CACHE == null || (now - RANK_ENABLED_TS) > RANK_ENABLED_TTL_MS) rankLoadEnabledCache();
+        return RANK_ENABLED_CACHE.contains(g);
+    } catch (Throwable t) { return false; }
+}
+void rankEnableGroup(String groupId) {
+    String g = normGroupId(groupId); if (g.isEmpty()) return;
+    java.util.List l = parseCsv(HOST.getString(RANK_K_ENABLED, ""));
+    boolean has = false;
+    for (int i = 0; i < l.size(); i++) { if (g.equals(normGroupId((String) l.get(i)))) { has = true; break; } }
+    if (!has) l.add(g);
+    HOST.putString(RANK_K_ENABLED, joinCsv(l));
+    rankLoadEnabledCache();   // 即时生效
+}
+void rankDisableGroup(String groupId) {
+    String g = normGroupId(groupId); if (g.isEmpty()) return;
+    java.util.List l = parseCsv(HOST.getString(RANK_K_ENABLED, ""));
+    java.util.List out = new java.util.ArrayList();
+    for (int i = 0; i < l.size(); i++) { String x = normGroupId((String) l.get(i)); if (!x.isEmpty() && !g.equals(x)) out.add(x); }
+    HOST.putString(RANK_K_ENABLED, joinCsv(out));
+    rankLoadEnabledCache();
+}
+
+// ===== 采集缓冲(append-only List) + 降级 (仿 speak_buffer 锁序) =====
+Object RANK_LOCK        = new Object();   // 保护 RANK_DIRTY (热路径只用这把)
+Object RANK_FLUSH_LOCK  = new Object();   // 串行化 rankFlush (换出+落库); 锁序 FLUSH_LOCK 外, LOCK 内换出
+java.util.List RANK_DIRTY = new java.util.ArrayList();   // 每项 Object[]{ grp, wxid, Long type, Long ts, Long val }
+int     RANK_BUFFER_CAP = 5000;           // 缓冲条数上界: ≥ 此值进降级(保护内存)
+int     RANK_FAIL_CAP   = 5;              // flush 连续失败阈值
+boolean RANK_DEGRADED   = false;          // 降级标志: 真则 rankRecordEvent 直接 return(廉价布尔读)
+long    RANK_flushFailStreak = 0;
+
+// 热路径入口: O(1) 内存 append。grp/wxid 空跳过; 降级期丢弃(L3 可降级, 不影响 L1/L2 与收发)。
+void rankRecordEvent(String groupId, String wxid, int type, long ts, Long val) {
+    if (groupId == null || wxid == null || groupId.isEmpty() || wxid.isEmpty()) return;
+    if (RANK_DEGRADED) return;
+    synchronized (RANK_LOCK) {
+        RANK_DIRTY.add(new Object[]{ groupId, wxid, new Long((long) type), new Long(ts), val });
+        if (!RANK_DEGRADED && RANK_DIRTY.size() >= RANK_BUFFER_CAP) RANK_DEGRADED = true;   // 触发器(1) 缓冲到顶
+    }
+}
+
+// 后台批量落库: 换出缓冲 → rankInsertBatch 单事务(C-PERF-05)。锁序: FLUSH_LOCK 外, RANK_LOCK 内仅换出瞬间。
+// 失败丢本批(L3 可降级, 不回灌避免无限增长); 连续失败到顶 → 降级。成功且缓冲低水位 → 解除降级。
+void rankFlush() {
+    synchronized (RANK_FLUSH_LOCK) {
+        java.util.List swap = null;
+        synchronized (RANK_LOCK) {
+            if (!RANK_DIRTY.isEmpty()) { swap = RANK_DIRTY; RANK_DIRTY = new java.util.ArrayList(); }
+        }
+        if (swap == null) return;
+        boolean fail = false;
+        try { rankInsertBatch(swap); } catch (Throwable t) { fail = true; }
+        if (fail) {
+            RANK_flushFailStreak++;
+            if (!RANK_DEGRADED && RANK_flushFailStreak >= RANK_FAIL_CAP) RANK_DEGRADED = true;   // 触发器(2)
+        } else {
+            RANK_flushFailStreak = 0;
+            if (RANK_DEGRADED) { synchronized (RANK_LOCK) { if (RANK_DIRTY.size() < (RANK_BUFFER_CAP / 2)) RANK_DEGRADED = false; } }
+        }
+    }
+}

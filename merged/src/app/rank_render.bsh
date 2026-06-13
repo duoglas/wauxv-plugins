@@ -1,0 +1,64 @@
+// ============================================================
+// app/rank_render — 排行榜展示: 查询 A → 解析昵称 → 趣味文案 → 后台线程发群(手动出榜)。
+// 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md
+// 依赖: domain/rank.bsh(rankTopNCount/rankTopNSum) + 全局 HOST(lookupName/sendText)。
+//
+// 红线: 出榜由命令手动触发, 全程后台线程(查询+反射昵称都不上消息热路径, 防 ANR §7); 整段 try/catch。
+//   v1 趣味类目: 👑话痨榜(COUNT top5) + 💧水王(字数 SUM top1)。潜水冠军/红包/拍一拍/转账 之最 → 后续增量。
+//   时间窗 v1 = 总榜(累计, since=0..MAX); 今日/本周窗 → 后续。
+// ============================================================
+
+// wxid → 群昵称(取不到回退 wxid)。HOST.lookupName 是反射缝(后台线程调)。
+String _rankName(String wxid, String grp) {
+    try { String n = HOST.lookupName(wxid, grp); if (n != null && !n.trim().isEmpty()) return n; } catch (Throwable t) {}
+    return (wxid == null) ? "?" : wxid;
+}
+
+// 纯构建榜文本(可测; 无线程/无 sendText)。无数据返回 null。
+String rankBuildBoard(String groupId) {
+    long SINCE = 0L;
+    long UNTIL = Long.MAX_VALUE;   // v1 总榜(累计)
+    java.util.List cnt = rankTopNCount(groupId, SINCE, UNTIL, 5);
+    if (cnt == null || cnt.isEmpty()) return null;
+
+    StringBuilder sb = new StringBuilder();
+    sb.append("🏆 群龙榜 🏆\n\n【话痨榜】谁在屠屏\n");
+    String[] medals = { "🥇", "🥈", "🥉", "4️⃣", "5️⃣" };
+    for (int i = 0; i < cnt.size() && i < medals.length; i++) {
+        Object[] r = (Object[]) cnt.get(i);
+        sb.append(medals[i]).append(" ").append(_rankName((String) r[0], groupId))
+          .append("  ").append(((Long) r[1]).longValue()).append(" 条\n");
+    }
+    // 💧 水王(字数冠军)
+    java.util.List water = rankTopNSum(groupId, RANK_TYPE_TEXT, SINCE, UNTIL, 1);
+    if (water != null && !water.isEmpty()) {
+        Object[] w = (Object[]) water.get(0);
+        long chars = ((Long) w[1]).longValue();
+        if (chars > 0) {
+            sb.append("\n💧 水王: ").append(_rankName((String) w[0], groupId))
+              .append(" 敲了 ").append(chars).append(" 字，多喝水");
+        }
+    }
+    return sb.toString();
+}
+
+// 手动出榜入口(命令调): 后台线程构建 + 发群。
+//   注: BeanShell 匿名类捕获外层 namespace 不要求 final(去 final 保 bsh-2.0b6 单测可 source); 设备 BeanShell 同样捕获。
+void rankShowLeaderboard(String groupId, String content) {
+    try {
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    String board = rankBuildBoard(groupId);
+                    if (board == null) {
+                        try { HOST.sendText(groupId, "📊 本群暂无排行榜数据 (管理员发「排行榜开启」开始统计)"); } catch (Throwable t) {}
+                        return;
+                    }
+                    HOST.sendText(groupId, board);
+                } catch (Throwable t) {
+                    try { HOST.sendText(groupId, "排行榜生成失败"); } catch (Throwable t2) {}
+                }
+            }
+        }).start();
+    } catch (Throwable t) {}
+}

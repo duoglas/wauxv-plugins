@@ -1,0 +1,42 @@
+// L1 单测: domain/rank 录入契约 —— rankInsertEvent/rankInsertBatch 用正确 SQL + binds 调端口。
+// fake 端口只记 exec 调用, 验交互(不碰真 SQL)。运行 cwd = merged/。
+source("tests/_harness.bsh");
+source("tests/fakes/storage_fake.bsh");
+source("src/domain/rank.bsh");
+
+// ---- 1) 文本事件: 正确 SQL + 5 binds, val=字数 ----
+FAKE_EXEC_CALLS.clear();
+rankInsertEvent("g@chatroom", "wx1", RANK_TYPE_TEXT, 1000L, new Long(5L));
+check("insert 调 exec 1 次", FAKE_EXEC_CALLS.size() == 1);
+Object[] call = (Object[]) FAKE_EXEC_CALLS.get(0);
+check("SQL = RANK_INSERT_SQL", RANK_INSERT_SQL.equals(call[0]));
+Object[] b = (Object[]) call[1];
+check("binds 5 个", b.length == 5);
+check("bind[0] grp", "g@chatroom".equals(b[0]));
+check("bind[1] wxid", "wx1".equals(b[1]));
+check("bind[2] type=1(文本)", ((Long) b[2]).longValue() == 1L);
+check("bind[3] ts=1000", ((Long) b[3]).longValue() == 1000L);
+check("bind[4] val=5(字数)", ((Long) b[4]).longValue() == 5L);
+
+// ---- 2) 非文本事件: type=0, val bind = null ----
+FAKE_EXEC_CALLS.clear();
+rankInsertEvent("g@chatroom", "wx2", RANK_TYPE_OTHER, 2000L, null);
+Object[] b2 = (Object[]) ((Object[]) FAKE_EXEC_CALLS.get(0))[1];
+check("非文本 type=0", ((Long) b2[2]).longValue() == 0L);
+check("非文本 val bind = null", b2[4] == null);
+
+// ---- 3) 批量: 每行各记一项 ----
+FAKE_EXEC_CALLS.clear();
+java.util.List bl = new java.util.ArrayList();
+bl.add(new Object[]{ "g", "a", new Long(1L), new Long(10L), new Long(3L) });
+bl.add(new Object[]{ "g", "b", new Long(1L), new Long(11L), new Long(4L) });
+rankInsertBatch(bl);
+check("batch 记 2 行", FAKE_EXEC_CALLS.size() == 2);
+check("batch 行0 SQL = RANK_INSERT_SQL", RANK_INSERT_SQL.equals(((Object[]) FAKE_EXEC_CALLS.get(0))[0]));
+
+// ---- 4) 空批量不抛 ----
+FAKE_EXEC_CALLS.clear();
+rankInsertBatch(new java.util.ArrayList());
+check("空批量 0 调用不抛", FAKE_EXEC_CALLS.size() == 0);
+
+done();

@@ -1,0 +1,59 @@
+// L1 单测: app/rank_collect —— 单群门(默认OFF/enable/disable) + 缓冲累积/flush 批量落库/清空 + 空跳过 + 降级。
+// fake HOST(KV)+CLOCK + fake STORAGE(记 execBatch 逐行)。运行 cwd = merged/。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");        // HOST KV + CLOCK(FAKE_NOW)
+source("tests/fakes/storage_fake.bsh");     // STORAGE(fake) + FAKE_EXEC_CALLS
+source("src/domain/membership.bsh");        // normGroupId/parseCsv/joinCsv
+source("src/domain/rank.bsh");              // rankInsertBatch + RANK_INSERT_SQL + RANK_TYPE_*
+source("src/app/rank_collect.bsh");
+
+String G = "g@chatroom";
+
+// ---- 1) 单群门默认 OFF (灰度安全) ----
+check("默认 OFF: rankIsGroupEnabled=false", rankIsGroupEnabled(G) == false);
+
+// ---- 2) enable → ON, disable → OFF (写 HOST KV + 缓存即时生效) ----
+rankEnableGroup(G);
+check("enable 后 ON", rankIsGroupEnabled(G) == true);
+check("HOST KV rank_enabled_groups 含群", HOST.getString("rank_enabled_groups", "").indexOf("g@chatroom") >= 0);
+rankDisableGroup(G);
+check("disable 后 OFF", rankIsGroupEnabled(G) == false);
+
+// ---- 3) record 累积 → flush 批量落库 + 清空 ----
+FAKE_EXEC_CALLS.clear();
+rankRecordEvent(G, "wxA", RANK_TYPE_TEXT, 100L, new Long(5L));
+rankRecordEvent(G, "wxB", RANK_TYPE_OTHER, 101L, null);
+rankRecordEvent(G, "wxA", RANK_TYPE_TEXT, 102L, new Long(7L));
+check("3 事件入缓冲", RANK_DIRTY.size() == 3);
+rankFlush();
+check("flush 后缓冲清空", RANK_DIRTY.size() == 0);
+check("flush 批量落库 3 行(execBatch 逐行记)", FAKE_EXEC_CALLS.size() == 3);
+check("落库 SQL = RANK_INSERT_SQL", RANK_INSERT_SQL.equals(((Object[]) FAKE_EXEC_CALLS.get(0))[0]));
+Object[] fb = (Object[]) ((Object[]) FAKE_EXEC_CALLS.get(0))[1];
+check("首行 grp 透传", G.equals(fb[0]));
+check("首行 val=5 透传", ((Long) fb[4]).longValue() == 5L);
+
+// ---- 4) 空缓冲 flush 不落库 ----
+FAKE_EXEC_CALLS.clear();
+rankFlush();
+check("空缓冲 flush 不调端口", FAKE_EXEC_CALLS.size() == 0);
+
+// ---- 5) grp/wxid 空跳过 ----
+RANK_DIRTY.clear();
+rankRecordEvent(null, "w", RANK_TYPE_TEXT, 1L, null);
+rankRecordEvent(G, "", RANK_TYPE_TEXT, 1L, null);
+check("空 grp/wxid 不入缓冲", RANK_DIRTY.size() == 0);
+
+// ---- 6) 降级: 缓冲到顶 → RANK_DEGRADED → 后续丢弃(保收发) ----
+RANK_BUFFER_CAP = 3;
+RANK_DEGRADED = false;
+RANK_DIRTY.clear();
+rankRecordEvent(G, "w1", RANK_TYPE_TEXT, 1L, null);
+rankRecordEvent(G, "w2", RANK_TYPE_TEXT, 2L, null);
+rankRecordEvent(G, "w3", RANK_TYPE_TEXT, 3L, null);   // 第3条达 CAP → 降级
+check("缓冲到 CAP=3 → 降级", RANK_DEGRADED == true);
+int before = RANK_DIRTY.size();
+rankRecordEvent(G, "w4", RANK_TYPE_TEXT, 4L, null);   // 降级期丢弃
+check("降级期 record 被丢弃(size 不增)", RANK_DIRTY.size() == before);
+
+done();

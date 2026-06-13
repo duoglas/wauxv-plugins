@@ -1,0 +1,49 @@
+// L2 集成: app/rank_render.rankBuildBoard + sqlite-jdbc 真库 + fake HOST(lookupName) ——
+//   验榜文本含话痨榜 top + 计数 + 水王字数 + 名字解析; 空数据返回 null。
+// 运行 cwd = merged/, classpath 含 sqlite-jdbc.jar。
+import java.sql.*;
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");        // HOST(lookupName 回 wxid) + CLOCK
+source("src/domain/rank.bsh");
+source("src/app/rank_render.bsh");
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(RANK_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+String G = "gA@chatroom";
+long T = 1749470000000L;
+
+// ---- 空数据 → null ----
+check("空数据 rankBuildBoard 返回 null", rankBuildBoard(G) == null);
+
+// ---- 录入: wxA 3 条(字数 5/5/5=15), wxB 1 条(字数 100), wxC 2 条非文本 ----
+rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 1, new Long(5L));
+rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 2, new Long(5L));
+rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 3, new Long(5L));
+rankInsertEvent(G, "wxB", RANK_TYPE_TEXT, T + 4, new Long(100L));
+rankInsertEvent(G, "wxC", RANK_TYPE_OTHER, T + 5, null);
+rankInsertEvent(G, "wxC", RANK_TYPE_OTHER, T + 6, null);
+
+String board = rankBuildBoard(G);
+check("有数据 → 非 null", board != null);
+check("含标题 群龙榜", board.indexOf("群龙榜") >= 0);
+check("含话痨榜", board.indexOf("话痨榜") >= 0);
+// 话痨榜: wxA=3 条 第一; wxC=2; wxB=1
+check("话痨第一含 wxA", board.indexOf("🥇 wxA") >= 0);
+check("wxA 显示 3 条", board.indexOf("wxA  3 条") >= 0);
+// 水王: wxB 字数 100 最高
+check("含水王 wxB", board.indexOf("💧 水王: wxB") >= 0);
+check("水王字数 100", board.indexOf("100 字") >= 0);
+
+// ---- 水王全 0 字数(无文本)不显示水王行 ----
+String G2 = "gB@chatroom";
+rankInsertEvent(G2, "wxD", RANK_TYPE_OTHER, T + 10, null);
+String board2 = rankBuildBoard(G2);
+check("G2 有发言数据 → 非 null", board2 != null);
+check("G2 话痨榜含 wxD", board2.indexOf("wxD") >= 0);
+check("G2 无文本字数 → 不显示水王行", board2.indexOf("水王") < 0);
+
+conn.close();
+done();

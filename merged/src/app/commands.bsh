@@ -215,6 +215,24 @@ boolean routeCommand(String groupId, String sender, String content,
         return true;
     }
 
+    // ---- 排行榜 (独立 rank 单群门, 与群管启用解耦; 手动出榜, 默认 OFF 灰度) ----
+    if (content.equals("排行榜开启") || content.equals("开启排行榜")) {
+        if (!isOwner(sender)) return true;
+        rankEnableGroup(groupId);
+        HOST.sendText(groupId, "✅ 本群排行榜统计已开启 (从现在起记录, 发「群龙榜」看榜)");
+        return true;
+    }
+    if (content.equals("排行榜关闭") || content.equals("关闭排行榜")) {
+        if (!isOwner(sender)) return true;
+        rankDisableGroup(groupId);
+        HOST.sendText(groupId, "🔕 本群排行榜统计已关闭 (历史数据保留)");
+        return true;
+    }
+    if (content.equals("群龙榜") || content.equals("排行榜") || content.equals("发言榜")) {
+        rankShowLeaderboard(groupId, content);
+        return true;
+    }
+
     // ---- 没启用就静默忽略其他所有命令 (@2206) ----
     if (!_cmdGroupEnabled(groupId)) return false;
 

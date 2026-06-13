@@ -65,6 +65,8 @@ void l3FlushLoop() {
     } catch (Throwable t) {
         try { log("l3 flush loop err: " + t); } catch (Throwable t2) {}
     } finally {
+        // 排行榜事件批量落库, 复用同节拍; 独立 try 不连坐 l3 与重调度。
+        try { rankFlush(); } catch (Throwable t) { try { log("rank flush err: " + t); } catch (Throwable t2) {} }
         try {
             delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
         } catch (Throwable t) {
@@ -102,6 +104,9 @@ void onLoad() {
         // W6: RP 表 (merged 适配: 线上 RP 用独立 RP_DB 懒建, merged 统一进 STORAGE=groupadmin.db 同库,
         //     故 onLoad 显式建 rp_record 表)。
         STORAGE.exec(RP_CREATE_SQL, new Object[]{});
+        // 排行榜原始事件表 msg_event + 索引(grp,ts)。表先于索引(VH-05)。
+        STORAGE.exec(RANK_CREATE_SQL, new Object[]{});
+        STORAGE.exec(RANK_INDEX_SQL, new Object[]{});
     } catch (Throwable t) {
         try { log("GroupAdmin onLoad 端口接线/建表失败: " + t); } catch (Throwable t2) {}
     }
@@ -220,6 +225,8 @@ void _hooksCloseDb() { }
 void onUnload() {
     // 卸载前把内存脏增量同步落库, 防丢 (线上 @1998 逐字)。
     try { l3Flush(); } catch (Throwable t) { try { log("onUnload l3Flush fail: " + t); } catch (Throwable t2) {} }
+    // 卸载前同步落排行榜事件缓冲, 防 force-stop/重载丢失 (Santa C1: 节拍 flush 不覆盖卸载最后一批)。
+    try { rankFlush(); } catch (Throwable t) { try { log("onUnload rankFlush fail: " + t); } catch (Throwable t2) {} }
     // 关 DB 句柄 (观察性/资源缝, P2 接真实句柄)。
     try { _hooksCloseDb(); } catch (Throwable t) { try { log("onUnload db close fail: " + t); } catch (Throwable t2) {} }
     L3_flushStarted = false;
@@ -357,6 +364,17 @@ void onHandleMsgBody(Object msg) {
 
     // 4. GA isText 二分取 content (@2117-2143)。普通文本零额外成本; 非文本才回看 content 判空。
     boolean isTextMsg = _msgIsText(msg);
+
+    // ★排行榜事件采集 (独立 rank 单群门, 默认 OFF 灰度; 置于非文本早退之前 → 图片/红包等所有消息都计入"发言")。
+    //   热路径 O(1): rankIsGroupEnabled 走 60s TTL 缓存(零 FUSE), rankRecordEvent 只内存 append; 整段 try/catch 不连坐。
+    //   type 自归一码(不用 getType, waux-msg-detect-gettype-unreliable): 文本=1(val=字数) / 其它=0(val=NULL)。
+    try {
+        if (sender != null && !sender.isEmpty() && rankIsGroupEnabled(groupId)) {
+            Long _rval = (isTextMsg && rawContent != null) ? new Long((long) rawContent.trim().length()) : null;   // Santa I3: trim 后计字数(与显示内容一致, 不算空白)
+            rankRecordEvent(groupId, sender, isTextMsg ? RANK_TYPE_TEXT : RANK_TYPE_OTHER, CLOCK.now(), _rval);
+        }
+    } catch (Throwable _rErr) {}
+
     String content;
     if (isTextMsg) {
         content = rawContent;

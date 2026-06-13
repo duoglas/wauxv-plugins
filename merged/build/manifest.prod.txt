@@ -17,11 +17,13 @@ src/domain/redpacket_store.bsh
 src/domain/redpacket_tiers.bsh
 src/domain/redpacket_qualify.bsh
 src/domain/redpacket_export.bsh
+src/domain/rank.bsh
 src/app/device_base.bsh
 src/app/redpacket_detect.bsh
 src/app/redpacket_worker.bsh
 src/app/device_ui.bsh
 src/app/speak_buffer.bsh
+src/app/rank_collect.bsh
 src/app/enable_state.bsh
 src/app/ga_actions_query.bsh
 src/app/ga_actions_write.bsh
@@ -30,6 +32,7 @@ src/app/speak_baseline.bsh
 src/app/redpacket_app.bsh
 src/app/device_recv.bsh
 src/app/redpacket_send.bsh
+src/app/rank_render.bsh
 src/app/commands.bsh
 src/app/dialogs.bsh
 src/app/hooks.bsh

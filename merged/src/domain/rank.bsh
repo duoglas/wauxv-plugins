@@ -1,0 +1,58 @@
+// ============================================================
+// domain/rank — 排行榜原始事件 msg_event 持久化 + 聚合查询领域逻辑。
+// 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md
+// 只依赖 StoragePort(全局 STORAGE), 不碰 android/jdbc/反射/UI → 可本地测。
+// 端口契约: STORAGE.exec(sql,binds) / execBatch(sql,List<binds>) / queryLong / queryRows->List<Object[]>。
+// binds 元素 = String / Long / null。
+//
+// ★数据模型(用户拍板): A = 逐条事件 msg_event 唯一真相全量保留; B(榜单) = 对 A 的聚合查询(rollup 下迭代)。
+// ★type 自归一码(不用 msg.getType() — 返大数不可靠, 见 waux-msg-detect-gettype-unreliable):
+//     v1: 0=非文本(其它), 1=文本; 预留 2=红包 3=拍一拍 4=转账入 5=转账出 …(后续 metric)。
+// ★val: 文本→字数; 金额事件→分(避免浮点); 其它→NULL。
+// ============================================================
+
+// ---- type 自归一码常量(v1 最小集; 后续 metric 扩) ----
+int RANK_TYPE_OTHER = 0;   // 非文本(图片/语音/红包/…未细分前统归此)
+int RANK_TYPE_TEXT  = 1;   // 文本消息(val=字数)
+
+// ---- 建表 + 索引(测试/迁移用; 生产由 onLoad 建)。窗口榜按 (grp,ts) 范围扫 → 索引 (grp,ts)。----
+RANK_CREATE_SQL = "CREATE TABLE IF NOT EXISTS msg_event(grp TEXT, wxid TEXT, type INTEGER, ts INTEGER, val INTEGER)";
+RANK_INDEX_SQL  = "CREATE INDEX IF NOT EXISTS idx_event_grp_ts ON msg_event(grp,ts)";
+
+// ---- 录入(SQL 由领域拥有)。append-only, 无主键(逐条事件全量留)。----
+RANK_INSERT_SQL = "INSERT INTO msg_event(grp,wxid,type,ts,val) VALUES(?,?,?,?,?)";
+
+// 录一条事件(单条; 生产热路径不直接调, 走 rank_collect 内存缓冲 + 批量 flush)。
+// val 可为 null(非文本/无字数事件)。
+void rankInsertEvent(String grp, String wxid, int type, long ts, Long val) {
+    STORAGE.exec(RANK_INSERT_SQL, new Object[]{ grp, wxid, new Long((long) type), new Long(ts), val });
+}
+
+// 批量录入(单事务, C-PERF-05; rank_collect flush 调)。
+// bindsList: List<Object[]{ grp(String), wxid(String), type(Long), ts(Long), val(Long|null) }>。
+void rankInsertBatch(java.util.List bindsList) {
+    STORAGE.execBatch(RANK_INSERT_SQL, bindsList);
+}
+
+// ---- 聚合榜(B 从 A 派生)。窗口 [sinceTs, untilTs); 总榜传 since=0, until=Long.MAX。----
+
+// 话痨榜: 某群窗口内按"消息条数"(任意 type) topN。返回 List<Object[]>: [0]=wxid(String) [1]=count(Long)。
+// 平票按 wxid 升序稳定排序。
+RANK_TOPN_COUNT_SQL =
+    "SELECT wxid, COUNT(*) c FROM msg_event WHERE grp=? AND ts>=? AND ts<? "
+    + "GROUP BY wxid ORDER BY c DESC, wxid ASC LIMIT ?";
+java.util.List rankTopNCount(String grp, long sinceTs, long untilTs, int n) {
+    return STORAGE.queryRows(RANK_TOPN_COUNT_SQL,
+        new Object[]{ grp, new Long(sinceTs), new Long(untilTs), new Long((long) n) });
+}
+
+// 求和榜(水王=字数 / 金额): 某群某 type 窗口内按 SUM(val) topN。
+//   coalesce(SUM(val),0) 兜 NULL(全 NULL 组返 0 不返 NULL, sqlite-upsert-coalesce-null-guard)。
+//   返回 [0]=wxid(String) [1]=sum(Long)。
+RANK_TOPN_SUM_SQL =
+    "SELECT wxid, coalesce(SUM(val),0) s FROM msg_event WHERE grp=? AND type=? AND ts>=? AND ts<? "
+    + "GROUP BY wxid ORDER BY s DESC, wxid ASC LIMIT ?";
+java.util.List rankTopNSum(String grp, int type, long sinceTs, long untilTs, int n) {
+    return STORAGE.queryRows(RANK_TOPN_SUM_SQL,
+        new Object[]{ grp, new Long((long) type), new Long(sinceTs), new Long(untilTs), new Long((long) n) });
+}
