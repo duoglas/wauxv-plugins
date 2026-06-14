@@ -112,10 +112,10 @@ void showHelp(String groupId) {
     sb.append("解除黑名单 @TA    解除拉黑 (可@多人)\n");
     sb.append("解除黑名单【N】   按序号解除\n");
     sb.append("【白名单·免罚】\n");
-    sb.append("@TA 白名单        加入: 免警告 (含红包伸手党)\n");
+    sb.append("@TA 白名单 [天数]  加入: 免警告 (含红包伸手党); 不填默认 ").append(WT_DEFAULT_DAYS).append(" 天\n");
     sb.append("解除白名单 @TA    移出白名单\n");
     sb.append("【潜水保护·允许不发言】\n");
-    sb.append("@TA 潜水保护      免潜水扫描+免伸手党+不上潜水榜\n");
+    sb.append("@TA 潜水保护 [天数] 免潜水扫描+免伸手党+不上潜水榜; 不填=永久\n");
     sb.append("取消潜水保护 @TA  移出\n");
     sb.append("【警告·潜水】\n");
     sb.append("@TA 警告 [理由]   累计 ").append(getWarnKick(groupId)).append(" 次自动踢\n");
@@ -191,6 +191,7 @@ void showWarnList(String groupId) {
 
 // ---- 保护名单 (@1647-1654) ----
 void showProtected(String groupId) {
+    purgeExpiredProtected(groupId);   // v1.20.0: 入口惰性清过期(非热路径)
     List p = getProtected(groupId);
     if (p.isEmpty()) { HOST.sendText(groupId, "📋 本群潜水保护名单为空"); return; }
     List sorted = crownSort(groupId, p);   // 👑榜置顶
@@ -199,7 +200,9 @@ void showProtected(String groupId) {
     sb.append("🛡 潜水保护名单 (").append(p.size()).append("):\n");
     for (int i = 0; i < sorted.size(); i++) {
         String w = (String) sorted.get(i);
-        sb.append("· ").append(crownName(HOST.lookupName(w, groupId), cl.contains(w))).append("\n");
+        String lbl = protectedExpiryLabelOrNull(groupId, w);   // 👑/永久→null, 有期限→有效期至 date
+        sb.append("· ").append(crownName(HOST.lookupName(w, groupId), cl.contains(w)))
+          .append(lbl != null ? (" · " + lbl) : "").append("\n");
     }
     HOST.sendText(groupId, sb.toString());
 }
@@ -222,6 +225,7 @@ void showCrownList(String groupId) {
 
 // ---- 本群白名单 (@3822-3831) ----
 void showWhitelist(String groupId) {
+    purgeExpiredWhitelist(groupId);   // v1.20.0: 入口惰性清过期 + 老数据补默认60天(非热路径)
     List wt = getWhitelist(groupId);
     if (wt.isEmpty()) { HOST.sendText(groupId, "📋 本群白名单为空\n(白名单: 免警告 + 免管理员踢 + 免进群黑名单检测)"); return; }
     List sorted = crownSort(groupId, wt);   // 皇冠榜置顶
@@ -230,9 +234,11 @@ void showWhitelist(String groupId) {
     sb.append("✅ 本群白名单 (").append(wt.size()).append("):\n");
     for (int i = 0; i < sorted.size(); i++) {
         String w = (String) sorted.get(i);
-        sb.append("· ").append(crownName(HOST.lookupName(w, groupId), cl.contains(w))).append("\n");
+        String lbl = whitelistExpiryLabelOrNull(groupId, w);   // 👑→null(永久), 否则 有效期至 date
+        sb.append("· ").append(crownName(HOST.lookupName(w, groupId), cl.contains(w)))
+          .append(cl.contains(w) ? "" : (lbl != null ? (" · " + lbl) : " · 永久")).append("\n");
     }
-    sb.append("— 白名单: 免警告 + 免管理员踢 + 免进群黑名单检测 —");
+    sb.append("— 白名单: 免警告 + 免管理员踢 + 免进群黑名单检测 · 默认 ").append(WT_DEFAULT_DAYS).append(" 天 —");
     HOST.sendText(groupId, sb.toString());
 }
 

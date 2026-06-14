@@ -233,13 +233,13 @@ void clearAdminExpiry(String groupId, String wxid) {
         if (m.remove(wxid) != null) _saveAdminExp(groupId, m);
     } catch (Throwable t) {}
 }
-// 显示标签: "永久" 或 "有效期至 yyyy-MM-dd"。
+// 显示标签: "永久" 或 "[yyyy-MM-dd]"。
 String adminExpiryLabel(String groupId, String wxid) {
     try {
         long exp = getAdminExpiry(groupId, wxid);
         if (exp <= 0L) return "永久";
         String d = new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp));
-        return "有效期至 " + d;
+        return "[" + d + "]";
     } catch (Throwable t) { return "永久"; }
 }
 // 显示标签(永久不写法): 永久(exp<=0/无记录) → null; 有期限 → "有效期至 yyyy-MM-dd"。
@@ -248,7 +248,7 @@ String adminExpiryLabelOrNull(String groupId, String wxid) {
     try {
         long exp = getAdminExpiry(groupId, wxid);
         if (exp <= 0L) return null;
-        return "有效期至 " + new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp));
+        return "[" + new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp)) + "]";
     } catch (Throwable t) { return null; }
 }
 // 惰性到期清除: 遍历 getAdmins, 对有 exp 且已过期者 → 从 admins 移除 + clearAdminExpiry, 变更则落盘。
@@ -270,5 +270,192 @@ void purgeExpiredAdmins(String groupId) {
             }
         }
         if (changed) setAdmins(groupId, admins);
+    } catch (Throwable t) {}
+}
+
+// ============================================================
+// v1.20.0 白名单/潜水保护 时效 (wt_exp_<裸gid> / protected_exp_<裸gid>) — 复刻 admin_exp_ 范式。
+//   白名单强制期限(用户 2026-06-14): 命令不填默认 WT_DEFAULT_DAYS=60 天; 老数据无记录 → 惰性补 60 天(非过期);
+//     到期惰性移出白名单。潜水保护可选期限: 不填=永久(无记录); 填则到期惰性移出。
+//   👑榜成员豁免期限: purge 保留 + 清残留期限记录(永久)。键用裸 gid(与 wt_/protected_ 同口径), CSV "wxid:到期毫秒;"。
+//   全部 try/catch(Throwable) 退化, 绝不抛回微信。端口: HOST.getString/putString + CLOCK.now() + isCrown。
+// ★ purgeExpiredWhitelist/purgeExpiredProtected 只在管理/查询/列表入口调 (doWhitelist/doProtect/show*/列表 dialog/picker),
+//   绝不进 isWhitelistAny 等每条消息热路径 (C-PERF-01); isWhitelistAny 保持纯成员判定不读期限。
+// ============================================================
+int WT_DEFAULT_DAYS = 60;   // 白名单默认期限(天); 命令不填天数时用 (用户 2026-06-14)
+
+// 通用: 按完整 storage key 解析/落盘 "wxid:ms;" 映射 (与 _parseAdminExp 同编码, 仅 key 解耦)。
+java.util.Map _parseExpRaw(String key) {
+    java.util.HashMap m = new java.util.HashMap();
+    try {
+        String raw = HOST.getString(key, "");
+        if (raw == null || raw.isEmpty()) return m;
+        String[] parts = raw.split(";");
+        for (int i = 0; i < parts.length; i++) {
+            String p = parts[i].trim();
+            if (p.isEmpty()) continue;
+            int idx = p.lastIndexOf(":");
+            if (idx <= 0 || idx >= p.length() - 1) continue;
+            String w = p.substring(0, idx).trim();
+            String ms = p.substring(idx + 1).trim();
+            if (w.isEmpty()) continue;
+            try { m.put(w, new Long(Long.parseLong(ms))); } catch (Throwable t) {}
+        }
+    } catch (Throwable t) {}
+    return m;
+}
+void _saveExpRaw(String key, java.util.Map m) {
+    try {
+        StringBuilder sb = new StringBuilder();
+        java.util.Iterator it = m.keySet().iterator();
+        boolean first = true;
+        while (it.hasNext()) {
+            String w = (String) it.next();
+            Long v = (Long) m.get(w);
+            if (w == null || w.isEmpty() || v == null) continue;
+            if (!first) sb.append(";");
+            sb.append(w).append(":").append(v.longValue());
+            first = false;
+        }
+        HOST.putString(key, sb.toString());
+    } catch (Throwable t) {}
+}
+
+// ---- 白名单时效 (wt_exp_<裸gid>): 0/无记录 = 永久(未设期限)。 ----
+long getWhitelistExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return 0L;
+        Long v = (Long) _parseExpRaw("wt_exp_" + groupId).get(wxid);
+        return v == null ? 0L : v.longValue();
+    } catch (Throwable t) { return 0L; }
+}
+void setWhitelistExpiry(String groupId, String wxid, long millis) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseExpRaw("wt_exp_" + groupId);
+        m.put(wxid, new Long(millis));
+        _saveExpRaw("wt_exp_" + groupId, m);
+    } catch (Throwable t) {}
+}
+void clearWhitelistExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseExpRaw("wt_exp_" + groupId);
+        if (m.remove(wxid) != null) _saveExpRaw("wt_exp_" + groupId, m);
+    } catch (Throwable t) {}
+}
+// 显示标签(永久不写法): 👑/永久/无记录 → null; 有期限 → "有效期至 yyyy-MM-dd"。
+String whitelistExpiryLabelOrNull(String groupId, String wxid) {
+    try {
+        if (isCrown(groupId, wxid)) return null;   // 👑榜永久
+        long exp = getWhitelistExpiry(groupId, wxid);
+        if (exp <= 0L) return null;
+        return "[" + new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp)) + "]";
+    } catch (Throwable t) { return null; }
+}
+
+// ---- 潜水保护时效 (protected_exp_<裸gid>): 0/无记录 = 永久(可选期限默认永久)。 ----
+long getProtectedExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return 0L;
+        Long v = (Long) _parseExpRaw("protected_exp_" + groupId).get(wxid);
+        return v == null ? 0L : v.longValue();
+    } catch (Throwable t) { return 0L; }
+}
+void setProtectedExpiry(String groupId, String wxid, long millis) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseExpRaw("protected_exp_" + groupId);
+        m.put(wxid, new Long(millis));
+        _saveExpRaw("protected_exp_" + groupId, m);
+    } catch (Throwable t) {}
+}
+void clearProtectedExpiry(String groupId, String wxid) {
+    try {
+        if (wxid == null || wxid.isEmpty()) return;
+        java.util.Map m = _parseExpRaw("protected_exp_" + groupId);
+        if (m.remove(wxid) != null) _saveExpRaw("protected_exp_" + groupId, m);
+    } catch (Throwable t) {}
+}
+String protectedExpiryLabelOrNull(String groupId, String wxid) {
+    try {
+        if (isCrown(groupId, wxid)) return null;   // 👑榜永久
+        long exp = getProtectedExpiry(groupId, wxid);
+        if (exp <= 0L) return null;
+        return "[" + new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp)) + "]";
+    } catch (Throwable t) { return null; }
+}
+
+// 惰性到期清除(白名单, 强制期限): 无记录非👑→惰性补默认60天(非过期, 防老数据被瞬间清空);
+//   过期非👑→移出白名单 + 清期限; 👑→保留并清残留期限记录(永久)。静默。
+// ★只在管理/查询/列表入口调, 绝不进 isWhitelistAny 热路径 (C-PERF-01)。
+void purgeExpiredWhitelist(String groupId) {
+    try {
+        List wt = getWhitelist(groupId);
+        List crowns = getCrownList(groupId);   // 👑必须在白名单(即便是管理员, 用户 2026-06-14); 自愈补回
+        if (wt.isEmpty() && crowns.isEmpty()) return;
+        long now = CLOCK.now();
+        // 单次解析期限映射, 全程内存改, 末尾一次落盘 — 避免逐成员 _parse+_save (O(N) FUSE IO, C-PERF-01)。
+        java.util.Map exp = _parseExpRaw("wt_exp_" + groupId);
+        boolean listChanged = false;   // wt_ 名单是否变更
+        boolean expChanged = false;    // wt_exp_ 映射是否变更
+        // 自愈: 确保每个👑在白名单(永久, 无期限); 缺则补 — 管理员身份不豁免这条(根因: 加管理员去白名单把👑挤掉)。
+        for (int i = 0; i < crowns.size(); i++) {
+            String c = (String) crowns.get(i);
+            if (c == null || c.isEmpty()) continue;
+            if (!wt.contains(c)) { wt.add(c); listChanged = true; }
+            if (exp.remove(c) != null) expChanged = true;   // 👑永久, 清残留期限
+        }
+        // 到期清 + 老数据补默认 (非👑; 用本地 crowns.contains 避免 isCrown 逐成员 FUSE 读)
+        for (int i = wt.size() - 1; i >= 0; i--) {
+            String w = (String) wt.get(i);
+            if (crowns.contains(w)) continue;                // 👑已处理(豁免)
+            Long v = (Long) exp.get(w);
+            if (v == null) {                                 // 老数据/无记录 → 惰性补默认 (不是过期!)
+                exp.put(w, new Long(now + (long) WT_DEFAULT_DAYS * 86400000L));
+                expChanged = true;
+            } else if (now >= v.longValue()) {               // 已过期 → 移出白名单 + 清期限
+                wt.remove(i);
+                exp.remove(w);
+                listChanged = true;
+                expChanged = true;
+            }
+        }
+        if (expChanged) _saveExpRaw("wt_exp_" + groupId, exp);
+        if (listChanged) setWhitelist(groupId, wt);
+    } catch (Throwable t) {}
+}
+
+// 惰性到期清除(潜水保护, 可选期限): 无记录=永久(不补默认); 过期非👑→移出 + 清期限; 👑→保留并清残留记录。静默。
+// ★只在管理/查询/列表入口调, 绝不进热路径 (C-PERF-01)。
+void purgeExpiredProtected(String groupId) {
+    try {
+        List p = getProtected(groupId);
+        List crowns = getCrownList(groupId);   // 👑必须在潜水保护; 自愈补回
+        if (p.isEmpty() && crowns.isEmpty()) return;
+        long now = CLOCK.now();
+        java.util.Map exp = _parseExpRaw("protected_exp_" + groupId);   // 单次解析, 末尾一次落盘
+        boolean listChanged = false;
+        boolean expChanged = false;
+        // 自愈: 确保每个👑在潜水保护(永久, 无期限)
+        for (int i = 0; i < crowns.size(); i++) {
+            String c = (String) crowns.get(i);
+            if (c == null || c.isEmpty()) continue;
+            if (!p.contains(c)) { p.add(c); listChanged = true; }
+            if (exp.remove(c) != null) expChanged = true;
+        }
+        for (int i = p.size() - 1; i >= 0; i--) {
+            String w = (String) p.get(i);
+            if (crowns.contains(w)) continue;   // 👑豁免
+            Long v = (Long) exp.get(w);
+            if (v != null && now >= v.longValue()) {
+                p.remove(i);
+                exp.remove(w);
+                listChanged = true;
+                expChanged = true;
+            }
+        }
+        if (expChanged) _saveExpRaw("protected_exp_" + groupId, exp);
+        if (listChanged) setProtected(groupId, p);
     } catch (Throwable t) {}
 }

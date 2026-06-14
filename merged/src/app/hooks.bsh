@@ -527,7 +527,7 @@ Object makeAndroidLeaf() {
     void checkBotPriv(String groupId, String sender)       { global.doCheckBotPriv(groupId, sender); }         // @2284
     void addBlacklistByAt(String groupId, String sender, List atList) { global.doAddBlacklistByAt(groupId, sender, atList); }   // @2290
     void removeBlacklist(String groupId, String sender, String content, List atList) { global.doRemoveBlacklist(groupId, sender, content, atList); }   // @2296
-    void whitelist(String groupId, String sender, String w)   { global.doWhitelist(groupId, sender, w); }      // @2310
+    void whitelist(String groupId, String sender, String w, int days) { global.doWhitelist(groupId, sender, w, days); }   // @2310; v1.20.0 days
     void unwhitelist(String groupId, String sender, String w) { global.doUnwhitelist(groupId, sender, w); }    // @2316
     void addGlobalBlacklist(String groupId, String w)         { global.doAddGlobalBlacklist(groupId, w); }     // @2322
     void delGlobalBlacklist(String groupId, String w)         { global.doDelGlobalBlacklist(groupId, w); }     // @2328
@@ -537,7 +537,7 @@ Object makeAndroidLeaf() {
     void warnDetail(String groupId, String target)            { global.doWarnDetail(groupId, target); }        // @2531
     void addAdmin(String groupId, String target, int days)    { global.doAddAdmin(groupId, target, days); }     // @2532
     void delAdmin(String groupId, String target)              { global.doDelAdmin(groupId, target); }          // @2533
-    void protect(String groupId, String sender, String target)   { global.doProtect(groupId, sender, target); }   // @2534
+    void protect(String groupId, String sender, String target, int days) { global.doProtect(groupId, sender, target, days); }   // @2534; v1.20.0 days
     void unprotect(String groupId, String sender, String target) { global.doUnprotect(groupId, sender, target); } // @2535
     void addOwner(String groupId, String target)              { global.doAddOwner(groupId, target); }          // @2538
     void delOwner(String groupId, String target)              { global.doDelOwner(groupId, target); }          // @2539

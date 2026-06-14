@@ -38,6 +38,8 @@ Object _mkRecLeaf() {
     void enableGroup(String groupId, String sender) { FAKE_LEAF.add(new Object[]{ "enable", groupId }); }
     void unwhitelist(String groupId, String sender, String w) { FAKE_LEAF.add(new Object[]{ "unwhitelist", w }); }
     void removeBlacklist(String groupId, String sender, String content, List atList) { FAKE_LEAF.add(new Object[]{ "removeBlacklist", content }); }
+    void whitelist(String groupId, String sender, String w, int days) { FAKE_LEAF.add(new Object[]{ "whitelist", w, new Integer(days) }); }   // v1.20.0 days
+    void protect(String groupId, String sender, String target, int days) { FAKE_LEAF.add(new Object[]{ "protect", target, new Integer(days) }); }   // v1.20.0 days
     return this;
 }
 LEAF = _mkRecLeaf();
@@ -214,5 +216,28 @@ boolean r15 = routeCommand(gid, "normalX", "@张三 警告", true, atTarget("ufr
 check("15 非管理员用警告 消费",         r15 == true);
 check("15 反向警告: 警告了调用者本人",  getWarn(gid, "normalX") >= 1);
 check("15 反向警告 没警告被@的目标",    getWarn(gid, "ufresh") == 0);
+
+// ============================================================
+// 16. 白名单/潜水保护 尾随天数解析 + 透传 days (用户 2026-06-14 v1.20.0)
+// ============================================================
+int _leafDays(String name) {
+    for (int i = 0; i < FAKE_LEAF.size(); i++) {
+        Object[] e = (Object[]) FAKE_LEAF.get(i);
+        if (e[0].equals(name)) return ((Integer) e[2]).intValue();
+    }
+    return -999;
+}
+reset();
+routeCommand(gid, "owner1", "@张三 白名单 30", true, atTarget("uwt1"), null, null);
+check("16 @白名单30 命中 whitelist days=30", leafHit("whitelist") && _leafDays("whitelist") == 30);
+reset();
+routeCommand(gid, "owner1", "@张三 白名单", true, atTarget("uwt2"), null, null);
+check("16 @白名单(无天数) 命中 whitelist days=0", leafHit("whitelist") && _leafDays("whitelist") == 0);
+reset();
+routeCommand(gid, "owner1", "@张三 潜水保护 7", true, atTarget("up1"), null, null);
+check("16 @潜水保护7 命中 protect days=7", leafHit("protect") && _leafDays("protect") == 7);
+reset();
+routeCommand(gid, "owner1", "@张三 潜水保护", true, atTarget("up2"), null, null);
+check("16 @潜水保护(无天数) 命中 protect days=0", leafHit("protect") && _leafDays("protect") == 0);
 
 done();

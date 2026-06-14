@@ -33,7 +33,7 @@ check("11 永久(无到期记录) → null", adminExpiryLabelOrNull(gid, "admin1
 setAdminExpiry(gid, "admin2", 4102444800000L);   // 固定未来 ms(约 2100 年)
 String _lbl = adminExpiryLabelOrNull(gid, "admin2");
 check("12 有期限 → 非 null", _lbl != null);
-check("13 有期限 → 含『有效期至』", _lbl != null && _lbl.indexOf("有效期至") >= 0);
+check("13 有期限 → 含日期方括号 [", _lbl != null && _lbl.indexOf("[") >= 0 && _lbl.indexOf("]") >= 0);
 check("14 旧 adminExpiryLabel 永久仍返『永久』(未改语义)", "永久".equals(adminExpiryLabel(gid, "admin1")));
 setAdminExpiry(gid, "admin2", 0L);   // 边界: exp<=0 视为永久
 check("15 边界 exp=0 → null", adminExpiryLabelOrNull(gid, "admin2") == null);
@@ -45,5 +45,87 @@ check("16 管理员不能动白名单成员 admin1→wlguy",       canActOn(gid,
 check("17 群主可动白名单成员 owner1→wlguy",           canActOn(gid, "owner1", "wlguy") == true);
 check("18 管理员仍可动非白名单普通人 admin1→normalZ", canActOn(gid, "admin1", "normalZ") == true);
 HOST.putString("wt_test@chatroom", "");   // 还原
+
+// ============================================================
+// v1.20.0 白名单/潜水保护 时效 + 惰性 purge (用户 2026-06-14)
+// ============================================================
+FAKE_NOW = 1000000L;
+HOST.putString("crown_test@chatroom", "");   // 确保无👑干扰
+
+// 19. 白名单时效 helper 回环 + label
+setWhitelistExpiry(gid, "wexp1", 5000000L);
+check("19 setWhitelistExpiry 回环",       getWhitelistExpiry(gid, "wexp1") == 5000000L);
+String _wl = whitelistExpiryLabelOrNull(gid, "wexp1");
+check("19 whitelistExpiryLabelOrNull 含日期方括号 [", _wl != null && _wl.indexOf("[") >= 0 && _wl.indexOf("]") >= 0);
+clearWhitelistExpiry(gid, "wexp1");
+check("19 clear 后 → 永久(0/null)",       getWhitelistExpiry(gid, "wexp1") == 0L && whitelistExpiryLabelOrNull(gid, "wexp1") == null);
+
+// 20. purgeExpiredWhitelist: 无期限非👑老成员 → 惰性补默认60天(仍在名单, 不被当过期清空)
+HOST.putString("wt_test@chatroom", "legacy1");
+HOST.putString("wt_exp_test@chatroom", "");
+purgeExpiredWhitelist(gid);
+check("20 老白名单成员未被清空(惰性补非过期)", getWhitelist(gid).contains("legacy1"));
+check("20 老成员惰性补默认60天",          getWhitelistExpiry(gid, "legacy1") == FAKE_NOW + 60L * 86400000L);
+
+// 21. purgeExpiredWhitelist: 已过期非👑 → 移出 + 清期限
+HOST.putString("wt_test@chatroom", "exp1");
+HOST.putString("wt_exp_test@chatroom", "");
+setWhitelistExpiry(gid, "exp1", FAKE_NOW - 1000L);
+purgeExpiredWhitelist(gid);
+check("21 过期白名单非👑 → 移出",         !getWhitelist(gid).contains("exp1"));
+check("21 过期 → 期限记录清",             getWhitelistExpiry(gid, "exp1") == 0L);
+
+// 22. purgeExpiredWhitelist: 👑成员 → 保留 + 期限记录清(永久豁免), 即便已过期
+HOST.putString("wt_test@chatroom", "king1");
+HOST.putString("crown_test@chatroom", "king1");
+setWhitelistExpiry(gid, "king1", FAKE_NOW - 1000L);
+purgeExpiredWhitelist(gid);
+check("22 👑成员白名单保留(豁免期限)",     getWhitelist(gid).contains("king1"));
+check("22 👑成员期限记录被清(永久)",       getWhitelistExpiry(gid, "king1") == 0L);
+HOST.putString("crown_test@chatroom", "");
+
+// 23. purgeExpiredProtected: 无期限 = 永久(不补默认, 与白名单不同)
+HOST.putString("protected_test@chatroom", "p1");
+HOST.putString("protected_exp_test@chatroom", "");
+purgeExpiredProtected(gid);
+check("23 潜水保护无期限=永久(保留+不补默认)", getProtected(gid).contains("p1") && getProtectedExpiry(gid, "p1") == 0L);
+
+// 24. purgeExpiredProtected: 过期非👑→移出; 👑→保留
+HOST.putString("protected_test@chatroom", "p2,king2");
+HOST.putString("crown_test@chatroom", "king2");
+setProtectedExpiry(gid, "p2", FAKE_NOW - 1000L);
+setProtectedExpiry(gid, "king2", FAKE_NOW - 1000L);
+purgeExpiredProtected(gid);
+check("24 过期潜水保护非👑 → 移出",       !getProtected(gid).contains("p2"));
+check("24 👑成员潜水保护保留(豁免期限)",   getProtected(gid).contains("king2"));
+HOST.putString("crown_test@chatroom", "");
+
+// 25. isWhitelistAny 纯成员判定: 热路径不读期限 → 期限已过但未 purge 时仍判在白名单
+HOST.putString("wt_test@chatroom", "hot1");
+HOST.putString("wt_exp_test@chatroom", "");
+setWhitelistExpiry(gid, "hot1", FAKE_NOW - 1000L);
+check("25 isWhitelistAny 不受期限影响(热路径零改)", isWhitelistAny(gid, "hot1") == true);
+
+// 26. purge 自愈: 👑(哪怕是管理员)不在白名单 → 自动补入(永久) (用户 2026-06-14 根因)
+HOST.putString("wt_test@chatroom", "");
+HOST.putString("wt_exp_test@chatroom", "");
+HOST.putString("admins_test@chatroom", "owner1,kadmin");   // kadmin 是管理员
+HOST.putString("crown_test@chatroom", "kadmin");           // 且在👑榜
+purgeExpiredWhitelist(gid);
+check("26 👑(管理员)缺白名单 → 自愈补入",  getWhitelist(gid).contains("kadmin"));
+check("26 自愈👑无期限(永久)",            getWhitelistExpiry(gid, "kadmin") == 0L);
+// 27. 潜水保护同样自愈👑
+HOST.putString("protected_test@chatroom", "");
+HOST.putString("protected_exp_test@chatroom", "");
+purgeExpiredProtected(gid);
+check("27 👑缺潜水保护 → 自愈补入",       getProtected(gid).contains("kadmin"));
+HOST.putString("admins_test@chatroom", "admin1");   // 还原原始 admins(前置用例依赖)
+
+// 还原所有时效相关键
+HOST.putString("wt_test@chatroom", "");
+HOST.putString("wt_exp_test@chatroom", "");
+HOST.putString("protected_test@chatroom", "");
+HOST.putString("protected_exp_test@chatroom", "");
+HOST.putString("crown_test@chatroom", "");
 
 done();

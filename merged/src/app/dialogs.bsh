@@ -502,6 +502,8 @@ void showAdminListDialog(String groupId) {
             if (!l.contains(w)) { l.add(w); setAdmins(fGroupId, l); }
             if (days > 0) setAdminExpiry(fGroupId, w, CLOCK.now() + (long) days * 86400000L);   // 端口: CLOCK.now() (Santa)
             else clearAdminExpiry(fGroupId, w);
+            // 加管理员自动去白名单(与命令 doAddAdmin 一致); 👑成员除外, 必须留白名单 (用户 2026-06-14)
+            try { if (!isCrown(fGroupId, w)) { java.util.List _wl2 = getWhitelist(fGroupId); if (_wl2.remove(w)) { setWhitelist(fGroupId, _wl2); clearWhitelistExpiry(fGroupId, w); } } } catch (Throwable t) {}
             toast(days > 0 ? ("已添加本群管理员 (" + days + "天)") : "已添加本群管理员");   // 永久不写(2026-06-14)
             if (dh[0] != null) dh[0].dismiss();
             showAdminListDialog(fGroupId);
@@ -703,15 +705,20 @@ void _addPickerPerson(String groupId, String wxid, String kind) {
             java.util.List cl = getCrownList(groupId); if (!cl.contains(wxid)) { cl.add(wxid); setCrownList(groupId, cl); }
             java.util.List wl = getWhitelist(groupId); if (!wl.contains(wxid)) { wl.add(wxid); setWhitelist(groupId, wl); }
             java.util.List pl = getProtected(groupId); if (!pl.contains(wxid)) { pl.add(wxid); setProtected(groupId, pl); }
+            try { clearWhitelistExpiry(groupId, wxid); clearProtectedExpiry(groupId, wxid); } catch (Throwable t) {}   // v1.20.0: 👑永久不过期
         } else if (kind.equals("admin")) {
             java.util.List a = getAdmins(groupId); if (!a.contains(wxid)) { a.add(wxid); setAdmins(groupId, a); }
             try { clearAdminExpiry(groupId, wxid); } catch (Throwable t) {}   // 选择器加 = 永久
-            try { java.util.List _wl = getWhitelist(groupId); if (_wl.remove(wxid)) setWhitelist(groupId, _wl); } catch (Throwable t) {}   // 管理员自动去白名单
+            try { if (!isCrown(groupId, wxid)) { java.util.List _wl = getWhitelist(groupId); if (_wl.remove(wxid)) { setWhitelist(groupId, _wl); clearWhitelistExpiry(groupId, wxid); } } } catch (Throwable t) {}   // 管理员自动去白名单(+清期限); 👑除外(必须留白名单)
         } else if (kind.equals("whitelist")) {
-            if (isAdminInGroup(groupId, wxid)) return;   // 已是管理员不用加白名单(本就免罚)
+            if (isAdminInGroup(groupId, wxid) && !isCrown(groupId, wxid)) return;   // 已是管理员不用加白名单(本就免罚); 👑例外, 仍加
             java.util.List wl = getWhitelist(groupId); if (!wl.contains(wxid)) { wl.add(wxid); setWhitelist(groupId, wl); }
+            // v1.20.0: 白名单强制期限。👑→永久, 否则默认 WT_DEFAULT_DAYS 天
+            try { if (isCrown(groupId, wxid)) clearWhitelistExpiry(groupId, wxid); else setWhitelistExpiry(groupId, wxid, CLOCK.now() + (long) WT_DEFAULT_DAYS * 86400000L); } catch (Throwable t) {}
         } else if (kind.equals("protected")) {
             java.util.List pl = getProtected(groupId); if (!pl.contains(wxid)) { pl.add(wxid); setProtected(groupId, pl); }
+            // v1.20.0: 潜水保护可选期限, 选择器加 = 永久(清残留)
+            try { clearProtectedExpiry(groupId, wxid); } catch (Throwable t) {}
         }
     } catch (Throwable t) {}
 }
@@ -887,6 +894,13 @@ android.widget.LinearLayout _nameRow(Activity ctx, String groupId, String wxid, 
     final String fG = groupId; final String fW = wxid; final String fKind = kind; final AlertDialog[] fdh = dh;
     boolean crown = false; try { crown = isCrown(groupId, wxid); } catch (Throwable t) {}
     String nm = crownName(HOST.lookupName(wxid, groupId), crown);
+    // v1.20.0: 行尾附期限标签(👑/永久→不附); 白名单非👑无期限显示永久。
+    if (!crown) {
+        try {
+            if (kind.equals("whitelist")) { String _l = whitelistExpiryLabelOrNull(groupId, wxid); nm = nm + " · " + (_l != null ? _l : "永久"); }
+            else if (kind.equals("protected")) { String _l = protectedExpiryLabelOrNull(groupId, wxid); if (_l != null) nm = nm + " · " + _l; }
+        } catch (Throwable t) {}
+    }
     String label; String color;
     if (fKind.equals("crown")) { label = "取消👑"; color = "#FF6B6B"; }
     else if (fKind.equals("protected")) { label = "取消潜水保护"; color = "#FFD166"; }
@@ -900,18 +914,21 @@ android.widget.LinearLayout _nameRow(Activity ctx, String groupId, String wxid, 
                     List c = getCrownList(fG); c.remove(fW); setCrownList(fG, c);
                     List w2 = getWhitelist(fG); if (w2.remove(fW)) setWhitelist(fG, w2);
                     List p2 = getProtected(fG); if (p2.remove(fW)) setProtected(fG, p2);
+                    try { clearWhitelistExpiry(fG, fW); clearProtectedExpiry(fG, fW); } catch (Throwable t) {}   // v1.20.0: 清残留期限
                     toast("已移出皇冠榜 (含白名单+潜水保护)");
                     if (fdh[0] != null) fdh[0].dismiss();
                     showCrownListDialog(fG);
                 } else if (fKind.equals("protected")) {
                     if (isCrown(fG, fW)) { toast("👑 皇冠榜成员，请到「👑 皇冠榜」里取消👑 移除"); return; }
                     List p = getProtected(fG); p.remove(fW); setProtected(fG, p);
+                    try { clearProtectedExpiry(fG, fW); } catch (Throwable t) {}   // v1.20.0
                     toast("已取消潜水保护");
                     if (fdh[0] != null) fdh[0].dismiss();
                     showProtectedListDialog(fG);
                 } else {
                     if (isCrown(fG, fW)) { toast("👑 皇冠榜成员，请到「👑 皇冠榜」里取消👑 移除"); return; }
                     List l = getWhitelist(fG); l.remove(fW); setWhitelist(fG, l);
+                    try { clearWhitelistExpiry(fG, fW); } catch (Throwable t) {}   // v1.20.0
                     toast("已移除");
                     if (fdh[0] != null) fdh[0].dismiss();
                     showWhitelistDialog(fG);
@@ -990,6 +1007,7 @@ void showProtectedListDialog(String groupId) {
     final String fGroupId = groupId;
     final AlertDialog[] dh = new AlertDialog[1];
 
+    try { purgeExpiredProtected(groupId); } catch (Throwable t) {}   // v1.20.0: 入口惰性清过期
     List pl = getProtected(groupId);
     int dp = (int) ctx.getResources().getDisplayMetrics().density;
 
@@ -1250,6 +1268,7 @@ void showWhitelistDialog(String groupId) {
     final String fGroupId = groupId;
     final AlertDialog[] dh = new AlertDialog[1];
 
+    try { purgeExpiredWhitelist(groupId); } catch (Throwable t) {}   // v1.20.0: 入口惰性清过期 + 老数据补默认60天
     List wt = getWhitelist(groupId);
     int dp = (int) ctx.getResources().getDisplayMetrics().density;
 

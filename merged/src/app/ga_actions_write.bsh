@@ -48,13 +48,38 @@
 // 不含破坏性踢人 (doKick/doBan/doShowInactive/doKickInactive 属 W5 Santa 双审)。
 // ============================================================
 
-// ---- 保护名单 (@1628-1634) ----
-void doProtect(String groupId, String sender, String target) {
+// ---- 名单命令速查 (用户 2026-06-14: 加名单时附相关命令说明) ----
+String _whitelistCmdHint() {
+    return "📖 白名单命令: @TA 白名单 [天数](默认60天) · 解除白名单 @TA · 白名单 (查名单)";
+}
+String _protectCmdHint() {
+    return "📖 潜水保护命令: @TA 潜水保护 [天数](默认永久) · 取消潜水保护 @TA · 潜水保护名单";
+}
+String _adminCmdHint() {
+    return "📖 管理员命令: @TA 管理员 [天数](默认永久) · 移除管理 @TA · 管理员 (查名单)";
+}
+
+// ---- 保护名单 (@1628-1634); v1.20.0 可选期限 + 命令说明 ----
+void doProtect(String groupId, String sender, String target) { doProtect(groupId, sender, target, 0); }
+void doProtect(String groupId, String sender, String target, int days) {
     if (!isAdminInGroup(groupId, sender)) return;
     List p = getProtected(groupId);
     if (!p.contains(target)) p.add(target);
     setProtected(groupId, p);
-    HOST.sendText(groupId, "🛡 已加入潜水保护名单: " + HOST.lookupName(target, groupId) + "\n(潜水扫描/红包伸手党/潜水榜都不会点名)");
+    // v1.20.0: 潜水保护可选期限。👑榜→永久; days>0→设期限; 否则永久(清残留记录)。
+    String expLine;
+    if (isCrown(groupId, target)) {
+        clearProtectedExpiry(groupId, target);
+        expLine = "\n👑 皇冠榜成员, 永久有效";
+    } else if (days > 0) {
+        setProtectedExpiry(groupId, target, CLOCK.now() + (long) days * 86400000L);
+        expLine = "\n(" + days + " 天 · " + protectedExpiryLabelOrNull(groupId, target) + ")";
+    } else {
+        clearProtectedExpiry(groupId, target);
+        expLine = "\n(永久)";
+    }
+    HOST.sendText(groupId, "🛡 已加入潜水保护名单: " + HOST.lookupName(target, groupId) + expLine
+        + "\n(潜水扫描/红包伸手党/潜水榜都不会点名)\n" + _protectCmdHint());
 }
 
 // ---- 取消保护 (@1636-1645) ----
@@ -65,6 +90,7 @@ void doUnprotect(String groupId, String sender, String target) {
     List p = getProtected(groupId);
     if (p.remove(target)) {
         setProtected(groupId, p);
+        clearProtectedExpiry(groupId, target);   // v1.20.0: 清残留期限记录
         HOST.sendText(groupId, "✅ 已取消潜水保护: " + HOST.lookupName(target, groupId));
     } else {
         HOST.sendText(groupId, "❌ 该用户不在潜水保护名单");
@@ -197,12 +223,12 @@ void doAddAdmin(String groupId, String target, int days) {
     else clearAdminExpiry(groupId, target);
     // 加管理员自动去白名单(管理员本就免罚, 白名单冗余; 用户 2026-06-14)
     boolean _rmWt = false;
-    try { List _wl = getWhitelist(groupId); if (_wl.remove(target)) { setWhitelist(groupId, _wl); _rmWt = true; } } catch (Throwable t) {}
+    try { if (!isCrown(groupId, target)) { List _wl = getWhitelist(groupId); if (_wl.remove(target)) { setWhitelist(groupId, _wl); clearWhitelistExpiry(groupId, target); _rmWt = true; } } } catch (Throwable t) {}   // 👑成员不从白名单移除(用户 2026-06-14)
     // 永久不写, 有期限才缀 (用户 2026-06-14)
     String suffix;
     if (days > 0) suffix = " (" + days + "天, " + adminExpiryLabel(groupId, target) + ")";
     else suffix = "";
-    HOST.sendText(groupId, "🛡 已加为管理员: " + HOST.lookupName(target, groupId) + suffix + (_rmWt ? "\n(已从白名单移除)" : ""));
+    HOST.sendText(groupId, "🛡 已加为管理员: " + HOST.lookupName(target, groupId) + suffix + (_rmWt ? "\n(已从白名单移除)" : "") + "\n" + _adminCmdHint());
 }
 
 // ---- 移除管理 (@2815-2824) ----
@@ -243,14 +269,27 @@ void doDelOwner(String groupId, String target) {
     }
 }
 
-// ---- 本群白名单 加 (@3804-3809) ----
-void doWhitelist(String groupId, String sender, String target) {
+// ---- 本群白名单 加 (@3804-3809); v1.20.0 强制期限(默认60天) + 命令说明 ----
+void doWhitelist(String groupId, String sender, String target) { doWhitelist(groupId, sender, target, 0); }
+void doWhitelist(String groupId, String sender, String target, int days) {
     if (!canActOn(groupId, sender, target)) { HOST.sendText(groupId, "❌ 权限不足"); return; }
     // 管理员本就免警告/不被踢, 白名单冗余 → 已是管理员不用加(用户 2026-06-14)
-    if (isAdminInGroup(groupId, target)) { HOST.sendText(groupId, "ℹ️ " + HOST.lookupName(target, groupId) + " 已是管理员, 本就免警告/不被踢, 无需加白名单"); return; }
+    // 已是管理员本就免罚, 无需白名单 — 但👑成员例外: 哪怕是管理员也必须在白名单(用户 2026-06-14)。
+    if (isAdminInGroup(groupId, target) && !isCrown(groupId, target)) { HOST.sendText(groupId, "ℹ️ " + HOST.lookupName(target, groupId) + " 已是管理员, 本就免警告/不被踢, 无需加白名单"); return; }
     List wt = getWhitelist(groupId);
     if (!wt.contains(target)) { wt.add(target); setWhitelist(groupId, wt); }
-    HOST.sendText(groupId, "✅ 已加入本群白名单: " + HOST.lookupName(target, groupId) + "\n(免警告 + 免管理员踢 + 免进群黑名单检测)");
+    // v1.20.0: 白名单强制期限。👑榜→永久(清残留); 否则 days<=0 默认 WT_DEFAULT_DAYS 天。
+    String expLine;
+    if (isCrown(groupId, target)) {
+        clearWhitelistExpiry(groupId, target);
+        expLine = "\n👑 皇冠榜成员, 永久有效";
+    } else {
+        int d = days > 0 ? days : WT_DEFAULT_DAYS;
+        setWhitelistExpiry(groupId, target, CLOCK.now() + (long) d * 86400000L);
+        expLine = "\n(" + d + " 天 · " + whitelistExpiryLabelOrNull(groupId, target) + ")";
+    }
+    HOST.sendText(groupId, "✅ 已加入本群白名单: " + HOST.lookupName(target, groupId) + expLine
+        + "\n(免警告 + 免管理员踢 + 免进群黑名单检测)\n" + _whitelistCmdHint());
 }
 
 // ---- 本群白名单 删 (@3811-3820) ----
@@ -261,6 +300,7 @@ void doUnwhitelist(String groupId, String sender, String target) {
     List wt = getWhitelist(groupId);
     if (wt.remove(target)) {
         setWhitelist(groupId, wt);
+        clearWhitelistExpiry(groupId, target);   // v1.20.0: 清残留期限记录
         HOST.sendText(groupId, "✅ 已移除本群白名单: " + HOST.lookupName(target, groupId));
     } else {
         HOST.sendText(groupId, "❌ 该用户不在本群白名单");

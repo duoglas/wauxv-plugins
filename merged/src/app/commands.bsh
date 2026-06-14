@@ -98,7 +98,7 @@ Object _mkNoopLeaf() {
     void checkBotPriv(String groupId, String sender)       { }   // @2284 #群权限自检/群权限自检 → doCheckBotPriv
     void addBlacklistByAt(String groupId, String sender, List atList) { }   // @2290 添加黑名单 @XX → doAddBlacklistByAt
     void removeBlacklist(String groupId, String sender, String content, List atList) { }   // @2296 去除黑名单 → doRemoveBlacklist
-    void whitelist(String groupId, String sender, String w)   { }   // @2310 addwt <wxid> → doWhitelist
+    void whitelist(String groupId, String sender, String w, int days) { }   // @2310 addwt <wxid> → doWhitelist; v1.20.0 days(0=默认60)
     void unwhitelist(String groupId, String sender, String w) { }   // @2316 delwt <wxid> → doUnwhitelist
     void addGlobalBlacklist(String groupId, String w)         { }   // @2322 addgb <wxid> → doAddGlobalBlacklist
     void delGlobalBlacklist(String groupId, String w)         { }   // @2328 delgb <wxid> → doDelGlobalBlacklist
@@ -110,7 +110,7 @@ Object _mkNoopLeaf() {
     void warnDetail(String groupId, String target)            { }   // @2531 警告详情 → doWarnDetail
     void addAdmin(String groupId, String target, int days)    { }   // @2532 管理员 [N天] → doAddAdmin
     void delAdmin(String groupId, String target)              { }   // @2533 移除管理 → doDelAdmin
-    void protect(String groupId, String sender, String target)   { }   // @2534 保护 → doProtect
+    void protect(String groupId, String sender, String target, int days) { }   // @2534 保护/潜水保护 → doProtect; v1.20.0 days(0=永久)
     void unprotect(String groupId, String sender, String target) { }   // @2535 取消保护 → doUnprotect
     void addOwner(String groupId, String target)              { }   // @2538 群主 → doAddOwner
     void delOwner(String groupId, String target)              { }   // @2539 移除群主 → doDelOwner
@@ -157,9 +157,9 @@ void dispatchAction(String groupId, String sender, String target, String lastTok
     else if (lastTok.equals("警告详情"))                        { LEAF.warnDetail(groupId, target); }
     else if (lastTok.equals("管理员"))                          { LEAF.addAdmin(groupId, target, days); }
     else if (lastTok.equals("移除管理"))                        { LEAF.delAdmin(groupId, target); }
-    else if (lastTok.equals("保护") || lastTok.equals("潜水保护"))        { LEAF.protect(groupId, sender, target); }
+    else if (lastTok.equals("保护") || lastTok.equals("潜水保护"))        { LEAF.protect(groupId, sender, target, days); }
     else if (lastTok.equals("取消保护") || lastTok.equals("取消潜水保护")) { LEAF.unprotect(groupId, sender, target); }
-    else if (lastTok.equals("白名单"))                          { LEAF.whitelist(groupId, sender, target); }
+    else if (lastTok.equals("白名单"))                          { LEAF.whitelist(groupId, sender, target, days); }
     else if (lastTok.equals("移除白名单") || lastTok.equals("解除白名单")) { LEAF.unwhitelist(groupId, sender, target); }
     else if (lastTok.equals("群主"))                            { LEAF.addOwner(groupId, target); }
     else if (lastTok.equals("移除群主"))                        { LEAF.delOwner(groupId, target); }
@@ -336,7 +336,7 @@ boolean routeCommand(String groupId, String sender, String content,
     if (content.startsWith("addwt ")) {
         if (!_cmdAuthorized(groupId, sender)) return true;
         String w = content.substring(6).trim();
-        if (!w.isEmpty()) LEAF.whitelist(groupId, sender, w);
+        if (!w.isEmpty()) LEAF.whitelist(groupId, sender, w, 0);   // by-wxid: 默认期限(doWhitelist 内 60 天)
         return true;
     }
     if (content.startsWith("delwt ")) {
@@ -383,6 +383,10 @@ boolean routeCommand(String groupId, String sender, String content,
         if (prev.equals("管理员") && _isPosIntTok(lastTok)) {
             try { actDays = Integer.parseInt(lastTok); } catch (Throwable t) { actDays = 0; }
             if (actDays > 0) lastTok = "管理员";   // 改写动作词为"管理员", 带 days
+        } else if ((prev.equals("白名单") || prev.equals("潜水保护") || prev.equals("保护")) && _isPosIntTok(lastTok)) {
+            // v1.20.0: 白名单/潜水保护 尾随天数 (白名单默认60, 潜水保护默认永久; 显式 N 天覆盖)
+            try { actDays = Integer.parseInt(lastTok); } catch (Throwable t) { actDays = 0; }
+            if (actDays > 0) lastTok = prev;   // 改写动作词为对应名单, 带 days
         } else if (prev.equals("警告")) {
             warnReason = lastTok; lastTok = "警告";   // 改写动作词为"警告", 带 reason
         }
@@ -440,12 +444,15 @@ boolean routeCommand(String groupId, String sender, String content,
     if (quoteTitle != null) {
         String[] tt = quoteTitle.trim().split("[\\s\\u2005\\u00A0]+");
         if (tt.length > 0) actionTok = tt[tt.length - 1].trim();
-        // 仅"管理员"动作识别尾随天数; 其它动作不变。
+        // "管理员"/"白名单"/"潜水保护"/"保护" 动作识别尾随天数 (与 @ 路径对齐, v1.20.0)。
         if (!isActionTok(actionTok) && tt.length >= 2) {
             String prev = tt[tt.length - 2].trim();
             if (prev.equals("管理员") && _isPosIntTok(actionTok)) {
                 try { qDays = Integer.parseInt(actionTok); } catch (Throwable t2) { qDays = 0; }
                 if (qDays > 0) actionTok = "管理员";
+            } else if ((prev.equals("白名单") || prev.equals("潜水保护") || prev.equals("保护")) && _isPosIntTok(actionTok)) {
+                try { qDays = Integer.parseInt(actionTok); } catch (Throwable t2) { qDays = 0; }
+                if (qDays > 0) actionTok = prev;
             }
         }
     }
