@@ -53,5 +53,12 @@ check("空窗口 → 空", rankTopNCount(G, T + 5000L, T + 6000L, "botwx", 10).i
 java.util.List sumOther = rankTopNSum(G, RANK_TYPE_OTHER, SINCE, UNTIL, "botwx", 10);
 check("全 NULL val SUM coalesce → 0", ((Long) ((Object[]) sumOther.get(0))[1]).longValue() == 0L);
 
+// ---- 概览 rankSummary: 排除 bot, 窗口内 发言人数=2(wxA,wxB) 总消息=5(wxA3+wxB2) ----
+java.util.List sm = rankSummary(G, SINCE, UNTIL, "botwx");
+Object[] smr = (Object[]) sm.get(0);
+check("概览 发言人数(distinct)=2", ((Long) smr[0]).longValue() == 2L);
+check("概览 总消息=5 (排除 bot, 窗口内)", ((Long) smr[1]).longValue() == 5L);
+check("概览 不排除时 总消息=10 (含 bot 5)", ((Long) ((Object[]) rankSummary(G, SINCE, UNTIL, "").get(0))[1]).longValue() == 10L);
+
 conn.close();
 done();

@@ -74,12 +74,20 @@ java.util.List rankLurkChampion(String grp, String exclWxid) {
     return STORAGE.queryRows(RANK_LURK_SQL, new Object[]{ grp, (exclWxid == null ? "" : exclWxid) });
 }
 
-// 红包王: rp_record 表里(本群,排除机器人)按发包条数 topN。返回 [0]=sender_wxid [1]=count(Long)。无则空。
-//   rp_record 与 msg_event 同库; 列 sender_wxid/grp(domain/redpacket_store)。
+// 红包王: rp_record 表里(本群,排除机器人,窗口 [since,until))按发包条数 topN。返回 [0]=sender_wxid [1]=count(Long)。无则空。
+//   rp_record 与 msg_event 同库; 列 sender_wxid/grp/ts(domain/redpacket_store)。
 RANK_RP_KING_SQL =
-    "SELECT sender_wxid, COUNT(*) c FROM rp_record WHERE grp=? AND sender_wxid<>? "
+    "SELECT sender_wxid, COUNT(*) c FROM rp_record WHERE grp=? AND sender_wxid<>? AND ts>=? AND ts<? "
     + "GROUP BY sender_wxid ORDER BY c DESC, sender_wxid ASC LIMIT ?";
-java.util.List rankRpKing(String grp, String exclWxid, int n) {
+java.util.List rankRpKing(String grp, long sinceTs, long untilTs, String exclWxid, int n) {
     return STORAGE.queryRows(RANK_RP_KING_SQL,
-        new Object[]{ grp, (exclWxid == null ? "" : exclWxid), new Long((long) n) });
+        new Object[]{ grp, (exclWxid == null ? "" : exclWxid), new Long(sinceTs), new Long(untilTs), new Long((long) n) });
+}
+
+// 概览: 某群窗口内 [发言人数(去重 wxid), 总消息数]，排除机器人。返回单行 Object[]{ distinct(Long), total(Long) }。
+RANK_SUMMARY_SQL =
+    "SELECT COUNT(DISTINCT wxid), COUNT(*) FROM msg_event WHERE grp=? AND wxid<>? AND ts>=? AND ts<?";
+java.util.List rankSummary(String grp, long sinceTs, long untilTs, String exclWxid) {
+    return STORAGE.queryRows(RANK_SUMMARY_SQL,
+        new Object[]{ grp, (exclWxid == null ? "" : exclWxid), new Long(sinceTs), new Long(untilTs) });
 }

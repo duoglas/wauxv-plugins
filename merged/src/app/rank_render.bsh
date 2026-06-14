@@ -33,31 +33,63 @@ String _rankFmtAgo(long ms) {
     return "" + (hours / 24L) + " 天";
 }
 
-// 纯构建榜文本(可测; 无线程/无 sendText)。无发言数据返回 null。
-String rankBuildBoard(String groupId) {
-    long SINCE = 0L;
-    long UNTIL = Long.MAX_VALUE;   // v1 总榜(累计)
+// 今日 0 点(设备本地时区)的毫秒。失败回退 0(=累计)。
+long _rankTodayStart() {
+    try {
+        java.util.Calendar c = java.util.Calendar.getInstance();
+        c.set(java.util.Calendar.HOUR_OF_DAY, 0);
+        c.set(java.util.Calendar.MINUTE, 0);
+        c.set(java.util.Calendar.SECOND, 0);
+        c.set(java.util.Calendar.MILLISECOND, 0);
+        return c.getTimeInMillis();
+    } catch (Throwable t) {
+        // Santa Bug2: Calendar 失败回退近 24h(而非 0L=epoch, 否则头部时间范围误导且累计冒充今日)。
+        try { return CLOCK.now() - 86400000L; } catch (Throwable t2) { return 0L; }
+    }
+}
+// 毫秒 → "HH:mm"(设备本地时区)。
+String _rankFmtClock(long ms) {
+    try { return new java.text.SimpleDateFormat("HH:mm").format(new java.util.Date(ms)); }
+    catch (Throwable t) { return "?"; }
+}
+
+// 纯构建榜文本(可测; 无线程/无 sendText)。窗口 [sinceTs, untilTs)。无发言数据返回 null。
+//   v1.2: 概览(发言人数/总消息/时间范围) + 话痨 Top10 + 单项之最(水王/图王/红包王 同窗口, 潜水冠军累计)。
+String rankBuildBoard(String groupId, long sinceTs, long untilTs) {
     String bot = "";
     try { String b = HOST.getLoginWxid(); if (b != null) bot = b; } catch (Throwable t) {}
 
-    java.util.List cnt = rankTopNCount(groupId, SINCE, UNTIL, bot, 5);
-    if (cnt == null || cnt.isEmpty()) return null;
+    long persons = 0L, total = 0L;
+    try {
+        java.util.List sm = rankSummary(groupId, sinceTs, untilTs, bot);
+        if (sm != null && !sm.isEmpty()) {
+            Object[] s0 = (Object[]) sm.get(0);
+            persons = (s0[0] == null) ? 0L : ((Long) s0[0]).longValue();
+            total = (s0[1] == null) ? 0L : ((Long) s0[1]).longValue();
+        }
+    } catch (Throwable t) {}
+    if (total <= 0L) return null;
 
     StringBuilder sb = new StringBuilder();
-    sb.append("🏆 群 龙 榜 🏆\n");
+    sb.append("📊 今日群龙榜\n");
     sb.append("━━━━━━━━━━━━\n");
-    sb.append("🗣️ 话痨榜 · 谁在屠屏\n");
-    String[] medals = { "🥇", "🥈", "🥉", "④", "⑤" };
+    sb.append("🕐 ").append(_rankFmtClock(sinceTs)).append(" - ").append(_rankFmtClock(CLOCK.now()))
+      .append("  👥 ").append(persons).append(" 人 · 💬 ").append(total).append(" 条\n");
+    sb.append("━━━━━━━━━━━━\n");
+    sb.append("🗣️ 话痨榜\n");
+    java.util.List cnt = rankTopNCount(groupId, sinceTs, untilTs, bot, 10);
+    if (cnt == null) cnt = new java.util.ArrayList();   // Santa Bug1: 主榜也兜 null(queryRows 返 null 不 NPE 毁整榜)
+    String[] medals = { "🥇", "🥈", "🥉", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩" };
     for (int i = 0; i < cnt.size() && i < medals.length; i++) {
         Object[] r = (Object[]) cnt.get(i);
         sb.append(medals[i]).append(" ").append(_rankName((String) r[0], groupId))
-          .append(" · ").append(((Long) r[1]).longValue()).append(" 条\n");
+          .append(" 【").append(((Long) r[1]).longValue()).append("】\n");
     }
 
     // 单项之最(各自独立 try/catch: 某表缺/查询错只跳过该项, 不毁整榜)。
     StringBuilder best = new StringBuilder();
     try {
-        java.util.List water = rankTopNSum(groupId, RANK_TYPE_TEXT, SINCE, UNTIL, bot, 1);
+        java.util.List water = rankTopNSum(groupId, RANK_TYPE_TEXT, sinceTs, untilTs, bot, 1);
         if (water != null && !water.isEmpty()) {
             Object[] w = (Object[]) water.get(0);
             long c = ((Long) w[1]).longValue();
@@ -65,7 +97,7 @@ String rankBuildBoard(String groupId) {
         }
     } catch (Throwable t) {}
     try {
-        java.util.List pic = rankTopNCountType(groupId, RANK_TYPE_OTHER, SINCE, UNTIL, bot, 1);
+        java.util.List pic = rankTopNCountType(groupId, RANK_TYPE_OTHER, sinceTs, untilTs, bot, 1);
         if (pic != null && !pic.isEmpty()) {
             Object[] p = (Object[]) pic.get(0);
             long c = ((Long) p[1]).longValue();
@@ -73,7 +105,7 @@ String rankBuildBoard(String groupId) {
         }
     } catch (Throwable t) {}
     try {
-        java.util.List rp = rankRpKing(groupId, bot, 1);
+        java.util.List rp = rankRpKing(groupId, sinceTs, untilTs, bot, 1);
         if (rp != null && !rp.isEmpty()) {
             Object[] k = (Object[]) rp.get(0);
             long c = ((Long) k[1]).longValue();
@@ -123,9 +155,9 @@ void rankShowLeaderboard(String groupId, String content) {
         new Thread(new Runnable() {
             public void run() {
                 try {
-                    String board = rankBuildBoard(groupId);
+                    String board = rankBuildBoard(groupId, _rankTodayStart(), Long.MAX_VALUE);   // 今日窗口
                     if (board == null) {
-                        try { HOST.sendText(groupId, "📊 本群暂无排行榜数据 (管理员发「排行榜开启」开始统计)"); } catch (Throwable t) {}
+                        try { HOST.sendText(groupId, "📊 本群今日暂无发言数据 (或未开启: 管理员发「排行榜开启」)"); } catch (Throwable t) {}
                         return;
                     }
                     board = rankLlmPolish(board);

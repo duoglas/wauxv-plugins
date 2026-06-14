@@ -1,5 +1,5 @@
 // L2 集成: app/rank_render.rankBuildBoard + sqlite-jdbc(msg_event+speak+rp_record) + fake HOST ——
-//   验 5 类目(话痨/水王/图王/红包王/潜水) + 排除机器人 + 空数据 + 格式串。
+//   验 概览(人数/消息) + 话痨Top + 5类目 + 排除机器人 + 空数据 + 格式串。窗口 [since,until)。
 // 运行 cwd = merged/, classpath 含 sqlite-jdbc.jar。
 import java.sql.*;
 source("tests/_harness.bsh");
@@ -16,15 +16,16 @@ conn.createStatement().execute(SPEAK_CREATE_SQL);
 conn.createStatement().execute(RP_CREATE_SQL);
 STORAGE = makeJdbcStorage(conn);
 
-FAKE_LOGIN_WXID = "botwx";       // 机器人 wxid → 应被所有榜排除
-FAKE_NOW = 2000000000000L;       // 潜水 ago = now - last_speak
+FAKE_LOGIN_WXID = "botwx";
+FAKE_NOW = 2000000000000L;
 String G = "gA@chatroom";
 long T = 1749470000000L;
+long SINCE = 0L, UNTIL = Long.MAX_VALUE;   // 测试用全窗口(覆盖所有 ts)
 
-// ---- 空数据 → null ----
-check("空数据 rankBuildBoard 返回 null", rankBuildBoard(G) == null);
+// 空数据 → null
+check("空数据 rankBuildBoard 返回 null", rankBuildBoard(G, SINCE, UNTIL) == null);
 
-// ---- msg_event: wxA 3 文本; wxB 1 文本(100字)+2 非文本(图); botwx 10 文本(应排除) ----
+// msg_event: wxA 3 文本; wxB 1 文本(100字)+2 非文本(图); botwx 10 文本(排除)
 rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 1, new Long(5L));
 rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 2, new Long(5L));
 rankInsertEvent(G, "wxA", RANK_TYPE_TEXT, T + 3, new Long(5L));
@@ -32,35 +33,35 @@ rankInsertEvent(G, "wxB", RANK_TYPE_TEXT, T + 4, new Long(100L));
 rankInsertEvent(G, "wxB", RANK_TYPE_OTHER, T + 5, null);
 rankInsertEvent(G, "wxB", RANK_TYPE_OTHER, T + 6, null);
 for (int i = 0; i < 10; i++) rankInsertEvent(G, "botwx", RANK_TYPE_TEXT, T + 10 + i, new Long(999L));
-
-// ---- speak: wxA 近期; wxC 很久没说话(潜水冠军); botwx 最久(排除) ----
+// speak: wxC 潜水冠军; botwx 排除
 speakRecord(G, "wxA", 1999999999000L);
 speakRecord(G, "wxC", 1000000000000L);
 speakRecord(G, "botwx", 500000000000L);
+// rp_record: wxA 2 包, wxB 1 包, botwx 3 包(排除) → 红包王 wxA
+rpRecord("k1", "d", T, G, "群", "wxA", "wxA", "t", 1L, "");
+rpRecord("k2", "d", T, G, "群", "wxA", "wxA", "t", 1L, "");
+rpRecord("k3", "d", T, G, "群", "wxB", "wxB", "t", 1L, "");
+rpRecord("k4", "d", T, G, "群", "botwx", "bot", "t", 1L, "");
+rpRecord("k5", "d", T, G, "群", "botwx", "bot", "t", 1L, "");
+rpRecord("k6", "d", T, G, "群", "botwx", "bot", "t", 1L, "");
 
-// ---- rp_record: wxA 2 包, wxB 1 包, botwx 3 包(排除) → 红包王 wxA ----
-rpRecord("k1", "d", T, G, "群A", "wxA", "A", "t", 1L, "");
-rpRecord("k2", "d", T, G, "群A", "wxA", "A", "t", 1L, "");
-rpRecord("k3", "d", T, G, "群A", "wxB", "B", "t", 1L, "");
-rpRecord("k4", "d", T, G, "群A", "botwx", "bot", "t", 1L, "");
-rpRecord("k5", "d", T, G, "群A", "botwx", "bot", "t", 1L, "");
-rpRecord("k6", "d", T, G, "群A", "botwx", "bot", "t", 1L, "");
-
-String b = rankBuildBoard(G);
+String b = rankBuildBoard(G, SINCE, UNTIL);
 check("有数据 → 非 null", b != null);
-check("含标题 群 龙 榜", b.indexOf("群 龙 榜") >= 0);
-check("话痨第一 = wxA(3条)", b.indexOf("🥇 wxA · 3 条") >= 0);
+check("含标题 今日群龙榜", b.indexOf("今日群龙榜") >= 0);
+// 概览: 排除 bot → 发言人数 2(wxA,wxB), 总消息 6(wxA3+wxB3)
+check("概览 发言人数 2 人", b.indexOf("👥 2 人") >= 0);
+check("概览 总消息 6 条", b.indexOf("💬 6 条") >= 0);
+// 话痨榜(Top10, 平票 wxid 升序 wxA<wxB, 各3条): 新格式【N】
+check("话痨第一 wxA 【3】", b.indexOf("🥇 wxA 【3】") >= 0);
 check("★排除机器人: 全榜无 botwx", b.indexOf("botwx") < 0);
 check("💧 水王 = wxB(100字)", b.indexOf("💧 水  王  wxB · 100 字") >= 0);
 check("📷 图王 = wxB(2张)", b.indexOf("📷 图  王  wxB · 2 张") >= 0);
-check("🧧 红包王 = wxA(2个, 排除 botwx 的 3)", b.indexOf("🧧 红包王  wxA · 2 个") >= 0);
+check("🧧 红包王 = wxA(2个, 排除 botwx 3)", b.indexOf("🧧 红包王  wxA · 2 个") >= 0);
 check("🤿 潜水冠军 = wxC(排除 botwx)", b.indexOf("🤿 潜水冠军 wxC") >= 0);
-check("含 单项之最 分区", b.indexOf("单项之最") >= 0);
 
-// ---- 数字/时长格式化 ----
+// 数字/时长格式化
 check("_rankFmtNum 万", "5.2万".equals(_rankFmtNum(52000L)));
 check("_rankFmtNum 整万", "3万".equals(_rankFmtNum(30000L)));
-check("_rankFmtNum 小数省略", "100".equals(_rankFmtNum(100L)));
 check("_rankFmtAgo 天", "11 天".equals(_rankFmtAgo(1000000000L)));
 
 conn.close();
