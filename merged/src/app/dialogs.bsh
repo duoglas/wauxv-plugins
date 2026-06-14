@@ -1328,6 +1328,107 @@ void showMergedGroupConfig(String groupId) {
         }
     });
     root.addView(rpDetail);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button rankCfg = _gaBtn(ctx, "📊 排行榜设置", "#252934");
+    rankCfg.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showRankConfig(fG);
+        }
+    });
+    root.addView(rankCfg);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx)
+        .setView(sv)
+        .setNegativeButton("关闭", null)
+        .create();
+    dh[0].show();
+}
+
+// ----- 排行榜配置子页 (群管配置界面入口 showMergedGroupConfig→📊排行榜设置): 本群统计开关 + LLM润色开关 + 看榜 -----
+void showRankConfig(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+    if (groupId == null || !groupId.contains("@chatroom")) { toast("无效群 (需群聊)"); return; }
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    boolean rankOn = false;
+    try { rankOn = rankIsGroupEnabled(groupId); } catch (Throwable t) {}
+    boolean hasKey = false;
+    boolean polishOn = false;
+    try { hasKey = HOST.getString("ga_llm_key", "").trim().length() > 0; } catch (Throwable t) {}
+    try { polishOn = !"0".equals(HOST.getString("ga_llm_rank_on", "1")); } catch (Throwable t) {}
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("📊 排行榜设置");
+    title.setTextColor(_gaC("#E8E9EC"));
+    title.setTextSize(18);
+    title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    android.widget.LinearLayout card = new android.widget.LinearLayout(ctx);
+    card.setOrientation(android.widget.LinearLayout.VERTICAL);
+    card.setPadding(12 * dp, 12 * dp, 12 * dp, 12 * dp);
+    card.setBackground(_gaRound("#1A1D24", 12));
+    StringBuilder st = new StringBuilder();
+    st.append("本群统计: ").append(rankOn ? "✅ 已开启" : "🔴 未开启").append("\n");
+    st.append("LLM 润色: ").append(!hasKey ? "⚪ 未配置 key" : (polishOn ? "✨ 开" : "🔕 关")).append("\n");
+    st.append("开启后记录发言/红包等; 发「群龙榜」看今日榜 (话痨Top10 + 水王/图王/红包王/潜水冠军)。");
+    android.widget.TextView stv = new android.widget.TextView(ctx);
+    stv.setText(st.toString());
+    stv.setTextColor(_gaC("#B8BDC8"));
+    stv.setTextSize(12);
+    stv.setLineSpacing(0, 1.4f);
+    card.addView(stv);
+    root.addView(card);
+    _gaSpacer(root, ctx, 12 * dp);
+
+    final String fG = groupId;
+    final boolean fRankOn = rankOn;
+    final boolean fPolishOn = polishOn;
+    final AlertDialog[] dh = new AlertDialog[1];
+
+    android.widget.Button rankTgl = _gaBtn(ctx, fRankOn ? "🔕 关闭本群排行榜统计" : "✅ 开启本群排行榜统计", fRankOn ? "#FF6B6B" : "#5CB6FF");
+    rankTgl.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (fRankOn) { rankDisableGroup(fG); toast("已关闭本群排行榜统计 (历史保留)"); }
+            else { rankEnableGroup(fG); toast("已开启本群排行榜统计"); }
+            if (dh[0] != null) dh[0].dismiss();
+            showRankConfig(fG);
+        }
+    });
+    root.addView(rankTgl);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button polishTgl = _gaBtn(ctx, fPolishOn ? "✨ LLM润色: 开 → 点击关闭" : "✨ LLM润色: 关 → 点击开启", fPolishOn ? "#FF6B6B" : "#5CB6FF");
+    polishTgl.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            llmSetRankOn(!fPolishOn);
+            toast(!fPolishOn ? "已开启 LLM 润色 (需配置 key)" : "已关闭 LLM 润色 (恢复朴素榜)");
+            if (dh[0] != null) dh[0].dismiss();
+            showRankConfig(fG);
+        }
+    });
+    root.addView(polishTgl);
+    _gaSpacer(root, ctx, 14 * dp);
+
+    android.widget.Button showBtn = _gaBtn(ctx, "🏆 看群龙榜 (发到本群)", "#252934");
+    showBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            rankShowLeaderboard(fG, "群龙榜");
+        }
+    });
+    root.addView(showBtn);
 
     android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
     sv.addView(root);
