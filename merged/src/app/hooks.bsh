@@ -242,6 +242,43 @@ void onUnload() {
 }
 
 // ============================================================
+// onMemberChange — 新成员进群 → 黑名单先提醒 + 1 分钟宽限, 管理员未解除则自动踢 (用户 2026-06-14 定制版)。
+//   白名单/原生群主一进群即免(不提醒不踢); 无群管权限只提醒不踢; 全程后台 delay 不在消息热路径。
+//   线上 GroupAdmin onMemberChange @2546 逻辑 + 端口改写(sendText/tryKickSilent/botPrivState→HOST./全局)
+//   + 1 分宽限重查(替线上 delay 2s 直踢): 60s 后重读 bl_/wt_ 最新值再决定, 期间解除黑名单或加白名单即放行。
+// ============================================================
+void onMemberChange(String type, String groupWxid, String userWxid, String userName) {
+    try {
+        if (!"join".equals(type)) return;
+        if (!isGroupEnabled(groupWxid)) return;                          // 没启用群管不管
+        try { recordFirstSeen(groupWxid, userWxid); } catch (Throwable t) {}   // 进群记 first_seen, 自动获豁免期
+        if (isWhitelistAny(groupWxid, userWxid)) return;                 // 白名单免进群黑名单检测(压黑名单)
+        if (isNativeOwner(groupWxid, userWxid)) return;                  // 微信原生群主免
+        boolean fromGlobal = isGlobalBlacklist(userWxid);
+        boolean inLocal = getBlacklist(groupWxid).contains(userWxid);
+        if (!fromGlobal && !inLocal) return;                            // 非黑名单不处理
+        final String fGrp = groupWxid; final String fWx = userWxid; final String fName = (userName == null ? "该成员" : userName);
+        final String fTag = fromGlobal ? "🌐 全局黑名单" : "黑名单";
+        // 立即提醒 + 给管理员 1 分钟宽限窗
+        try { HOST.sendText(groupWxid, "⚠️ " + fName + " 在" + fTag + "里, 刚进群。\n1 分钟内管理员发「解除黑名单 @" + fName + "」可放行, 否则自动踢出。"); } catch (Throwable t) {}
+        // 60s 后重查最新名单: 仍黑名单 且 仍非白名单 → 踢; 期间解除黑名单/加白名单 → 放行(静默)
+        try {
+            delay(60000, new Runnable() {
+                public void run() {
+                    try {
+                        if (isWhitelistAny(fGrp, fWx)) return;                                 // 期间加了白名单 → 放行
+                        boolean stillBl = isGlobalBlacklist(fWx) || getBlacklist(fGrp).contains(fWx);
+                        if (!stillBl) return;                                                  // 期间解除黑名单 → 放行
+                        if (botPrivState(fGrp).equals("none")) { try { HOST.sendText(fGrp, "⚠️ " + fName + " 仍在" + fTag + ", 但机器人无群管权限, 未能踢出"); } catch (Throwable t) {} return; }
+                        if (HOST.tryKickSilent(fGrp, fWx)) { try { HOST.sendText(fGrp, "🚫 " + fName + " 在" + fTag + " 超时未解除, 已自动踢出"); } catch (Throwable t) {} }
+                    } catch (Throwable t) {}
+                }
+            });
+        } catch (Throwable t) {}
+    } catch (Throwable t) { try { log("onMemberChange err: " + t); } catch (Throwable t2) {} }
+}
+
+// ============================================================
 // 反射输入提取缝 (TODO P2: 接 WAuxiliary 消息对象反射; 本期占位, 每缝指向线上行号)。
 // 线上 onHandleMsgBody 从 msg 对象反射取这些字段; 骨架把"从 msg 取 X"隔离成缝, 让 hooks 的
 // 提取→采集→路由调用顺序真实可解析。占位返回值仅为解析门通过 + 调用骨架成立, 非真实语义。
@@ -478,6 +515,7 @@ Object makeAndroidLeaf() {
     void showAdmins(String groupId)                        { global.showAdmins(groupId); }                     // @2264
     void showWarnList(String groupId)                      { global.showWarnList(groupId); }                   // @2265
     void showProtected(String groupId)                     { global.showProtected(groupId); }                  // @2266
+    void showCrownList(String groupId)                     { global.showCrownList(groupId); }                  // 皇冠榜 (2026-06-14)
     void showWhitelist(String groupId)                     { global.showWhitelist(groupId); }                  // @2268
     void showGlobalBlacklist(String groupId)               { global.showGlobalBlacklist(groupId); }            // @2269
     void showGlobalWhitelist(String groupId)               { global.showGlobalWhitelist(groupId); }            // @2270

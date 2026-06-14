@@ -95,6 +95,7 @@ boolean canActOn(String groupId, String operator, String target) {
     }
     if (isAdminInGroup(groupId, operator)) {
         if (isAdminInGroup(groupId, target)) return false; // 插件管理不能动管理/群主
+        if (isWhitelistAny(groupId, target)) return false; // 白名单: 管理员不能踢/拉黑(群主可 — 群主分支在上方已 return true) (用户 2026-06-14)
         return true;
     }
     return false;
@@ -133,8 +134,34 @@ List getBlacklist(String groupId) { return parseCsv(HOST.getString("bl_" + group
 void setBlacklist(String groupId, List bl) { HOST.putString("bl_" + groupId, joinCsv(bl)); }       // @670 (W4 名单写)
 List getGlobalBlacklist() { return parseCsv(HOST.getString("bl_global", "")); }                     // @761
 void setGlobalBlacklist(List bl) { HOST.putString("bl_global", joinCsv(bl)); }                       // @762 (W4 名单写)
+boolean isGlobalBlacklist(String wxid) { return wxid != null && !wxid.isEmpty() && getGlobalBlacklist().contains(wxid); }   // @763 (onMemberChange 用; Santa 抓到漏移植)
 List getProtected(String groupId) { return parseCsv(HOST.getString("protected_" + groupId, "")); } // @755
 void setProtected(String groupId, List p) { HOST.putString("protected_" + groupId, joinCsv(p)); }  // @1445 (W4 名单写)
+
+// ============================================================
+// 皇冠榜 (crown_<裸gid>) — VIP/荣誉名单 (用户 2026-06-14): 选择器「添加皇冠榜成员」即加入(+白名单+潜水保护);
+//   白名单/潜水保护列表展示时皇冠榜成员置顶 + 显示 👑XX👑; 只能在皇冠榜界面移除。键用裸 gid (与 wt_/protected_ 同口径)。
+//   crown_note_<gid> = 皇冠榜底部说明(可界面改), 默认「特殊贡献 或 年消费过W」。
+// ============================================================
+List getCrownList(String groupId) { return parseCsv(HOST.getString("crown_" + groupId, "")); }
+void setCrownList(String groupId, List c) { HOST.putString("crown_" + groupId, joinCsv(c)); }
+boolean isCrown(String groupId, String wxid) {
+    if (wxid == null || wxid.isEmpty()) return false;
+    return getCrownList(groupId).contains(wxid);
+}
+// crown 置顶排序: crown 在前(保持原序), 非 crown 在后。
+List crownSort(String groupId, List wxids) {
+    List crowns = new ArrayList(); List others = new ArrayList();
+    List cl = getCrownList(groupId);
+    for (int i = 0; i < wxids.size(); i++) { String w = (String) wxids.get(i); if (cl.contains(w)) crowns.add(w); else others.add(w); }
+    crowns.addAll(others);
+    return crowns;
+}
+// crown 名字加冠: 👑XX👑
+String crownName(String name, boolean crown) { return crown ? ("👑" + name + "👑") : name; }
+// 皇冠榜底部说明(可界面改); 默认「特殊贡献 或 年消费过W」。
+String getCrownNote(String groupId) { String s = HOST.getString("crown_note_" + groupId, ""); return (s == null || s.trim().isEmpty()) ? "特殊贡献 或 年消费过W" : s; }
+void setCrownNote(String groupId, String note) { HOST.putString("crown_note_" + groupId, note == null ? "" : note); }
 
 // 管理员名册写 (@1738): purgeExpiredAdmins 落盘用。键用 norm 后的 gid (与 getAdmins @1737 对齐)。
 void setAdmins(String groupId, List admins) { HOST.putString("admins_" + normGroupId(groupId), joinCsv(admins)); }

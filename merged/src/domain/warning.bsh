@@ -66,8 +66,14 @@ void   setBotPriv(String groupId, String state) { HOST.putString("bp_" + groupId
 void doWarn(String groupId, String sender, String target) { doWarn(groupId, sender, target, null); }
 void doWarn(String groupId, String sender, String target, String reason) {
     boolean auto = (reason != null && !reason.trim().isEmpty());
-    // v1.19.1: 自动来源不警告管理员/群主/原生群主 (canActOn 对 owner→admin 不挡, 须显式豁免)。手动(auto=false)不受影响。
-    if (auto && (isAdminInGroup(groupId, target) || isOwner(target) || isNativeOwner(groupId, target))) return;
+    // v1.19.1: 自动来源不直接警告管理员/群主/原生群主。手动(auto=false)不受影响。
+    //   用户 2026-06-14: 管理员被自动判定(如伸手党)→ 发「提醒」(不计警告/不踢)让群主留意; 群主/原生群主静默。
+    if (auto && (isAdminInGroup(groupId, target) || isOwner(target) || isNativeOwner(groupId, target))) {
+        if (isAdminInGroup(groupId, target) && !isOwner(target) && !isNativeOwner(groupId, target)) {
+            try { HOST.sendText(groupId, "📢 提醒: 管理员 " + HOST.lookupName(target, groupId) + " · " + reason.trim() + "\n(管理员不直接警告, 仅提醒, 请群主留意)"); } catch (Throwable t) {}
+        }
+        return;
+    }
     if (!canActOn(groupId, sender, target)) { if (!auto) HOST.sendText(groupId, "❌ 权限不足或不能操作该对象"); return; }
     // v1.12: 白名单(本群+全局)免警告
     if (isWhitelistAny(groupId, target)) {

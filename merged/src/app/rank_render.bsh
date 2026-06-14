@@ -113,7 +113,7 @@ String rankBuildBoard(String groupId, long sinceTs, long untilTs) {
         }
     } catch (Throwable t) {}
     try {
-        java.util.List lurk = rankLurkChampion(groupId, bot);
+        java.util.List lurk = rankLurkChampion(groupId, bot, getProtected(groupId));   // 潜水保护者不上潜水榜(2026-06-14)
         if (lurk != null && !lurk.isEmpty()) {
             Object[] l = (Object[]) lurk.get(0);
             if (l[1] != null) {

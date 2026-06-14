@@ -39,4 +39,11 @@ setAdminExpiry(gid, "admin2", 0L);   // 边界: exp<=0 视为永久
 check("15 边界 exp=0 → null", adminExpiryLabelOrNull(gid, "admin2") == null);
 clearAdminExpiry(gid, "admin2");   // 还原
 
+// ---- canActOn 白名单: 管理员不能动白名单成员, 群主可 (用户 2026-06-14) ----
+HOST.putString("wt_test@chatroom", "wlguy");   // 白名单键用裸 gid
+check("16 管理员不能动白名单成员 admin1→wlguy",       canActOn(gid, "admin1", "wlguy") == false);
+check("17 群主可动白名单成员 owner1→wlguy",           canActOn(gid, "owner1", "wlguy") == true);
+check("18 管理员仍可动非白名单普通人 admin1→normalZ", canActOn(gid, "admin1", "normalZ") == true);
+HOST.putString("wt_test@chatroom", "");   // 还原
+
 done();

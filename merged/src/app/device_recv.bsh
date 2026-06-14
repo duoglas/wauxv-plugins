@@ -400,6 +400,8 @@ void hbDetailExtract(Object root, String key) {
                 // 排除名单 → Set (命中者豁免不判)。
                 java.util.Set exSet = new java.util.HashSet();
                 try { java.util.List ex = getExcludeList(talker); if (ex != null) for (int i = 0; i < ex.size(); i++) { String e = (String) ex.get(i); if (e != null) exSet.add(e.trim()); } } catch (Throwable t) {}
+                // ★潜水保护豁免(用户 2026-06-14): 潜水保护=允许不发言, 不判红包伸手党 (并入红包排除名单, 任一即免)。
+                try { java.util.List _prot = getProtected(talker); if (_prot != null) for (int i = 0; i < _prot.size(); i++) { String p = (String) _prot.get(i); if (p != null) exSet.add(p.trim()); } } catch (Throwable t) {}
                 // ★A1 发包人豁免: 发包人本人永不被判伸手党 (写库照常含, 仅判定豁免)。
                 try { String _spw = (job != null) ? (String) job[JOB_SENDER] : null; if (_spw != null && !_spw.isEmpty()) exSet.add(_spw.trim()); } catch (Throwable t) {}
                 int win = cfgFreeloaderWin(talker);

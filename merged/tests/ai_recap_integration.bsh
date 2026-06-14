@@ -8,6 +8,7 @@ String llmChat(String system, String user) { return FAKE_LLM_RESULT; }
 void log(String s) {}
 
 source("tests/fakes/host_fake.bsh");        // HOST(lookupName 回 wxid) + CLOCK
+source("src/domain/membership.bsh");        // getProtected/parseCsv (rank_render 潜水榜排除潜水保护)
 source("src/domain/rank.bsh");
 source("src/domain/chat_recent.bsh");
 source("src/domain/speak_store.bsh");

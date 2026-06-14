@@ -36,6 +36,8 @@ Object _mkRecLeaf() {
     void kick(String groupId, String sender, String target) { FAKE_LEAF.add(new Object[]{ "kick", groupId, target }); }
     void addAdmin(String groupId, String target, int days) { FAKE_LEAF.add(new Object[]{ "addAdmin", target, new Integer(days) }); }
     void enableGroup(String groupId, String sender) { FAKE_LEAF.add(new Object[]{ "enable", groupId }); }
+    void unwhitelist(String groupId, String sender, String w) { FAKE_LEAF.add(new Object[]{ "unwhitelist", w }); }
+    void removeBlacklist(String groupId, String sender, String content, List atList) { FAKE_LEAF.add(new Object[]{ "removeBlacklist", content }); }
     return this;
 }
 LEAF = _mkRecLeaf();
@@ -187,5 +189,30 @@ boolean r12 = routeCommand(gid, "normalX", "群聊总结", true, noAt, null, nul
 check("12 非管理员点评 静默消费",      r12 == true);
 check("12 非管理员点评 不触发生成",    FAKE_RECAP.isEmpty());
 recapDisableGroup(gid);
+
+// ============================================================
+// 13. 解除白名单 @TA → 命中 unwhitelist (= 移除白名单 别名, 2026-06-14)
+// ============================================================
+reset();
+boolean r13 = routeCommand(gid, "admin1", "@某人 解除白名单", true, atTarget("uw1"), null, null);
+check("13 解除白名单 消费",            r13 == true);
+check("13 解除白名单 命中 unwhitelist 缝", leafHit("unwhitelist"));
+
+// ============================================================
+// 14. 解除黑名单 @TA → 命中 removeBlacklist (= 去除黑名单 别名, 2026-06-14)
+// ============================================================
+reset();
+boolean r14 = routeCommand(gid, "admin1", "解除黑名单", true, atTarget("ub1"), null, null);
+check("14 解除黑名单 消费",            r14 == true);
+check("14 解除黑名单 命中 removeBlacklist 缝", leafHit("removeBlacklist"));
+
+// ============================================================
+// 15. 反向警告: 非管理员用「警告」→ 警告调用者本人 (用户 2026-06-14)
+// ============================================================
+reset(); HOST.putString("wn_g@chatroom_normalX", "0");
+boolean r15 = routeCommand(gid, "normalX", "@张三 警告", true, atTarget("ufresh"), null, null);
+check("15 非管理员用警告 消费",         r15 == true);
+check("15 反向警告: 警告了调用者本人",  getWarn(gid, "normalX") >= 1);
+check("15 反向警告 没警告被@的目标",    getWarn(gid, "ufresh") == 0);
 
 done();

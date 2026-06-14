@@ -48,11 +48,12 @@ check("4 无权不踢 FAKE_KICKED 不含 u4", !FAKE_KICKED.contains("u4"));
 check("4 无权不清零 getWarn==10",      getWarn(gid, "u4") == 10);
 HOST.putString("bp_g@chatroom", "");   // 清掉 bp
 
-// 5. 自动来源豁免管理员: 静默, 计数不动
+// 5. 自动来源不直接警告管理员: 发📢提醒(不计警告), 让群主留意 (用户 2026-06-14)
 reset(); HOST.putString("wn_g@chatroom_admin1", "0");
 doWarn(gid, "owner1", "admin1", "30分钟未发言");
-check("5 自动豁免管理 getWarn==0",     getWarn(gid, "admin1") == 0);
-check("5 自动豁免静默 FAKE_SENT 空",   FAKE_SENT.isEmpty());
+check("5 自动判定管理员 不计警告 getWarn==0", getWarn(gid, "admin1") == 0);
+check("5 自动判定管理员 发📢提醒不直接警告",  FAKE_SENT.size() == 1
+        && ((Object[]) FAKE_SENT.get(0))[1].toString().indexOf("📢") >= 0);
 
 // 6. 手动可警告管理员(auto=false 不豁免)
 reset(); HOST.putString("wn_g@chatroom_admin1", "0");

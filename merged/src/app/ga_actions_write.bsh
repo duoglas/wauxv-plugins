@@ -54,18 +54,20 @@ void doProtect(String groupId, String sender, String target) {
     List p = getProtected(groupId);
     if (!p.contains(target)) p.add(target);
     setProtected(groupId, p);
-    HOST.sendText(groupId, "🛡 已加入保护名单: " + HOST.lookupName(target, groupId) + "\n(潜水扫描时不会出现)");
+    HOST.sendText(groupId, "🛡 已加入潜水保护名单: " + HOST.lookupName(target, groupId) + "\n(潜水扫描/红包伸手党/潜水榜都不会点名)");
 }
 
 // ---- 取消保护 (@1636-1645) ----
 void doUnprotect(String groupId, String sender, String target) {
     if (!isAdminInGroup(groupId, sender)) return;
+    // 👑榜成员锁定: 不能单独取消潜水保护, 只能到👑榜取消👑 (用户 2026-06-14)
+    if (isCrown(groupId, target)) { HOST.sendText(groupId, "👑 " + HOST.lookupName(target, groupId) + " 在皇冠榜里, 不能单独取消潜水保护\n请到 群管 → 👑 皇冠榜 → 取消👑 (会一并移出白名单/潜水保护)"); return; }
     List p = getProtected(groupId);
     if (p.remove(target)) {
         setProtected(groupId, p);
-        HOST.sendText(groupId, "✅ 已取消保护: " + HOST.lookupName(target, groupId));
+        HOST.sendText(groupId, "✅ 已取消潜水保护: " + HOST.lookupName(target, groupId));
     } else {
-        HOST.sendText(groupId, "❌ 该用户不在保护名单");
+        HOST.sendText(groupId, "❌ 该用户不在潜水保护名单");
     }
 }
 
@@ -193,11 +195,14 @@ void doAddAdmin(String groupId, String target, int days) {
     // v1.17.0: days>0 → 设到期; days<=0 → 永久 (清除可能残留的旧时效)
     if (days > 0) setAdminExpiry(groupId, target, CLOCK.now() + (long) days * 86400000L);
     else clearAdminExpiry(groupId, target);
+    // 加管理员自动去白名单(管理员本就免罚, 白名单冗余; 用户 2026-06-14)
+    boolean _rmWt = false;
+    try { List _wl = getWhitelist(groupId); if (_wl.remove(target)) { setWhitelist(groupId, _wl); _rmWt = true; } } catch (Throwable t) {}
     // 永久不写, 有期限才缀 (用户 2026-06-14)
     String suffix;
     if (days > 0) suffix = " (" + days + "天, " + adminExpiryLabel(groupId, target) + ")";
     else suffix = "";
-    HOST.sendText(groupId, "🛡 已加为管理员: " + HOST.lookupName(target, groupId) + suffix);
+    HOST.sendText(groupId, "🛡 已加为管理员: " + HOST.lookupName(target, groupId) + suffix + (_rmWt ? "\n(已从白名单移除)" : ""));
 }
 
 // ---- 移除管理 (@2815-2824) ----
@@ -241,14 +246,18 @@ void doDelOwner(String groupId, String target) {
 // ---- 本群白名单 加 (@3804-3809) ----
 void doWhitelist(String groupId, String sender, String target) {
     if (!canActOn(groupId, sender, target)) { HOST.sendText(groupId, "❌ 权限不足"); return; }
+    // 管理员本就免警告/不被踢, 白名单冗余 → 已是管理员不用加(用户 2026-06-14)
+    if (isAdminInGroup(groupId, target)) { HOST.sendText(groupId, "ℹ️ " + HOST.lookupName(target, groupId) + " 已是管理员, 本就免警告/不被踢, 无需加白名单"); return; }
     List wt = getWhitelist(groupId);
     if (!wt.contains(target)) { wt.add(target); setWhitelist(groupId, wt); }
-    HOST.sendText(groupId, "✅ 已加入本群白名单: " + HOST.lookupName(target, groupId) + "\n(免警告 + 免进群黑名单检测)");
+    HOST.sendText(groupId, "✅ 已加入本群白名单: " + HOST.lookupName(target, groupId) + "\n(免警告 + 免管理员踢 + 免进群黑名单检测)");
 }
 
 // ---- 本群白名单 删 (@3811-3820) ----
 void doUnwhitelist(String groupId, String sender, String target) {
     if (!canActOn(groupId, sender, target)) { HOST.sendText(groupId, "❌ 权限不足"); return; }
+    // 👑榜成员锁定: 不能单独解除白名单, 只能到👑榜取消👑 (用户 2026-06-14)
+    if (isCrown(groupId, target)) { HOST.sendText(groupId, "👑 " + HOST.lookupName(target, groupId) + " 在皇冠榜里, 不能单独解除白名单\n请到 群管 → 👑 皇冠榜 → 取消👑 (会一并移出白名单/潜水保护)"); return; }
     List wt = getWhitelist(groupId);
     if (wt.remove(target)) {
         setWhitelist(groupId, wt);

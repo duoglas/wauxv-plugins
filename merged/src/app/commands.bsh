@@ -36,7 +36,8 @@ boolean isActionTok(String lastTok) {
            lastTok.equals("管理员") || lastTok.equals("移除管理") ||
            lastTok.equals("群主") || lastTok.equals("移除群主") ||
            lastTok.equals("保护") || lastTok.equals("取消保护") ||
-           lastTok.equals("白名单") || lastTok.equals("移除白名单") ||
+           lastTok.equals("潜水保护") || lastTok.equals("取消潜水保护") ||
+           lastTok.equals("白名单") || lastTok.equals("移除白名单") || lastTok.equals("解除白名单") ||
            lastTok.equals("微信群主") || lastTok.equals("移除微信群主");
 }
 
@@ -85,6 +86,7 @@ Object _mkNoopLeaf() {
     void showAdmins(String groupId)                        { }   // @2264 管理员 → showAdmins
     void showWarnList(String groupId)                      { }   // @2265 警告名单 → showWarnList
     void showProtected(String groupId)                     { }   // @2266 保护名单 → showProtected
+    void showCrownList(String groupId)                     { }   // 皇冠榜 → showCrownList (2026-06-14)
     void showWhitelist(String groupId)                     { }   // @2268 白名单 → showWhitelist
     void showGlobalBlacklist(String groupId)               { }   // @2269 全局黑名单 → showGlobalBlacklist
     void showGlobalWhitelist(String groupId)               { }   // @2270 全局白名单 → showGlobalWhitelist
@@ -155,10 +157,10 @@ void dispatchAction(String groupId, String sender, String target, String lastTok
     else if (lastTok.equals("警告详情"))                        { LEAF.warnDetail(groupId, target); }
     else if (lastTok.equals("管理员"))                          { LEAF.addAdmin(groupId, target, days); }
     else if (lastTok.equals("移除管理"))                        { LEAF.delAdmin(groupId, target); }
-    else if (lastTok.equals("保护"))                            { LEAF.protect(groupId, sender, target); }
-    else if (lastTok.equals("取消保护"))                        { LEAF.unprotect(groupId, sender, target); }
+    else if (lastTok.equals("保护") || lastTok.equals("潜水保护"))        { LEAF.protect(groupId, sender, target); }
+    else if (lastTok.equals("取消保护") || lastTok.equals("取消潜水保护")) { LEAF.unprotect(groupId, sender, target); }
     else if (lastTok.equals("白名单"))                          { LEAF.whitelist(groupId, sender, target); }
-    else if (lastTok.equals("移除白名单"))                      { LEAF.unwhitelist(groupId, sender, target); }
+    else if (lastTok.equals("移除白名单") || lastTok.equals("解除白名单")) { LEAF.unwhitelist(groupId, sender, target); }
     else if (lastTok.equals("群主"))                            { LEAF.addOwner(groupId, target); }
     else if (lastTok.equals("移除群主"))                        { LEAF.delOwner(groupId, target); }
     // v1.13: 微信原生角色登记
@@ -267,14 +269,14 @@ boolean routeCommand(String groupId, String sender, String content,
     // ---- 群管命令统一前置: 非管理员一律静默忽略 (@2233) ----
     boolean isCmd = content.equals("群管帮助") || content.equals("帮助 群管") ||
                     content.equals("黑名单") || content.equals("管理员") ||
-                    content.equals("警告名单") || content.equals("保护名单") ||
+                    content.equals("警告名单") || content.equals("保护名单") || content.equals("潜水保护名单") ||
                     content.equals("白名单") || content.equals("清除警告名单") ||
                     content.equals("全局黑名单") || content.equals("全局白名单") ||
                     content.startsWith("严格模式") || content.startsWith("警告上限") ||
                     content.startsWith("#潜水") || content.equals("潜水") ||
                     content.startsWith("#踢潜水") || content.startsWith("踢潜水") ||
                     content.equals("#群权限自检") || content.equals("群权限自检") ||
-                    content.startsWith("添加黑名单") || content.startsWith("去除黑名单") ||
+                    content.startsWith("添加黑名单") || content.startsWith("去除黑名单") || content.startsWith("解除黑名单") ||
                     content.startsWith("addsb ") || content.startsWith("delbk ") ||
                     content.startsWith("addwt ") || content.startsWith("delwt ") ||
                     content.startsWith("addgb ") || content.startsWith("delgb ") ||
@@ -288,9 +290,10 @@ boolean routeCommand(String groupId, String sender, String content,
     if (content.equals("黑名单")) { LEAF.showBlacklist(groupId); return true; }
     if (content.equals("管理员")) { LEAF.showAdmins(groupId); return true; }
     if (content.equals("警告名单")) { LEAF.showWarnList(groupId); return true; }
-    if (content.equals("保护名单")) { LEAF.showProtected(groupId); return true; }
+    if (content.equals("保护名单") || content.equals("潜水保护名单")) { LEAF.showProtected(groupId); return true; }
     // v1.12 查询
     if (content.equals("白名单")) { LEAF.showWhitelist(groupId); return true; }
+    if (content.equals("皇冠榜") || content.equals("👑榜")) { LEAF.showCrownList(groupId); return true; }   // 公开荣誉榜(任何成员可看), 2026-06-14
     if (content.equals("全局黑名单")) { LEAF.showGlobalBlacklist(groupId); return true; }
     if (content.equals("全局白名单")) { LEAF.showGlobalWhitelist(groupId); return true; }
     // v1.12 控制
@@ -316,7 +319,7 @@ boolean routeCommand(String groupId, String sender, String content,
         LEAF.addBlacklistByAt(groupId, sender, atList);
         return true;
     }
-    if (content.startsWith("去除黑名单")) {
+    if (content.startsWith("去除黑名单") || content.startsWith("解除黑名单")) {
         if (!_cmdAuthorized(groupId, sender)) return true;
         LEAF.removeBlacklist(groupId, sender, content, atList);
         return true;
@@ -391,7 +394,11 @@ boolean routeCommand(String groupId, String sender, String content,
     if (hasAt) {
         // ===== @ 路径 (@2372) =====
         if (!isAction) return false;
-        if (!_cmdAuthorized(groupId, sender)) return true;       // 非管理员/群主静默
+        if (!_cmdAuthorized(groupId, sender)) {
+            // 反向警告(用户 2026-06-14): 无权限者却用「警告」→ 警告他本人并说明理由; 其它动作仍静默。
+            if (lastTok.equals("警告")) { try { doWarn(groupId, HOST.getLoginWxid(), sender, "无管理权限却使用警告功能, 越权操作"); } catch (Throwable t) {} }
+            return true;       // 非管理员/群主: 其它动作静默
+        }
 
         // v1.17.2: 踢人若 @所有人 则拒绝 (@2381)。
         if (lastTok.equals("踢") || lastTok.equals("请")) {
@@ -447,7 +454,11 @@ boolean routeCommand(String groupId, String sender, String content,
     if (quoteTarget.isEmpty()) return false;
 
     // 权限/保护与 @ 路径完全相同: 先 isAuthorized 静默闸门, 再走 dispatchAction (内含 ownerOnly + canActOn)。
-    if (!_cmdAuthorized(groupId, sender)) return true;       // 非授权者引用发动作 → 静默拒绝
+    if (!_cmdAuthorized(groupId, sender)) {
+        // 反向警告(用户 2026-06-14): 引用「警告」无权限 → 警告本人并说明理由。
+        if (actionTok.equals("警告")) { try { doWarn(groupId, HOST.getLoginWxid(), sender, "无管理权限却使用警告功能, 越权操作"); } catch (Throwable t) {} }
+        return true;       // 非授权者引用发其它动作 → 静默拒绝
+    }
     dispatchAction(groupId, sender, quoteTarget, actionTok, qDays);
     return true;
 }

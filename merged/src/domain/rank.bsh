@@ -71,7 +71,26 @@ RANK_LURK_SQL =
     "SELECT wxid, last_speak FROM speak WHERE grp=? AND wxid<>? AND last_speak IS NOT NULL "
     + "ORDER BY last_speak ASC LIMIT 1";
 java.util.List rankLurkChampion(String grp, String exclWxid) {
-    return STORAGE.queryRows(RANK_LURK_SQL, new Object[]{ grp, (exclWxid == null ? "" : exclWxid) });
+    return rankLurkChampion(grp, exclWxid, null);
+}
+// exclList = 额外排除的 wxid 列表(潜水保护名单 protected_) → SQL `AND wxid NOT IN(...)`; 潜水保护者不上潜水榜(用户 2026-06-14)。
+//   动态占位与 binds 同步追加(RISK: 占位数必须==binds 数, 否则 SQL 绑定错位)。
+java.util.List rankLurkChampion(String grp, String exclWxid, java.util.List exclList) {
+    StringBuilder sql = new StringBuilder("SELECT wxid, last_speak FROM speak WHERE grp=? AND wxid<>? AND last_speak IS NOT NULL");
+    java.util.List binds = new java.util.ArrayList();
+    binds.add(grp);
+    binds.add(exclWxid == null ? "" : exclWxid);
+    if (exclList != null && !exclList.isEmpty()) {
+        sql.append(" AND wxid NOT IN (");
+        for (int i = 0; i < exclList.size(); i++) {
+            if (i > 0) sql.append(",");
+            sql.append("?");
+            binds.add((String) exclList.get(i));
+        }
+        sql.append(")");
+    }
+    sql.append(" ORDER BY last_speak ASC LIMIT 1");
+    return STORAGE.queryRows(sql.toString(), binds.toArray());
 }
 
 // 红包王: rp_record 表里(本群,排除机器人,窗口 [since,until))按发包条数 topN。返回 [0]=sender_wxid [1]=count(Long)。无则空。

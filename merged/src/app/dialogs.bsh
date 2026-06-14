@@ -272,7 +272,7 @@ void showGroupConfigDialog(String groupId) {
     root.addView(banBtn);
     _gaSpacer(root, ctx, 6 * dp);
 
-    android.widget.Button protBtn = _gaBtn(ctx, "🛡 保护名单 (" + pCount + ")", "#252934");
+    android.widget.Button protBtn = _gaBtn(ctx, "🛡 潜水保护名单 (" + pCount + ")", "#252934");
     protBtn.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
             if (dh[0] != null) dh[0].dismiss();
@@ -292,6 +292,28 @@ void showGroupConfigDialog(String groupId) {
         }
     });
     root.addView(wtBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    // 2026-06-14: 从群成员搜索, 静默加入皇冠榜 (= 白名单+潜水保护+列表置顶加冠)
+    android.widget.Button pickBtn = _gaBtn(ctx, "👑 添加皇冠榜成员", "#FFD166");
+    pickBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showMemberPicker(fGroupId);
+        }
+    });
+    root.addView(pickBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    int crownCount = getCrownList(groupId).size();
+    android.widget.Button crownBtn = _gaBtn(ctx, "👑 皇冠榜 (" + crownCount + ")", "#FFD166");
+    crownBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showCrownListDialog(fGroupId);
+        }
+    });
+    root.addView(crownBtn);
     _gaSpacer(root, ctx, 6 * dp);
 
     android.widget.Button warnBtn = _gaBtn(ctx, "⚠️ 警告名单 (" + wlCount + ")", "#252934");
@@ -455,7 +477,17 @@ void showAdminListDialog(String groupId) {
     root.addView(dayInp);
     _gaSpacer(root, ctx, 6 * dp);
 
-    android.widget.Button addBtn = _gaBtn(ctx, "➕ 添加本群管理员", "#5CB6FF");
+    android.widget.Button adminPickBtn = _gaBtn(ctx, "🔍 从群成员搜索添加 (推荐)", "#5CB6FF");
+    adminPickBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showMemberPicker(fGroupId, "admin");
+        }
+    });
+    root.addView(adminPickBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button addBtn = _gaBtn(ctx, "➕ 手动输入 wxid 添加", "#252934");
     addBtn.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
             String w = inp.getText().toString().trim();
@@ -468,7 +500,7 @@ void showAdminListDialog(String groupId) {
             } catch (Throwable t) { days = 0; }
             List l = getAdmins(fGroupId);
             if (!l.contains(w)) { l.add(w); setAdmins(fGroupId, l); }
-            if (days > 0) setAdminExpiry(fGroupId, w, System.currentTimeMillis() + (long) days * 86400000L);
+            if (days > 0) setAdminExpiry(fGroupId, w, CLOCK.now() + (long) days * 86400000L);   // 端口: CLOCK.now() (Santa)
             else clearAdminExpiry(fGroupId, w);
             toast(days > 0 ? ("已添加本群管理员 (" + days + "天)") : "已添加本群管理员");   // 永久不写(2026-06-14)
             if (dh[0] != null) dh[0].dismiss();
@@ -659,6 +691,298 @@ void showBanListDialog(String groupId) {
     dh[0].show();
 }
 
+// ============================================================
+// 成员搜索选择器 (用户 2026-06-14): 从群成员搜昵称/群名片 → 点选静默加入皇冠榜(白名单+潜水保护)。
+//   后台线程 HOST.getGroupMemberList + lookupName 建 roster(防 ANR §7) → 主线程搜索框过滤(只渲染匹配)→
+//   点「加入」即写 wt_+protected_(dedup) + toast, 零群消息。大群(几百人)靠搜索过滤不渲染全量。
+// ============================================================
+// 选择器按 kind 静默加人: crown=皇冠榜(+白+保护) / admin=管理员(永久) / whitelist=白名单 / protected=潜水保护。
+void _addPickerPerson(String groupId, String wxid, String kind) {
+    try {
+        if (kind.equals("crown")) {
+            java.util.List cl = getCrownList(groupId); if (!cl.contains(wxid)) { cl.add(wxid); setCrownList(groupId, cl); }
+            java.util.List wl = getWhitelist(groupId); if (!wl.contains(wxid)) { wl.add(wxid); setWhitelist(groupId, wl); }
+            java.util.List pl = getProtected(groupId); if (!pl.contains(wxid)) { pl.add(wxid); setProtected(groupId, pl); }
+        } else if (kind.equals("admin")) {
+            java.util.List a = getAdmins(groupId); if (!a.contains(wxid)) { a.add(wxid); setAdmins(groupId, a); }
+            try { clearAdminExpiry(groupId, wxid); } catch (Throwable t) {}   // 选择器加 = 永久
+            try { java.util.List _wl = getWhitelist(groupId); if (_wl.remove(wxid)) setWhitelist(groupId, _wl); } catch (Throwable t) {}   // 管理员自动去白名单
+        } else if (kind.equals("whitelist")) {
+            if (isAdminInGroup(groupId, wxid)) return;   // 已是管理员不用加白名单(本就免罚)
+            java.util.List wl = getWhitelist(groupId); if (!wl.contains(wxid)) { wl.add(wxid); setWhitelist(groupId, wl); }
+        } else if (kind.equals("protected")) {
+            java.util.List pl = getProtected(groupId); if (!pl.contains(wxid)) { pl.add(wxid); setProtected(groupId, pl); }
+        }
+    } catch (Throwable t) {}
+}
+java.util.List _pickerList(String groupId, String kind) {
+    try {
+        if (kind.equals("crown")) return getCrownList(groupId);
+        if (kind.equals("admin")) return getAdmins(groupId);
+        if (kind.equals("whitelist")) return getWhitelist(groupId);
+        if (kind.equals("protected")) return getProtected(groupId);
+    } catch (Throwable t) {}
+    return new java.util.ArrayList();
+}
+String _pickerTitle(String kind) {
+    if (kind.equals("crown")) return "👑 添加皇冠榜成员";
+    if (kind.equals("admin")) return "🛡 添加管理员";
+    if (kind.equals("whitelist")) return "✅ 添加白名单成员";
+    if (kind.equals("protected")) return "🛡 添加潜水保护成员";
+    return "添加成员";
+}
+String _pickerAddedMsg(String kind) {
+    if (kind.equals("crown")) return "👑 已加入皇冠榜: ";
+    if (kind.equals("admin")) return "🛡 已设为管理员: ";
+    if (kind.equals("whitelist")) return "✅ 已加入白名单: ";
+    if (kind.equals("protected")) return "🛡 已加入潜水保护: ";
+    return "已添加: ";
+}
+
+// 单行构建(含点选回调) —— 抽成顶层函数: onClick 捕获的是函数参数(BeanShell 可靠捕获),
+//   不是 loop-local final(在 Runnable→loop 深层嵌套里 BeanShell 捕获不稳 → 之前"点击没反应"的根因)。
+android.widget.LinearLayout _pickerRow(Activity ctx, String groupId, String main, String sub, String wxid, String kind, boolean already) {
+    final String fG = groupId; final String fW = wxid; final String fMain = main; final String fKind = kind; final boolean fAd = already;
+    android.widget.LinearLayout row = _gaRow(ctx, main, sub, already ? "✓已加" : "加入", already ? "#3A3F4B" : "#5CB6FF");
+    final android.view.View act = row.getChildAt(1);
+    act.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (fAd) return;
+            _addPickerPerson(fG, fW, fKind);
+            toast(_pickerAddedMsg(fKind) + fMain);
+            try { ((android.widget.TextView) act).setText("✓已加"); } catch (Throwable t) {}
+        }
+    });
+    return row;
+}
+
+void showMemberPicker(String groupId) { showMemberPicker(groupId, "crown"); }
+void showMemberPicker(String groupId, String kind) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+    if (groupId == null || !groupId.contains("@chatroom")) { toast("无效群 (需群聊)"); return; }
+    final String fG = groupId;
+    final String fKind = kind;
+    toast("⏳ 加载群成员中…");
+    new Thread(new Runnable() {
+        public void run() {
+            final java.util.List roster = new java.util.ArrayList();   // Object[]{name, wxid}
+            try {
+                java.util.List mem = HOST.getGroupMemberList(fG);
+                if (mem != null) {
+                    for (int i = 0; i < mem.size(); i++) {
+                        String w = (String) mem.get(i);
+                        if (w == null || w.isEmpty()) continue;
+                        String gn = ""; try { String x = getFriendDisplayName(w, fG); if (x != null) gn = x.trim(); } catch (Throwable t) {}
+                        String nk = ""; try { String x = getFriendNickName(w); if (x != null) nk = x.trim(); } catch (Throwable t) {}
+                        if (gn.isEmpty() && nk.isEmpty()) { try { String x = HOST.lookupName(w, fG); if (x != null && !x.isEmpty()) nk = x; } catch (Throwable t) {} }
+                        roster.add(new Object[]{ gn, nk, w });   // 群名片, 微信昵称, wxid
+                    }
+                }
+            } catch (Throwable t) {}
+            try {
+                ctx.runOnUiThread(new Runnable() {
+                    public void run() {
+                        if (roster.isEmpty()) { toast("拿不到群成员列表"); return; }
+                        _showMemberPickerDialog(ctx, fG, roster, fKind);
+                    }
+                });
+            } catch (Throwable t) {}
+        }
+    }).start();
+}
+
+void _showMemberPickerDialog(Activity ctx, String groupId, java.util.List roster, String kind) {
+    final Activity fCtx = ctx;
+    final String fG = groupId;
+    final String fKind = kind;
+    final java.util.List fRoster = roster;
+    final int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText(_pickerTitle(kind) + " · " + fRoster.size() + " 人");
+    title.setTextColor(_gaC("#E8E9EC")); title.setTextSize(15);
+    title.setPadding(0, 0, 0, 8 * dp);
+    root.addView(title);
+
+    final android.widget.EditText search = new android.widget.EditText(ctx);
+    search.setHint("输入昵称 / 群名片 搜索");
+    search.setTextColor(_gaC("#E8E9EC")); search.setHintTextColor(_gaC("#7C828E"));
+    search.setTextSize(14); search.setSingleLine(true);
+    root.addView(search);
+
+    final android.widget.LinearLayout results = new android.widget.LinearLayout(ctx);
+    results.setOrientation(android.widget.LinearLayout.VERTICAL);
+    results.setPadding(0, 8 * dp, 0, 0);
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(results);
+    sv.setLayoutParams(new android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 360 * dp));
+    root.addView(sv);
+
+    final Runnable[] renderHolder = new Runnable[1];
+    renderHolder[0] = new Runnable() {
+        public void run() {
+            results.removeAllViews();
+            String kw = search.getText().toString().trim();
+            if (kw.isEmpty()) {
+                android.widget.TextView hint = new android.widget.TextView(fCtx);
+                hint.setText("输入昵称或群名片关键词搜索成员"); hint.setTextColor(_gaC("#7C828E")); hint.setTextSize(13);
+                results.addView(hint); return;
+            }
+            // 一次性读目标名单(避免每行 FUSE getString ~26ms; reviewer C1)。已在目标名单=已加。
+            java.util.List _cl = null;
+            try { _cl = _pickerList(fG, fKind); } catch (Throwable t) {}
+            final java.util.List fCl = _cl;
+            int shown = 0;
+            for (int i = 0; i < fRoster.size() && shown < 30; i++) {
+                Object[] r = (Object[]) fRoster.get(i);
+                String gn = (String) r[0];   // 群名片
+                String nk = (String) r[1];   // 微信昵称
+                String w = (String) r[2];    // wxid
+                if (gn.indexOf(kw) < 0 && nk.indexOf(kw) < 0) continue;   // 群名片 或 微信名 命中即显示
+                shown++;
+                String main = !gn.isEmpty() ? gn : (!nk.isEmpty() ? nk : w);
+                String tail = w.length() > 4 ? w.substring(w.length() - 4) : w;
+                StringBuilder sb2 = new StringBuilder();
+                // 主行=群名片(优先); 副行显微信名(区分同名片的人)+wxid 尾4
+                if (!gn.isEmpty() && !nk.isEmpty() && !nk.equals(gn)) sb2.append("微信名: ").append(nk).append("  ·  ");
+                sb2.append("…").append(tail);
+                boolean ad = false;
+                try { ad = (fCl != null && fCl.contains(w)); } catch (Throwable t) {}
+                results.addView(_pickerRow(fCtx, fG, main, sb2.toString(), w, fKind, ad));
+            }
+            if (shown == 0) {
+                android.widget.TextView none = new android.widget.TextView(fCtx);
+                none.setText("无匹配成员"); none.setTextColor(_gaC("#7C828E")); none.setTextSize(13);
+                results.addView(none);
+            } else if (shown >= 30) {
+                android.widget.TextView more = new android.widget.TextView(fCtx);
+                more.setText("(仅显示前 30 个匹配, 关键词再精确些)"); more.setTextColor(_gaC("#7C828E")); more.setTextSize(12);
+                results.addView(more);
+            }
+        }
+    };
+    search.addTextChangedListener(new android.text.TextWatcher() {
+        public void afterTextChanged(android.text.Editable e) { try { renderHolder[0].run(); } catch (Throwable t) {} }
+        public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+        public void onTextChanged(CharSequence s, int a, int b, int c) {}
+    });
+    renderHolder[0].run();
+
+    android.widget.ScrollView outer = new android.widget.ScrollView(ctx);
+    outer.addView(root);
+    outer.setBackground(_gaRound("#0F1115", 0));
+    new AlertDialog.Builder(ctx).setView(outer).setNegativeButton("关闭", null).create().show();
+}
+
+// 名单行(皇冠榜/潜水保护/白名单 共用): wxid 作函数参数 → BeanShell 可靠捕获。
+//   修 bug: loop-local `final wxid` 在匿名 onClick 里被按命名空间引用捕获(非按值), 点哪行都操作最后一行的人(用户 2026-06-14 实测取消👑删错人)。
+//   kind: crown(取消👑=完整移除crown+白+保护) / protected(取消潜水保护, 皇冠成员挡) / whitelist(移除, 皇冠成员挡)。
+android.widget.LinearLayout _nameRow(Activity ctx, String groupId, String wxid, String kind, AlertDialog[] dh) {
+    final String fG = groupId; final String fW = wxid; final String fKind = kind; final AlertDialog[] fdh = dh;
+    boolean crown = false; try { crown = isCrown(groupId, wxid); } catch (Throwable t) {}
+    String nm = crownName(HOST.lookupName(wxid, groupId), crown);
+    String label; String color;
+    if (fKind.equals("crown")) { label = "取消👑"; color = "#FF6B6B"; }
+    else if (fKind.equals("protected")) { label = "取消潜水保护"; color = "#FFD166"; }
+    else { label = "移除"; color = "#7C828E"; }
+    android.widget.LinearLayout row = _gaRow(ctx, nm, wxid, label, color);
+    final android.view.View act = row.getChildAt(1);
+    act.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            try {
+                if (fKind.equals("crown")) {
+                    List c = getCrownList(fG); c.remove(fW); setCrownList(fG, c);
+                    List w2 = getWhitelist(fG); if (w2.remove(fW)) setWhitelist(fG, w2);
+                    List p2 = getProtected(fG); if (p2.remove(fW)) setProtected(fG, p2);
+                    toast("已移出皇冠榜 (含白名单+潜水保护)");
+                    if (fdh[0] != null) fdh[0].dismiss();
+                    showCrownListDialog(fG);
+                } else if (fKind.equals("protected")) {
+                    if (isCrown(fG, fW)) { toast("👑 皇冠榜成员，请到「👑 皇冠榜」里取消👑 移除"); return; }
+                    List p = getProtected(fG); p.remove(fW); setProtected(fG, p);
+                    toast("已取消潜水保护");
+                    if (fdh[0] != null) fdh[0].dismiss();
+                    showProtectedListDialog(fG);
+                } else {
+                    if (isCrown(fG, fW)) { toast("👑 皇冠榜成员，请到「👑 皇冠榜」里取消👑 移除"); return; }
+                    List l = getWhitelist(fG); l.remove(fW); setWhitelist(fG, l);
+                    toast("已移除");
+                    if (fdh[0] != null) fdh[0].dismiss();
+                    showWhitelistDialog(fG);
+                }
+            } catch (Throwable t) { toast("操作失败"); }
+        }
+    });
+    return row;
+}
+
+// ---- 皇冠榜 子 Dialog (用户 2026-06-14): 查看/管理 crown_ 名单 + 改底部说明; 取消👑 = 完整移除(crown+白名单+潜水保护, 唯一移除入口) ----
+void showCrownListDialog(String groupId) {
+    Activity ctx = getTopActivity();
+    if (ctx == null) return;
+    final String fGroupId = groupId;
+    final AlertDialog[] dh = new AlertDialog[1];
+    List cl = getCrownList(groupId);
+    int dp = (int) ctx.getResources().getDisplayMetrics().density;
+
+    android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+    root.setOrientation(android.widget.LinearLayout.VERTICAL);
+    root.setPadding(16 * dp, 16 * dp, 16 * dp, 16 * dp);
+    root.setBackground(_gaRound("#0F1115", 0));
+
+    android.widget.TextView title = new android.widget.TextView(ctx);
+    title.setText("👑 皇冠榜 · " + cl.size() + " 人");
+    title.setTextColor(_gaC("#E8E9EC")); title.setTextSize(16); title.setPadding(0, 0, 0, 12 * dp);
+    root.addView(title);
+
+    // 皇冠榜说明(可改): 发「皇冠榜」命令时显示在底部小字
+    final android.widget.EditText noteInp = new android.widget.EditText(ctx);
+    noteInp.setText(getCrownNote(fGroupId));
+    noteInp.setTextColor(_gaC("#E8E9EC")); noteInp.setHintTextColor(_gaC("#7C828E"));
+    noteInp.setTextSize(12); noteInp.setSingleLine(true);
+    noteInp.setHint("皇冠榜说明(发「皇冠榜」时底部显示)");
+    root.addView(noteInp);
+    android.widget.Button noteSave = _gaBtn(ctx, "💾 保存说明", "#5CB6FF");
+    noteSave.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            setCrownNote(fGroupId, noteInp.getText().toString().trim());
+            toast("已保存皇冠榜说明");
+        }
+    });
+    root.addView(noteSave);
+    _gaSpacer(root, ctx, 12 * dp);
+
+    if (cl.isEmpty()) {
+        android.widget.TextView empty = new android.widget.TextView(ctx);
+        empty.setText("皇冠榜暂无成员\n请到上一页「👑 添加皇冠榜成员」从群里添加");
+        empty.setTextColor(_gaC("#7C828E")); empty.setTextSize(13); empty.setPadding(0, 12 * dp, 0, 12 * dp);
+        root.addView(empty);
+    } else {
+        for (int i = 0; i < cl.size(); i++) {
+            root.addView(_nameRow(ctx, groupId, (String) cl.get(i), "crown", dh));
+            _gaSpacer(root, ctx, 6 * dp);
+        }
+    }
+
+    android.widget.Button back = _gaBtn(ctx, "← 返回", "#252934");
+    back.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) { if (dh[0] != null) dh[0].dismiss(); showGroupConfigDialog(fGroupId); }
+    });
+    root.addView(back);
+
+    android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+    sv.addView(root);
+    sv.setBackground(_gaRound("#0F1115", 0));
+    dh[0] = new AlertDialog.Builder(ctx).setView(sv).create();
+    dh[0].show();
+}
+
 // ---- 保护名单子 Dialog ----
 void showProtectedListDialog(String groupId) {
     Activity ctx = getTopActivity();
@@ -675,35 +999,33 @@ void showProtectedListDialog(String groupId) {
     root.setBackground(_gaRound("#0F1115", 0));
 
     android.widget.TextView title = new android.widget.TextView(ctx);
-    title.setText("🛡 保护名单 (" + pl.size() + " 人)");
+    title.setText("🛡 潜水保护名单 (" + pl.size() + " 人)");
     title.setTextColor(_gaC("#E8E9EC"));
     title.setTextSize(16);
     title.setPadding(0, 0, 0, 12 * dp);
     root.addView(title);
 
+    android.widget.Button protPickBtn = _gaBtn(ctx, "🔍 从群成员搜索添加", "#5CB6FF");
+    protPickBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showMemberPicker(fGroupId, "protected");
+        }
+    });
+    root.addView(protPickBtn);
+    _gaSpacer(root, ctx, 8 * dp);
+
     if (pl.isEmpty()) {
         android.widget.TextView empty = new android.widget.TextView(ctx);
-        empty.setText("本群无保护名单");
+        empty.setText("本群无潜水保护名单");
         empty.setTextColor(_gaC("#7C828E"));
         empty.setTextSize(13);
         empty.setPadding(0, 12 * dp, 0, 12 * dp);
         root.addView(empty);
     } else {
-        for (int i = 0; i < pl.size(); i++) {
-            final String wxid = (String) pl.get(i);
-            android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(wxid, fGroupId), wxid, "取消保护", "#FFD166");
-            android.view.View act = row.getChildAt(1);
-            act.setOnClickListener(new android.view.View.OnClickListener() {
-                public void onClick(android.view.View v) {
-                    List p = getProtected(fGroupId);
-                    p.remove(wxid);
-                    HOST.putString("protected_" + fGroupId, joinCsv(p));
-                    toast("已取消保护");
-                    if (dh[0] != null) dh[0].dismiss();
-                    showProtectedListDialog(fGroupId);
-                }
-            });
-            root.addView(row);
+        java.util.List _ps = crownSort(groupId, pl);   // 皇冠榜置顶
+        for (int i = 0; i < _ps.size(); i++) {
+            root.addView(_nameRow(ctx, groupId, (String) _ps.get(i), "protected", dh));
             _gaSpacer(root, ctx, 6 * dp);
         }
     }
@@ -943,6 +1265,16 @@ void showWhitelistDialog(String groupId) {
     title.setPadding(0, 0, 0, 6 * dp);
     root.addView(title);
 
+    android.widget.Button wtPickBtn = _gaBtn(ctx, "🔍 从群成员搜索添加", "#5CB6FF");
+    wtPickBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showMemberPicker(fGroupId, "whitelist");
+        }
+    });
+    root.addView(wtPickBtn);
+    _gaSpacer(root, ctx, 8 * dp);
+
     android.widget.TextView hint = new android.widget.TextView(ctx);
     hint.setText("白名单成员免警告 + 免进群黑名单检测");
     hint.setTextColor(_gaC("#7C828E"));
@@ -958,21 +1290,9 @@ void showWhitelistDialog(String groupId) {
         empty.setPadding(0, 12 * dp, 0, 12 * dp);
         root.addView(empty);
     } else {
-        for (int i = 0; i < wt.size(); i++) {
-            final String wxid = (String) wt.get(i);
-            android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(wxid, fGroupId), wxid, "移除", "#7C828E");
-            android.view.View act = row.getChildAt(1);
-            act.setOnClickListener(new android.view.View.OnClickListener() {
-                public void onClick(android.view.View v) {
-                    List l = getWhitelist(fGroupId);
-                    l.remove(wxid);
-                    setWhitelist(fGroupId, l);
-                    toast("已移除");
-                    if (dh[0] != null) dh[0].dismiss();
-                    showWhitelistDialog(fGroupId);
-                }
-            });
-            root.addView(row);
+        java.util.List _ws = crownSort(groupId, wt);   // 皇冠榜置顶
+        for (int i = 0; i < _ws.size(); i++) {
+            root.addView(_nameRow(ctx, groupId, (String) _ws.get(i), "whitelist", dh));
             _gaSpacer(root, ctx, 6 * dp);
         }
     }
