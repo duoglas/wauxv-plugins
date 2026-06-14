@@ -193,9 +193,10 @@ void doAddAdmin(String groupId, String target, int days) {
     // v1.17.0: days>0 → 设到期; days<=0 → 永久 (清除可能残留的旧时效)
     if (days > 0) setAdminExpiry(groupId, target, CLOCK.now() + (long) days * 86400000L);
     else clearAdminExpiry(groupId, target);
+    // 永久不写, 有期限才缀 (用户 2026-06-14)
     String suffix;
     if (days > 0) suffix = " (" + days + "天, " + adminExpiryLabel(groupId, target) + ")";
-    else suffix = " (永久)";
+    else suffix = "";
     HOST.sendText(groupId, "🛡 已加为管理员: " + HOST.lookupName(target, groupId) + suffix);
 }
 

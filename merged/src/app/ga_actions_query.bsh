@@ -164,8 +164,11 @@ void showAdmins(String groupId) {
         sb.append("\n🛡 管理员:\n");
         for (int i = 0; i < admins.size(); i++) {
             String aw = (String) admins.get(i);
-            sb.append("· ").append(HOST.lookupName(aw, groupId))
-              .append(" (").append(adminExpiryLabel(groupId, aw)).append(")\n");
+            sb.append("· ").append(HOST.lookupName(aw, groupId));
+            // 永久不写, 有期限才缀 (用户 2026-06-14)
+            String _exp = adminExpiryLabelOrNull(groupId, aw);
+            if (_exp != null) sb.append(" (").append(_exp).append(")");
+            sb.append("\n");
         }
     }
     HOST.sendText(groupId, sb.toString());

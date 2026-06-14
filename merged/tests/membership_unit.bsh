@@ -28,4 +28,15 @@ FAKE_NATIVE.put("test@chatroom", "native2");
 check("10 自动检测原生群主也不能动 owner1→native2", canActOn(gid, "owner1", "native2") == false);
 FAKE_NATIVE.clear();   // 用完清掉
 
+// ---- adminExpiryLabelOrNull: 永久→null / 有期限→"有效期至 X" / 边界 exp<=0→null (用户 2026-06-14) ----
+check("11 永久(无到期记录) → null", adminExpiryLabelOrNull(gid, "admin1") == null);
+setAdminExpiry(gid, "admin2", 4102444800000L);   // 固定未来 ms(约 2100 年)
+String _lbl = adminExpiryLabelOrNull(gid, "admin2");
+check("12 有期限 → 非 null", _lbl != null);
+check("13 有期限 → 含『有效期至』", _lbl != null && _lbl.indexOf("有效期至") >= 0);
+check("14 旧 adminExpiryLabel 永久仍返『永久』(未改语义)", "永久".equals(adminExpiryLabel(gid, "admin1")));
+setAdminExpiry(gid, "admin2", 0L);   // 边界: exp<=0 视为永久
+check("15 边界 exp=0 → null", adminExpiryLabelOrNull(gid, "admin2") == null);
+clearAdminExpiry(gid, "admin2");   // 还原
+
 done();

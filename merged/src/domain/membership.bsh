@@ -215,6 +215,15 @@ String adminExpiryLabel(String groupId, String wxid) {
         return "有效期至 " + d;
     } catch (Throwable t) { return "永久"; }
 }
+// 显示标签(永久不写法): 永久(exp<=0/无记录) → null; 有期限 → "有效期至 yyyy-MM-dd"。
+//   各文字输出点据此条件拼接: null 不缀任何后缀, 非 null 才按各自分隔符显示(用户 2026-06-14: 永久不特意写)。
+String adminExpiryLabelOrNull(String groupId, String wxid) {
+    try {
+        long exp = getAdminExpiry(groupId, wxid);
+        if (exp <= 0L) return null;
+        return "有效期至 " + new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date(exp));
+    } catch (Throwable t) { return null; }
+}
 // 惰性到期清除: 遍历 getAdmins, 对有 exp 且已过期者 → 从 admins 移除 + clearAdminExpiry, 变更则落盘。
 // 静默 (不发群消息)。★ 只在管理相关函数入口调用, 绝不进每条消息热路径 (C-PERF-01)。
 void purgeExpiredAdmins(String groupId) {

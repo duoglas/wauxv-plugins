@@ -365,8 +365,9 @@ android.widget.LinearLayout _adminRow(Activity ctx, String groupId, String wxid,
     final String fGroupId = groupId;
     final String fWxid = wxid;
     final AlertDialog[] fDh = dh;
-    // v1.17.0: 副标题显示 失效日期/永久 (替代原来只显示 wxid; wxid 仍拼在前)
-    String sub = fWxid + " · " + adminExpiryLabel(fGroupId, fWxid);
+    // v1.17.0: 副标题显示 失效日期; 永久不写, 有期限才缀 (用户 2026-06-14)
+    String _exp = adminExpiryLabelOrNull(fGroupId, fWxid);
+    String sub = (_exp != null) ? (fWxid + " · " + _exp) : fWxid;
     android.widget.LinearLayout row = _gaRow(ctx, HOST.lookupName(fWxid, fGroupId), sub, "移除", "#FF6B6B");
     android.view.View act = row.getChildAt(1);
     act.setOnClickListener(new android.view.View.OnClickListener() {
@@ -469,7 +470,7 @@ void showAdminListDialog(String groupId) {
             if (!l.contains(w)) { l.add(w); setAdmins(fGroupId, l); }
             if (days > 0) setAdminExpiry(fGroupId, w, System.currentTimeMillis() + (long) days * 86400000L);
             else clearAdminExpiry(fGroupId, w);
-            toast(days > 0 ? ("已添加本群管理员 (" + days + "天)") : "已添加本群管理员 (永久)");
+            toast(days > 0 ? ("已添加本群管理员 (" + days + "天)") : "已添加本群管理员");   // 永久不写(2026-06-14)
             if (dh[0] != null) dh[0].dismiss();
             showAdminListDialog(fGroupId);
         }
