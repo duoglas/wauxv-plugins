@@ -3,7 +3,7 @@
 // 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md (LLM 增量)
 // 协议: 标准 Chat Completions —— POST {url}{path}, Authorization: Bearer {key}, body{model,messages}, 解析 choices[0].message.content。
 //
-// ★设备缝: 用 java.net.HttpURLConnection(always-present, 免 okhttp 类加载) + org.json(Android 自带)。
+// ★设备缝: HTTP 用 okhttp3(微信进程自带, 兄弟「自动回复配置版」验证可用; HttpURLConnection 在微信进程上下文疑似被卡) + org.json(Android 自带)。
 //   org.json 在 bsh-2.0b6 本地测试 classpath 不存在 → 本片**绝不被单测 source**(会 ClassNotFound), 靠 L4 真机验;
 //   解析门(bsh.Parser 去 final)只查语法不解析类 → 可过(同既有 android.* 引用)。
 // ★安全红线(C-SEC): API key 只存设备 config.prop(ga_llm_key), 从兄弟插件「自动回复配置版」seed; 绝不入源码/git/日志。
@@ -15,32 +15,36 @@
 // ============================================================
 
 // 底层 HTTP POST(设备缝)。成功(2xx)返响应体, 否则/异常返 null。绝不抛。
+//   ★用 okhttp3(微信进程自带, 兄弟「自动回复配置版」验证可用) —— HttpURLConnection 在微信进程上下文疑似被卡(无响应/静默失败)。
+//   诊断日志: 失败记 http code / 异常类(okhttp 异常不含 Authorization header, 不泄漏 key); 读超时 60s 容推理模型。
 String _llmHttpPost(String urlStr, String apiKey, String jsonBody) {
-    java.net.HttpURLConnection conn = null;
     try {
-        java.net.URL u = new java.net.URL(urlStr);
-        conn = (java.net.HttpURLConnection) u.openConnection();
-        conn.setRequestMethod("POST");
-        conn.setConnectTimeout(10000);
-        conn.setReadTimeout(15000);
-        conn.setDoOutput(true);
-        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-        java.io.OutputStream os = conn.getOutputStream();
-        try { os.write(jsonBody.getBytes("UTF-8")); os.flush(); } finally { os.close(); }
-        int code = conn.getResponseCode();
-        java.io.InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
-        if (is == null) return null;
-        java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(is, "UTF-8"));
-        StringBuilder sb = new StringBuilder();
-        String line;
-        try { while ((line = br.readLine()) != null) sb.append(line); } finally { br.close(); }
-        if (code < 200 || code >= 300) return null;   // 非 2xx 视为失败
-        return sb.toString();
+        okhttp3.OkHttpClient client = new okhttp3.OkHttpClient.Builder()
+            .connectTimeout(10L, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(60L, java.util.concurrent.TimeUnit.SECONDS)
+            .build();
+        okhttp3.RequestBody body = okhttp3.RequestBody.create(
+            okhttp3.MediaType.parse("application/json; charset=utf-8"), jsonBody);
+        okhttp3.Request req = new okhttp3.Request.Builder()
+            .url(urlStr)
+            .addHeader("Authorization", "Bearer " + apiKey)
+            .post(body)
+            .build();   // Content-Type 由 RequestBody 的 MediaType 自动带, 不重复 addHeader
+        okhttp3.Response resp = client.newCall(req).execute();
+        try {
+            int code = resp.code();
+            if (code < 200 || code >= 300) {
+                try { log("llm http code=" + code); } catch (Throwable t2) {}
+                return null;
+            }
+            okhttp3.ResponseBody rb = resp.body();
+            return (rb == null) ? null : rb.string();
+        } finally {
+            try { resp.close(); } catch (Throwable t3) {}
+        }
     } catch (Throwable t) {
+        try { log("llm http err: " + t); } catch (Throwable t2) {}
         return null;
-    } finally {
-        try { if (conn != null) conn.disconnect(); } catch (Throwable t2) {}
     }
 }
 

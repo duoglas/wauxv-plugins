@@ -107,10 +107,12 @@ String RANK_POLISH_SYS = "你是群「群龙榜」的毒舌主持人。我给你
 String rankLlmPolish(String board) {
     try {
         if (board == null) return null;
-        if (!llmEnabled()) return board;
+        if (!llmEnabled()) { try { log("rank polish: disabled(no key/off)"); } catch (Throwable t2) {} return board; }
         String out = llmChat(RANK_POLISH_SYS, board);
-        return (out != null && out.trim().length() > 0) ? out : board;
-    } catch (Throwable t) { return board; }
+        boolean ok = (out != null && out.trim().length() > 0);
+        try { log("rank polish: " + (ok ? ("ok len=" + out.length()) : "fallback(null/empty)")); } catch (Throwable t2) {}
+        return ok ? out : board;
+    } catch (Throwable t) { try { log("rank polish err: " + t); } catch (Throwable t2) {} return board; }
 }
 
 // 手动出榜入口(命令调): 后台线程构建 + (可选)LLM 润色 + 发群。

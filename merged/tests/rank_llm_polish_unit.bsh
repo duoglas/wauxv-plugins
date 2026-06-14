@@ -2,6 +2,7 @@
 // 在 source rank_render 前定义可控桩; rankLlmPolish 调用时解析到桩。运行 cwd = merged/。
 source("tests/_harness.bsh");
 
+void log(String s) {}   // WAuxiliary 注入的 log 在测试环境无, 置桩(rankLlmPolish 诊断日志用)
 boolean FAKE_LLM_ENABLED = false;
 String FAKE_LLM_RESULT = null;
 boolean llmEnabled() { return FAKE_LLM_ENABLED; }
