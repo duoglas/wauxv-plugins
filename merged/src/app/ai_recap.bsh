@@ -1,0 +1,68 @@
+// ============================================================
+// app/ai_recap — AI 群聊点评/锐评: 取 chat_recent 转录 + 排行榜摘要 → LLM 生成锐评 → 发本群。
+// 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md (AI 点评增量)
+// 依赖: domain/chat_recent.bsh(chatRecentQuery) + app/rank_render.bsh(_rankName/rankBuildBoard/_rankTodayStart) + app/llm.bsh(llmChat) + 全局 HOST。
+//
+// 红线: 出点评全后台线程(转录+LLM 不上消息热路径); 失败/无 key/消息太少 → 友好提示不卡; 转录/content 绝不写日志; key 不入源码。
+//   风格 = 可配置 system prompt(键 ga_llm_recap_system, onLoad 可 seed); 默认机智吐槽(不人身攻击/不涉黄/不造谣)。
+// ============================================================
+
+String DEFAULT_RECAP_SYS = "你是群聊的吐槽役主持人。我给你今天这个群的聊天记录(格式 发言人: 内容)和排行榜数据。请写一段简短、有梗、机智吐槽风格的「今日群聊锐评」: ① 基于真实记录点出群里今天的热闹/趣事/谁在刷屏(可俏皮调侃, 但不得人身攻击、不涉黄赌毒、不造谣编造); ② 结合排行榜数据(话痨王等)收个尾; ③ 简短适合群里直接发, 只输出锐评正文, 不要解释或前后缀。";
+
+String recapSystemPrompt() {
+    try { String s = HOST.getString("ga_llm_recap_system", "").trim(); if (s.length() > 0) return s; } catch (Throwable t) {}
+    return DEFAULT_RECAP_SYS;
+}
+
+boolean recapHasKey() {
+    try { return HOST.getString("ga_llm_key", "").trim().length() > 0; } catch (Throwable t) { return false; }
+}
+
+// 构建喂 LLM 的 user prompt: 转录(最近≤300条, 字符预算≤6000) + 排行榜摘要。消息太少(<5)返 null。
+String recapBuildPrompt(String groupId, long sinceTs, long untilTs) {
+    java.util.List rows = chatRecentQuery(groupId, sinceTs, untilTs, 300);
+    if (rows == null || rows.size() < 5) return null;   // 消息太少不点评
+    StringBuilder sb = new StringBuilder();
+    sb.append("【今日群聊记录】(发言人: 内容)\n");
+    int budget = 6000;
+    for (int i = 0; i < rows.size(); i++) {
+        Object[] r = (Object[]) rows.get(i);
+        String nm = _rankName((String) r[0], groupId);
+        String line = nm + ": " + ((r[2] == null) ? "" : r[2].toString()) + "\n";
+        if (sb.length() + line.length() > budget) break;
+        sb.append(line);
+    }
+    try {
+        String board = rankBuildBoard(groupId, sinceTs, untilTs);
+        if (board != null) sb.append("\n【排行榜数据】\n").append(board);
+    } catch (Throwable t) {}
+    return sb.toString();
+}
+
+// 生成锐评文本(可测: 桩 llmChat)。无转录/LLM 失败 → null。
+String aiRecapText(String groupId, long sinceTs, long untilTs) {
+    String prompt = recapBuildPrompt(groupId, sinceTs, untilTs);
+    if (prompt == null) return null;
+    return llmChat(recapSystemPrompt(), prompt);
+}
+
+// 命令入口: 后台线程生成 + 发本群。
+void aiRecapShow(String groupId, String content) {
+    try {
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    if (!recapHasKey()) { try { HOST.sendText(groupId, "🤖 AI 点评需先配置大模型 key (设置里 LLM 配置)"); } catch (Throwable t) {} return; }
+                    String txt = aiRecapText(groupId, _rankTodayStart(), Long.MAX_VALUE);
+                    if (txt == null || txt.trim().length() == 0) {
+                        try { HOST.sendText(groupId, "📝 今日消息太少或点评没生成出来 (本群需先开「AI点评」并攒点聊天记录)"); } catch (Throwable t) {}
+                        return;
+                    }
+                    HOST.sendText(groupId, txt);
+                } catch (Throwable t) {
+                    try { HOST.sendText(groupId, "AI 点评生成失败"); } catch (Throwable t2) {}
+                }
+            }
+        }).start();
+    } catch (Throwable t) {}
+}

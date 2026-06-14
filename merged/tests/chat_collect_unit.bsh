@@ -1,0 +1,78 @@
+// L1 单测: app/chat_collect —— recap 单群门(默认OFF) + 缓冲/content截断/flush(批量+prune)/降级。
+// fake HOST(KV)+CLOCK + fake STORAGE(记 exec/execBatch)。运行 cwd = merged/。
+source("tests/_harness.bsh");
+source("tests/fakes/host_fake.bsh");
+source("tests/fakes/storage_fake.bsh");
+source("src/domain/membership.bsh");
+source("src/domain/chat_recent.bsh");      // SQL 常量 + insertBatch/prune
+source("src/app/chat_collect.bsh");
+
+String G = "g@chatroom";
+
+// ---- 1) recap 门默认 OFF + enable/disable ----
+check("默认 OFF", recapIsGroupEnabled(G) == false);
+recapEnableGroup(G);
+check("enable 后 ON", recapIsGroupEnabled(G) == true);
+recapDisableGroup(G);
+check("disable 后 OFF", recapIsGroupEnabled(G) == false);
+
+// ---- 2) record 累积 + content 截断 ----
+CHAT_DIRTY.clear();
+chatRecordEvent(G, "wxA", 100L, "你好");
+chatRecordEvent(G, "wxB", 101L, "世界");
+check("2 条入缓冲", CHAT_DIRTY.size() == 2);
+StringBuilder lng = new StringBuilder();
+for (int i = 0; i < 600; i++) lng.append("a");
+CHAT_DIRTY.clear();
+chatRecordEvent(G, "wxA", 102L, lng.toString());
+String stored = (String) ((Object[]) CHAT_DIRTY.get(0))[3];
+check("content 截断到 500", stored.length() == 500);
+check("content=null 跳过", true);
+CHAT_DIRTY.clear();
+chatRecordEvent(G, "wxA", 1L, null);
+check("null content 不入缓冲", CHAT_DIRTY.size() == 0);
+
+// ---- 3) flush → 批量落库 + prune; 缓冲清空 ----
+FAKE_EXEC_CALLS.clear();
+CHAT_DIRTY.clear();
+chatRecordEvent(G, "wxA", 200L, "一");
+chatRecordEvent(G, "wxB", 201L, "二");
+chatRecordEvent(G, "wxA", 202L, "三");
+chatFlush();
+check("flush 后缓冲清空", CHAT_DIRTY.size() == 0);
+// 3 条 insert(execBatch 逐行记) + 1 条 prune(exec)
+int inserts = 0, prunes = 0;
+for (int i = 0; i < FAKE_EXEC_CALLS.size(); i++) {
+    String sql = (String) ((Object[]) FAKE_EXEC_CALLS.get(i))[0];
+    if (CHAT_RECENT_INSERT_SQL.equals(sql)) inserts++;
+    if (CHAT_RECENT_PRUNE_SQL.equals(sql)) prunes++;
+}
+check("flush 落库 3 条", inserts == 3);
+check("flush 顺带 prune 1 次", prunes == 1);
+
+// ---- 4) 空缓冲 flush 不落库(但仍不报错) ----
+FAKE_EXEC_CALLS.clear();
+chatFlush();
+check("空缓冲 flush 完全不落库(insert+prune 都不调)", FAKE_EXEC_CALLS.isEmpty());
+int ins2 = 0;
+for (int i = 0; i < FAKE_EXEC_CALLS.size(); i++) if (CHAT_RECENT_INSERT_SQL.equals((String) ((Object[]) FAKE_EXEC_CALLS.get(i))[0])) ins2++;
+check("空缓冲 flush 0 insert", ins2 == 0);
+
+// ---- 5) 降级 ----
+CHAT_BUFFER_CAP = 2;
+CHAT_DEGRADED = false;
+CHAT_DIRTY.clear();
+chatRecordEvent(G, "w1", 1L, "a");
+chatRecordEvent(G, "w2", 2L, "b");   // 达 CAP=2 → 降级
+check("缓冲到 CAP=2 → 降级", CHAT_DEGRADED == true);
+int before = CHAT_DIRTY.size();
+chatRecordEvent(G, "w3", 3L, "c");
+check("降级期丢弃", CHAT_DIRTY.size() == before);
+
+// ---- 6) 降级恢复: flush 成功换出(缓冲→空, 低于 CAP/2) → 解除降级 (B3 覆盖) ----
+chatFlush();
+check("flush 成功 + 缓冲低水位 → 解除降级", CHAT_DEGRADED == false);
+chatRecordEvent(G, "w5", 5L, "x");
+check("恢复后可重新采集", CHAT_DIRTY.size() == 1);
+
+done();

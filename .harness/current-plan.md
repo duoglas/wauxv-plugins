@@ -1,36 +1,42 @@
-# 计划: LLM 对接(OpenAI 兼容) + 排行榜润色 — 2026-06-14
+# 计划: AI 群聊点评 / 锐评 (内容向群聊总结) — 2026-06-14
 
-## 需求(用户确认)
-- 给 GroupAdminPlus 加**可配置 LLM 客户端**(OpenAI 兼容: url/path/key/model/system)。
-- 用 LLM **每次润色排行榜**(默认开, 有 key 就用)。
-- 后续(不在本迭代): 群管智能回复。
+## 需求
+用户要类似友商的「AI 点评」: 大模型读群聊**内容**生成一段有梗的群聊总结/锐评(能点名说出谁刷屏/谁撕逼/谁发了啥), 要比友商更精彩。
 
-## 已确认决策
-- **默认配置 auto-seed**: 从兄弟插件「自动回复配置版」config.prop 读 `zhilia_ai_api_url/api_path/api_key/model_name` → 写进 GroupAdminPlus 自己的 `ga_llm_*`(仅设备运行时, key 留设备)。
-- **润色默认开**(有 key 即用), LLM 失败/超时 → 回退朴素榜(永不卡出榜)。
-- **隐私接受**(真昵称发外部 API, 与自动回复同源)。
+## 核心认知 (决定架构)
+- 友商样例能点名说**具体内容/原话** → **必须抓群聊文本内容**喂大模型。当前 `msg_event` **不存 content**(设计刻意, 隐私+体积)。
+- 故需**新增短保留内容缓冲** `chat_recent(grp,wxid,ts,content)`(只存文本, 滚动保留如 48h, 自动清理) —— 即 spec §2.7 预留的"短保留原始表", 现在用上。
+- **我们更精彩的点**: 内容锐评 + **现成排行榜数据**(话痨Top/水王/红包王…)结合 → 数据有据的点评(样例结尾也带了个 mini 榜)。
 
-## 安全红线 (C-SEC)
-- **API key 绝不进 main.java / 不进 git / 不进任何日志**。只存设备 config.prop, 从兄弟插件 seed。Security grep 必须 0。
-
-## 现状锚点
-- 自动回复配置: url=`https://LLM_HOST_REDACTED/v1` path=`/chat/completions` model=`gpt-5.5`, 标准 OpenAI Bearer + messages, org.json 解析。
-- org.json 是 Android 类(**bsh-2.0b6 测试 classpath 无**) → llm.bsh 的 HTTP+JSON 属设备缝(L4 真机验, 仿反射缝); 可测的是"润色失败回退"逻辑。
+## 关键决策 (需用户确认)
+1. **抓内容的隐私**: 群聊文本会发给外部 LLM(LLM_HOST_REDACTED), 比之前(昵称+数字)更进一步。你已接受昵称+数字, 内容是更大一步 —— 确认接受? 短保留(默认48h)+只文本+可关。
+2. **风格/人设**: 锐评语气用**可配置 system prompt**(键 `ga_llm_recap_system`, 从兄弟插件 seed 或自定义, 同自动回复 persona)。**默认给"机智毒舌吐槽"人设(不点名人身攻击/不黄)**; 你想要样例那种更辣的, 自己改 prompt 即可(你的群你的 LLM)。
+3. **触发**: 命令「群聊总结」/「锐评」(管理员) + 可选每日定时(如每晚) ; 出榜发本群。
+4. **体量/成本**: 转录截断(最近 N 条 / 字符预算, 如最近300条或~6k字), 避免超大 LLM 调用; 长群只取窗口尾部。
 
 ## 任务拆解 (每个 ≤15min)
-- **T1 llm.bsh 客户端(设备缝)**: 配置键 `ga_llm_url/path/key/model/system/rank_on`; `llmEnabled()`(key 非空 + rank_on); `_llmHttpPost(url,key,body)`(HttpURLConnection POST, Bearer, 超时10s, 全 try/catch 返 null) ; `llmChat(system,user)`(org.json 建 messages + 解析 choices[0].message.content, 失败 null); `llmSeedDefaults()`(GA ga_llm_url 空时读兄弟 config.prop 拷键)。done: 解析过(去 final)。
-- **T2 排行榜润色接线(rank_render)**: `rankShowLeaderboard` 后台线程内 build 朴素榜 → `llmEnabled()` 则 `rankLlmPolish(board)`(llmChat 润色, 返 null 回退朴素) → sendText。**润色逻辑(失败回退/禁用直发)抽成可测纯函数 + 假 llmChat 单测**。done: check.sh 含新测 GREEN。
-- **T3 onLoad seed + manifest + 命令**: onLoad 调 llmSeedDefaults(独立 try/catch); manifest 登记 llm.bsh(rank_render 前); 命令 `榜单润色 开/关`(owner) 写 ga_llm_rank_on。done: 解析 + check.sh GREEN + callee 闭合。
-- **T4 构建准出**: check.sh GREEN + 闭合扫描 + **Security grep 0(尤其 key/Bearer 不在源码)**。
-- **T5 独立 code review (C-HARNESS-03, 不可跳过)**: 独立 reviewer 审 —— key 不入源码/不入日志、HTTP 超时+全 try/catch 不卡线程、润色失败回退、JSON 健壮、seed 跨插件读安全。网络外部依赖属 medium → 叠 Santa 双审(A 安全/降级 / B JSON/边界/回退)。done: 独立 review PASS + Santa NICE。
-- **T6 真机准出**: 部署→seed 验证(GA config.prop 出现 ga_llm_* 非空)→测试群发「群龙榜」→看 LLM 润色版出榜 + 关 key/断网 → 回退朴素榜(降级实测)+ logcat 无异常 + 热路径不回归(润色全在后台)。done: 实测 PASS(含降级)。
+- **T1 domain/chat_recent**: 建表 `chat_recent(grp,wxid,ts,content)` + 索引(grp,ts); insert/batch; 查窗口最近N条(ORDER BY ts DESC LIMIT N 再正序); prune(DELETE WHERE ts < cutoff)。L1/L2 测(查询窗口/截断/prune)。
+- **T2 内容采集(热路径)**: 仿 rank_collect —— 文本消息且(rank启用 && 点评开关 `ga_recap_on`)时, 把 (grp,sender,ts,content) 入内存缓冲 → 批量 flush 到 chat_recent; flush 时顺带 prune 过期(>保留窗口)。**热路径仍 O(1) 内存 append**(content 已在手), 整段 try/catch。**默认关**(灰度+隐私)。L1 测缓冲/flush/gate。
+- **T3 aiRecap 生成(rank_render 旁/新 app/ai_recap.bsh)**: 取 chat_recent 窗口转录(wxid→昵称 + content, 截断到预算) + 拼排行榜摘要 → `llmChat(recapSystem, 转录+榜摘要)` → 失败回退"今日数据太少/生成失败"。全后台线程。可测: 转录构建(纯)+回退(桩 llmChat)。
+- **T4 命令+配置+seed**: 命令「群聊总结」/「锐评」(管理员 _cmdAuthorized) → 后台 aiRecap 发本群; showRankConfig 加「AI点评 开/关」(ga_recap_on)+提示; ga_llm_recap_system 默认人设(onLoad seed, 已配不覆盖)。
+- **T5 构建准出**: check.sh GREEN + 闭合 + **Security 0(key/content 不入源码/日志; 转录不写 plugin.log)**。
+- **T6 独立 review (C-HARNESS-03) + Santa**: 内容采集挂热路径=medium → Santa 双审(A 热路径O(1)+隐私不泄漏+降级 / B SQL/prune/转录截断/回退/seed)。
+- **T7 真机**: 部署→测试群开「AI点评」→发「群聊总结」→看锐评(内容+榜结合)+ 降级(无key/断网回退)+ chat_recent 滚动保留(prune 生效)+ 热路径不回归。
 
-## 风险 / 不可逆
-- 外部网络调用(从真机插件)：超时/失败必须不卡出榜、不碰消息热路径。
-- key 处理：seed 到设备 config.prop(可逆), 绝不入 git。
-- 真机 force-stop 重载(标准)。
+## 风险 / 红线
+- **隐私**: 群聊内容外发 + 短暂落库。仅文本、短保留、可关、默认关、灰度。content/转录**绝不写 plugin.log**。key 仍只设备。
+- **热路径**: 内容采集 O(1) 内存; 重活(转录/LLM)全后台。
+- **体积**: chat_recent 滚动 prune(默认48h), flush 时清理; 看门狗后续。
+- **内容风格**: 默认人设机智吐槽不人身攻击/不黄; 更辣由用户自配 prompt(其群其 LLM)。
 
-## 验收标准
-- check.sh GREEN + 闭合 + **Security 0(key 不在源码/日志)**。
-- 真机: seed 成功 + 群龙榜 LLM 润色出榜 + 降级(无 key/断网)回退朴素 + 热路径不回归。
-- 独立 code review PASS + Santa 双审 NICE。
+## 验收
+- check.sh GREEN + Security 0(无 key/content 泄漏)。
+- 真机: 开点评→群聊总结出有据锐评(引用真实内容+榜) + 降级回退 + prune 生效 + 热路径不回归。
+- 独立 review + Santa NICE。
+
+## 新增需求 (2026-06-14 一并纳入)
+- **N1 子配置菜单返回上级**: showRankConfig 等子页加「← 返回」按钮回上级(showMergedGroupConfig), 不只「关闭」。范围=合并 UI 新建的子页(showRankConfig 本轮先加; 排查其它新子页是否缺)。小改, 折进本 AI 点评的 T4 dialog 工作一并做。
+- **N2 顶层菜单支持大模型修改配置**: showMergedHome 加「🤖 AI 配置助手」入口 → 用户自然语言描述要改的设置 → LLM 解析成**结构化意图(改哪个键=什么值)** → **对照白名单校验**(只允许改预定义可改项: 群管/红包/排行榜/点评开关 + 阈值等, 绝不让 LLM 改任意键/执行任意动作) → 预览 + 确认后写入。**单独较大功能**, AI 点评之后单列迭代(需: 可改配置白名单 + LLM 结构化输出 schema + 解析校验 + 确认 UI + 独立 review+Santa, 防 LLM 误改/注入)。
+
+## 后续(用户确认也要做, 本计划后)
+拍一拍/转账/熬夜冠军 metric + rollup物化 + 体积看门狗 + 文档同步。

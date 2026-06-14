@@ -1358,6 +1358,8 @@ void showRankConfig(String groupId) {
 
     boolean rankOn = false;
     try { rankOn = rankIsGroupEnabled(groupId); } catch (Throwable t) {}
+    boolean recapOn = false;
+    try { recapOn = recapIsGroupEnabled(groupId); } catch (Throwable t) {}
     boolean hasKey = false;
     boolean polishOn = false;
     try { hasKey = HOST.getString("ga_llm_key", "").trim().length() > 0; } catch (Throwable t) {}
@@ -1381,8 +1383,9 @@ void showRankConfig(String groupId) {
     card.setBackground(_gaRound("#1A1D24", 12));
     StringBuilder st = new StringBuilder();
     st.append("本群统计: ").append(rankOn ? "✅ 已开启" : "🔴 未开启").append("\n");
-    st.append("LLM 润色: ").append(!hasKey ? "⚪ 未配置 key" : (polishOn ? "✨ 开" : "🔕 关")).append("\n");
-    st.append("开启后记录发言/红包等; 发「群龙榜」看今日榜 (话痨Top10 + 水王/图王/红包王/潜水冠军)。");
+    st.append("AI 点评: ").append(recapOn ? "✅ 已开启" : "🔴 未开启").append("\n");
+    st.append("LLM: ").append(!hasKey ? "⚪ 未配置 key" : "✅ 已配置").append("  润色: ").append(polishOn ? "✨开" : "🔕关").append("\n");
+    st.append("统计→发「群龙榜」看今日榜; 点评→攒聊天记录后发「群聊总结」生成 AI 锐评。");
     android.widget.TextView stv = new android.widget.TextView(ctx);
     stv.setText(st.toString());
     stv.setTextColor(_gaC("#B8BDC8"));
@@ -1394,6 +1397,7 @@ void showRankConfig(String groupId) {
 
     final String fG = groupId;
     final boolean fRankOn = rankOn;
+    final boolean fRecapOn = recapOn;
     final boolean fPolishOn = polishOn;
     final AlertDialog[] dh = new AlertDialog[1];
 
@@ -1407,6 +1411,18 @@ void showRankConfig(String groupId) {
         }
     });
     root.addView(rankTgl);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button recapTgl = _gaBtn(ctx, fRecapOn ? "🔕 关闭本群 AI 点评 (停采集聊天记录)" : "🤖 开启本群 AI 点评 (采集聊天记录)", fRecapOn ? "#FF6B6B" : "#5CB6FF");
+    recapTgl.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (fRecapOn) { recapDisableGroup(fG); toast("已关闭本群 AI 点评 (停止采集聊天内容)"); }
+            else { recapEnableGroup(fG); toast("已开启本群 AI 点评 (开始采集聊天内容, 仅文本/短保留)"); }
+            if (dh[0] != null) dh[0].dismiss();
+            showRankConfig(fG);
+        }
+    });
+    root.addView(recapTgl);
     _gaSpacer(root, ctx, 6 * dp);
 
     android.widget.Button polishTgl = _gaBtn(ctx, fPolishOn ? "✨ LLM润色: 开 → 点击关闭" : "✨ LLM润色: 关 → 点击开启", fPolishOn ? "#FF6B6B" : "#5CB6FF");
@@ -1429,6 +1445,27 @@ void showRankConfig(String groupId) {
         }
     });
     root.addView(showBtn);
+    _gaSpacer(root, ctx, 6 * dp);
+
+    android.widget.Button recapBtn = _gaBtn(ctx, "🤖 看 AI 群聊锐评 (发到本群)", "#252934");
+    recapBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            aiRecapShow(fG, "群聊总结");
+        }
+    });
+    root.addView(recapBtn);
+    _gaSpacer(root, ctx, 14 * dp);
+
+    // N1: 返回上级 (合并群配置页)
+    android.widget.Button backBtn = _gaBtn(ctx, "← 返回上级", "#1A1D24");
+    backBtn.setOnClickListener(new android.view.View.OnClickListener() {
+        public void onClick(android.view.View v) {
+            if (dh[0] != null) dh[0].dismiss();
+            showMergedGroupConfig(fG);
+        }
+    });
+    root.addView(backBtn);
 
     android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
     sv.addView(root);

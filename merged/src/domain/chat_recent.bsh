@@ -1,0 +1,39 @@
+// ============================================================
+// domain/chat_recent — AI 群聊点评用的短保留文本内容缓冲。
+// 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md (AI 点评增量)
+// 只依赖 StoragePort(全局 STORAGE)。端口契约: exec/execBatch/queryRows/queryLong。
+//
+// ★隐私: 只存文本 content, 滚动短保留(默认 48h, flush 时 prune), 默认关, 按群灰度。content 绝不写日志。
+// ★与 msg_event 区别: msg_event 是永久全量"元数据"(不含 content); chat_recent 是短保留"内容"专供 LLM 点评取转录。
+// ============================================================
+
+CHAT_RECENT_CREATE_SQL = "CREATE TABLE IF NOT EXISTS chat_recent(grp TEXT, wxid TEXT, ts INTEGER, content TEXT)";
+CHAT_RECENT_INDEX_SQL  = "CREATE INDEX IF NOT EXISTS idx_chat_grp_ts ON chat_recent(grp,ts)";
+
+CHAT_RECENT_INSERT_SQL = "INSERT INTO chat_recent(grp,wxid,ts,content) VALUES(?,?,?,?)";
+
+// 录一条(生产热路径不直接调, 走采集缓冲批量)。content 应为文本消息内容。
+void chatRecentInsert(String grp, String wxid, long ts, String content) {
+    STORAGE.exec(CHAT_RECENT_INSERT_SQL, new Object[]{ grp, wxid, new Long(ts), content });
+}
+// 批量(单事务)。bindsList: List<Object[]{ grp, wxid, Long ts, content }>。
+void chatRecentInsertBatch(java.util.List bindsList) {
+    STORAGE.execBatch(CHAT_RECENT_INSERT_SQL, bindsList);
+}
+
+// 取某群窗口 [sinceTs,untilTs) 内"最近 N 条", 按时间正序返回(便于拼转录)。
+//   子查询先 ORDER BY ts DESC LIMIT N 取最近 N, 外层再 ASC 转时序。返回 List<Object[]>: [0]=wxid [1]=ts(Long) [2]=content。
+CHAT_RECENT_QUERY_SQL =
+    "SELECT wxid, ts, content FROM ("
+    + "SELECT wxid, ts, content FROM chat_recent WHERE grp=? AND ts>=? AND ts<? ORDER BY ts DESC LIMIT ?"
+    + ") ORDER BY ts ASC";
+java.util.List chatRecentQuery(String grp, long sinceTs, long untilTs, int limit) {
+    return STORAGE.queryRows(CHAT_RECENT_QUERY_SQL,
+        new Object[]{ grp, new Long(sinceTs), new Long(untilTs), new Long((long) limit) });
+}
+
+// 清理: 删除早于 cutoffTs 的全部(滚动保留, flush 时调)。
+CHAT_RECENT_PRUNE_SQL = "DELETE FROM chat_recent WHERE ts < ?";
+void chatRecentPrune(long cutoffTs) {
+    STORAGE.exec(CHAT_RECENT_PRUNE_SQL, new Object[]{ new Long(cutoffTs) });
+}

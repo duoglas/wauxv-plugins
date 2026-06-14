@@ -67,6 +67,8 @@ void l3FlushLoop() {
     } finally {
         // 排行榜事件批量落库, 复用同节拍; 独立 try 不连坐 l3 与重调度。
         try { rankFlush(); } catch (Throwable t) { try { log("rank flush err: " + t); } catch (Throwable t2) {} }
+        // AI 点评内容批量落库 + 滚动 prune, 同节拍; 独立 try。
+        try { chatFlush(); } catch (Throwable t) { try { log("chat flush err: " + t); } catch (Throwable t2) {} }
         try {
             delay(L3_FLUSH_MS, new Runnable() { public void run() { l3FlushLoop(); } });
         } catch (Throwable t) {
@@ -107,6 +109,9 @@ void onLoad() {
         // 排行榜原始事件表 msg_event + 索引(grp,ts)。表先于索引(VH-05)。
         STORAGE.exec(RANK_CREATE_SQL, new Object[]{});
         STORAGE.exec(RANK_INDEX_SQL, new Object[]{});
+        // AI 点评短保留内容表 chat_recent + 索引。
+        STORAGE.exec(CHAT_RECENT_CREATE_SQL, new Object[]{});
+        STORAGE.exec(CHAT_RECENT_INDEX_SQL, new Object[]{});
     } catch (Throwable t) {
         try { log("GroupAdmin onLoad 端口接线/建表失败: " + t); } catch (Throwable t2) {}
     }
@@ -230,6 +235,7 @@ void onUnload() {
     try { l3Flush(); } catch (Throwable t) { try { log("onUnload l3Flush fail: " + t); } catch (Throwable t2) {} }
     // 卸载前同步落排行榜事件缓冲, 防 force-stop/重载丢失 (Santa C1: 节拍 flush 不覆盖卸载最后一批)。
     try { rankFlush(); } catch (Throwable t) { try { log("onUnload rankFlush fail: " + t); } catch (Throwable t2) {} }
+    try { chatFlush(); } catch (Throwable t) { try { log("onUnload chatFlush fail: " + t); } catch (Throwable t2) {} }
     // 关 DB 句柄 (观察性/资源缝, P2 接真实句柄)。
     try { _hooksCloseDb(); } catch (Throwable t) { try { log("onUnload db close fail: " + t); } catch (Throwable t2) {} }
     L3_flushStarted = false;
@@ -377,6 +383,14 @@ void onHandleMsgBody(Object msg) {
             rankRecordEvent(groupId, sender, isTextMsg ? RANK_TYPE_TEXT : RANK_TYPE_OTHER, CLOCK.now(), _rval);
         }
     } catch (Throwable _rErr) {}
+
+    // ★AI 点评内容采集 (独立 recap 单群门, 默认 OFF 灰度; 仅文本; O(1) 内存 append, content 截断在 chatRecordEvent; 隐私: 短保留+不写日志)。
+    try {
+        if (isTextMsg && sender != null && !sender.isEmpty() && rawContent != null && recapIsGroupEnabled(groupId)) {
+            String _ct = rawContent.trim();
+            if (_ct.length() > 0) chatRecordEvent(groupId, sender, CLOCK.now(), _ct);
+        }
+    } catch (Throwable _cErr) {}
 
     String content;
     if (isTextMsg) {

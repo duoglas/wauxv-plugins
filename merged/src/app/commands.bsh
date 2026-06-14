@@ -246,6 +246,11 @@ boolean routeCommand(String groupId, String sender, String content,
         HOST.sendText(groupId, "已关闭榜单 LLM 润色 (恢复朴素榜)");
         return true;
     }
+    if (content.equals("群聊总结") || content.equals("锐评") || content.equals("群聊锐评") || content.equals("AI点评")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
+        aiRecapShow(groupId, content);   // 后台线程生成 AI 群聊锐评发本群
+        return true;
+    }
 
     // ---- 没启用就静默忽略其他所有命令 (@2206) ----
     if (!_cmdGroupEnabled(groupId)) return false;

@@ -1,0 +1,54 @@
+// L2 集成: domain/chat_recent + sqlite-jdbc —— 验 insert/batch + 窗口查询(最近N+时序) + prune。
+// 运行 cwd = merged/, classpath 含 sqlite-jdbc.jar。
+import java.sql.*;
+source("tests/_harness.bsh");
+source("src/domain/chat_recent.bsh");
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(CHAT_RECENT_CREATE_SQL);
+conn.createStatement().execute(CHAT_RECENT_INDEX_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+String G = "gA@chatroom";
+String G2 = "gB@chatroom";
+long T = 1749470000000L;
+
+// 群A 5 条(时序乱序插入), 群B 1 条
+chatRecentInsert(G, "wxA", T + 30L, "第三句");
+chatRecentInsert(G, "wxA", T + 10L, "第一句");
+chatRecentInsert(G, "wxB", T + 20L, "第二句");
+chatRecentInsert(G, "wxA", T + 50L, "第五句");
+chatRecentInsert(G, "wxB", T + 40L, "第四句");
+chatRecentInsert(G2, "wxC", T + 25L, "别群勿入");
+
+// ---- 取最近 3 条(窗口全覆盖), 应是 ts 最大的 3 条(40/50 + 30)按时序: 第三/第四/第五 ----
+java.util.List r = chatRecentQuery(G, 0L, Long.MAX_VALUE, 3);
+check("最近 3 条", r.size() == 3);
+check("时序正序: 行0=第三句(ts30)", "第三句".equals(((Object[]) r.get(0))[2]));
+check("行1=第四句(ts40)", "第四句".equals(((Object[]) r.get(1))[2]));
+check("行2=第五句(ts50)", "第五句".equals(((Object[]) r.get(2))[2]));
+check("列: [0]=wxid [1]=ts [2]=content", "wxA".equals(((Object[]) r.get(0))[0]) && ((Long) ((Object[]) r.get(0))[1]).longValue() == T + 30L);
+check("群隔离: 群A查询不含群B", r.size() == 3);
+
+// ---- 窗口过滤: 只取 [T+15, T+45) → 第二(20)/第三(30)/第四(40) ----
+java.util.List w = chatRecentQuery(G, T + 15L, T + 45L, 100);
+check("窗口内 3 条", w.size() == 3);
+check("窗口首=第二句", "第二句".equals(((Object[]) w.get(0))[2]));
+check("窗口尾=第四句", "第四句".equals(((Object[]) w.get(2))[2]));
+
+// ---- 批量 ----
+java.util.List bl = new java.util.ArrayList();
+bl.add(new Object[]{ G2, "wxC", new Long(T + 60L), "批量1" });
+bl.add(new Object[]{ G2, "wxD", new Long(T + 61L), "批量2" });
+chatRecentInsertBatch(bl);
+check("群B 批量后 3 条(原1+批量2)", chatRecentQuery(G2, 0L, Long.MAX_VALUE, 100).size() == 3);
+
+// ---- prune: 删早于 T+35 的(群A: 10/20/30 删, 留 40/50; 群B: 25 删, 留 60/61) ----
+chatRecentPrune(T + 35L);
+check("群A prune 后留 2 条(40/50)", chatRecentQuery(G, 0L, Long.MAX_VALUE, 100).size() == 2);
+check("群A 留存首=第四句(ts40)", "第四句".equals(((Object[]) chatRecentQuery(G, 0L, Long.MAX_VALUE, 100).get(0))[2]));
+check("群B prune 后留 2 条(60/61)", chatRecentQuery(G2, 0L, Long.MAX_VALUE, 100).size() == 2);
+
+conn.close();
+done();

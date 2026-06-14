@@ -1,0 +1,98 @@
+// ============================================================
+// app/chat_collect — AI 点评的群聊文本内容采集 L3 infra: 热路径 O(1) 缓冲 + 批量 flush + 滚动 prune + 单群门。
+// 设计源: docs/superpowers/specs/2026-06-11-排行榜-ranking-design.md (AI 点评增量)
+// 依赖: domain/chat_recent.bsh(chatRecentInsertBatch/Prune) + domain/membership.bsh(normGroupId/parseCsv/joinCsv) + 全局 HOST/CLOCK/STORAGE。
+//
+// 红线:
+//   - chatRecordEvent 热路径**只内存 append**(C-PERF-01); 仿 rank_collect。content 截断 500 防超长。
+//   - 隐私: 独立 recap 单群门 **默认 OFF**(灰度); 只采集文本; content/转录**绝不写日志**; 滚动短保留(48h, flush 时 prune)。
+//   - 降级(C-ARCH-02): 缓冲到顶/flush 失败 → 丢弃, 绝不阻塞消息收发。
+// ============================================================
+
+// ===== 点评单群门(默认 OFF; 与 rank 门独立, 仿 enable_state) =====
+String RECAP_K_ENABLED      = "recap_enabled_groups";   // CSV; 空=无群启用(默认 OFF)
+java.util.HashSet RECAP_ENABLED_CACHE = null;
+long   RECAP_ENABLED_TS     = 0L;
+long   RECAP_ENABLED_TTL_MS = 60000L;
+
+void recapLoadEnabledCache() {
+    java.util.HashSet s = new java.util.HashSet();
+    try {
+        java.util.List l = parseCsv(HOST.getString(RECAP_K_ENABLED, ""));
+        for (int i = 0; i < l.size(); i++) { String g = normGroupId((String) l.get(i)); if (!g.isEmpty()) s.add(g); }
+    } catch (Throwable t) {}
+    RECAP_ENABLED_CACHE = s;
+    RECAP_ENABLED_TS = CLOCK.now();
+}
+boolean recapIsGroupEnabled(String groupId) {
+    try {
+        String g = normGroupId(groupId);
+        if (g.isEmpty()) return false;
+        long now = CLOCK.now();
+        if (RECAP_ENABLED_CACHE == null || (now - RECAP_ENABLED_TS) > RECAP_ENABLED_TTL_MS) recapLoadEnabledCache();
+        return RECAP_ENABLED_CACHE.contains(g);
+    } catch (Throwable t) { return false; }
+}
+void recapEnableGroup(String groupId) {
+    String g = normGroupId(groupId); if (g.isEmpty()) return;
+    java.util.List l = parseCsv(HOST.getString(RECAP_K_ENABLED, ""));
+    boolean has = false;
+    for (int i = 0; i < l.size(); i++) { if (g.equals(normGroupId((String) l.get(i)))) { has = true; break; } }
+    if (!has) l.add(g);
+    HOST.putString(RECAP_K_ENABLED, joinCsv(l));
+    recapLoadEnabledCache();
+}
+void recapDisableGroup(String groupId) {
+    String g = normGroupId(groupId); if (g.isEmpty()) return;
+    java.util.List l = parseCsv(HOST.getString(RECAP_K_ENABLED, ""));
+    java.util.List out = new java.util.ArrayList();
+    for (int i = 0; i < l.size(); i++) { String x = normGroupId((String) l.get(i)); if (!x.isEmpty() && !g.equals(x)) out.add(x); }
+    HOST.putString(RECAP_K_ENABLED, joinCsv(out));
+    recapLoadEnabledCache();
+}
+
+// ===== 采集缓冲 + 降级 + 滚动保留 =====
+Object CHAT_LOCK        = new Object();
+Object CHAT_FLUSH_LOCK  = new Object();
+java.util.List CHAT_DIRTY = new java.util.ArrayList();   // 每项 Object[]{ grp, wxid, Long ts, content }
+int     CHAT_BUFFER_CAP = 4000;
+int     CHAT_CONTENT_MAX = 500;       // 单条 content 截断上界(防超长)
+long    CHAT_RETAIN_MS   = 172800000L; // 滚动保留 48h
+boolean CHAT_DEGRADED   = false;
+long    CHAT_flushFailStreak = 0;
+int     CHAT_FAIL_CAP   = 5;
+
+// 热路径入口: O(1) 内存 append。只在文本消息且本群点评开启时调(由 hooks 判)。content 截断。
+void chatRecordEvent(String groupId, String wxid, long ts, String content) {
+    if (groupId == null || wxid == null || groupId.isEmpty() || wxid.isEmpty()) return;
+    if (content == null) return;
+    if (CHAT_DEGRADED) return;
+    String c = content;
+    if (c.length() > CHAT_CONTENT_MAX) c = c.substring(0, CHAT_CONTENT_MAX);
+    synchronized (CHAT_LOCK) {
+        CHAT_DIRTY.add(new Object[]{ groupId, wxid, new Long(ts), c });
+        if (!CHAT_DEGRADED && CHAT_DIRTY.size() >= CHAT_BUFFER_CAP) CHAT_DEGRADED = true;
+    }
+}
+
+// 后台批量落库 + 滚动 prune(删 > CHAT_RETAIN_MS 前的)。仿 rank_collect 锁序。
+void chatFlush() {
+    synchronized (CHAT_FLUSH_LOCK) {
+        java.util.List swap = null;
+        synchronized (CHAT_LOCK) {
+            if (!CHAT_DIRTY.isEmpty()) { swap = CHAT_DIRTY; CHAT_DIRTY = new java.util.ArrayList(); }
+        }
+        if (swap == null) return;
+        boolean fail = false;
+        try { chatRecentInsertBatch(swap); } catch (Throwable t) { fail = true; }
+        // 滚动清理(独立 try, 失败不影响落库结果判定)。
+        try { chatRecentPrune(CLOCK.now() - CHAT_RETAIN_MS); } catch (Throwable t) {}
+        if (fail) {
+            CHAT_flushFailStreak++;
+            if (!CHAT_DEGRADED && CHAT_flushFailStreak >= CHAT_FAIL_CAP) CHAT_DEGRADED = true;
+        } else {
+            CHAT_flushFailStreak = 0;
+            if (CHAT_DEGRADED) { synchronized (CHAT_LOCK) { if (CHAT_DIRTY.size() < (CHAT_BUFFER_CAP / 2)) CHAT_DEGRADED = false; } }
+        }
+    }
+}

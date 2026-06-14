@@ -1,0 +1,72 @@
+// L2 集成: app/ai_recap.recapBuildPrompt(+aiRecapText 桩 llmChat) —— 验转录构建(名字+内容+榜摘要) + 消息太少返 null + 回退。
+// 桩 llmChat/log 在 source 前定义。运行 cwd = merged/, classpath 含 sqlite-jdbc.jar。
+import java.sql.*;
+source("tests/_harness.bsh");
+
+String FAKE_LLM_RESULT = "🔥今日锐评🔥 群里炸开了锅";
+String llmChat(String system, String user) { return FAKE_LLM_RESULT; }
+void log(String s) {}
+
+source("tests/fakes/host_fake.bsh");        // HOST(lookupName 回 wxid) + CLOCK
+source("src/domain/rank.bsh");
+source("src/domain/chat_recent.bsh");
+source("src/domain/speak_store.bsh");
+source("src/domain/redpacket_store.bsh");
+source("src/app/rank_render.bsh");          // _rankName / rankBuildBoard
+source("src/app/ai_recap.bsh");
+source("tests/fakes/storage_jdbc.bsh");
+
+Connection conn = jdbcMemoryConn();
+conn.createStatement().execute(RANK_CREATE_SQL);
+conn.createStatement().execute(CHAT_RECENT_CREATE_SQL);
+conn.createStatement().execute(SPEAK_CREATE_SQL);
+conn.createStatement().execute(RP_CREATE_SQL);
+STORAGE = makeJdbcStorage(conn);
+
+FAKE_LOGIN_WXID = "botwx";
+String G = "gA@chatroom";
+long T = 1749470000000L;
+long SINCE = 0L, UNTIL = Long.MAX_VALUE;
+
+// ---- 消息太少(<5) → recapBuildPrompt null, aiRecapText null ----
+chatRecentInsert(G, "张三", T + 1, "在吗");
+chatRecentInsert(G, "李四", T + 2, "在");
+check("消息太少(2条) → recapBuildPrompt null", recapBuildPrompt(G, SINCE, UNTIL) == null);
+check("消息太少 → aiRecapText null(不调 LLM)", aiRecapText(G, SINCE, UNTIL) == null);
+
+// ---- 攒够消息 + msg_event(供榜摘要) ----
+chatRecentInsert(G, "张三", T + 3, "今晚谁带带我");
+chatRecentInsert(G, "李四", T + 4, "你又菜又爱玩");
+chatRecentInsert(G, "王五", T + 5, "哈哈哈笑死");
+chatRecentInsert(G, "张三", T + 6, "别嘴硬了");
+for (int i = 0; i < 8; i++) rankInsertEvent(G, "张三", RANK_TYPE_TEXT, T + i, new Long(10L));
+for (int i = 0; i < 3; i++) rankInsertEvent(G, "李四", RANK_TYPE_TEXT, T + i, new Long(5L));
+
+String prompt = recapBuildPrompt(G, SINCE, UNTIL);
+check("够消息 → 非 null", prompt != null);
+check("转录含发言人:内容", prompt.indexOf("张三: 今晚谁带带我") >= 0);
+check("转录含李四吐槽", prompt.indexOf("李四: 你又菜又爱玩") >= 0);
+check("含排行榜数据段", prompt.indexOf("排行榜数据") >= 0);
+check("榜摘要含话痨第一张三", prompt.indexOf("张三") >= 0);
+
+// ---- aiRecapText: 调(桩)llmChat 返回锐评 ----
+check("aiRecapText 返回锐评(桩)", FAKE_LLM_RESULT.equals(aiRecapText(G, SINCE, UNTIL)));
+
+// ---- llmChat 返 null → aiRecapText null(回退由调用方处理) ----
+FAKE_LLM_RESULT = null;
+check("llmChat null → aiRecapText null", aiRecapText(G, SINCE, UNTIL) == null);
+
+// ---- 6000 字预算截断 (B2 覆盖): 40 条长消息(每条~200字) → 转录截断, 晚的不进 ----
+String G3 = "gC@chatroom";   // 无 msg_event → 无榜摘要, bp 仅转录, 便于测 budget
+StringBuilder pad = new StringBuilder();
+for (int i = 0; i < 190; i++) pad.append("x");
+String PAD = pad.toString();
+for (int i = 1; i <= 40; i++) chatRecentInsert(G3, "u" + i, T + i, "MARK" + i + "_" + PAD);
+String bp = recapBuildPrompt(G3, SINCE, UNTIL);
+check("长消息组 → 非 null", bp != null);
+check("预算截断: 早的 MARK1_ 在转录内", bp.indexOf("MARK1_") >= 0);
+check("预算截断: 晚的 MARK40_ 被切不在(超 6000 预算)", bp.indexOf("MARK40_") < 0);
+check("转录长度受 budget 约束(≤6200)", bp.length() <= 6200);
+
+conn.close();
+done();
