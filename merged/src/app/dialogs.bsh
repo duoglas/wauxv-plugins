@@ -1382,10 +1382,10 @@ void showRankConfig(String groupId) {
     card.setPadding(12 * dp, 12 * dp, 12 * dp, 12 * dp);
     card.setBackground(_gaRound("#1A1D24", 12));
     StringBuilder st = new StringBuilder();
-    st.append("本群统计: ").append(rankOn ? "✅ 已开启" : "🔴 未开启").append("\n");
-    st.append("AI 点评: ").append(recapOn ? "✅ 已开启" : "🔴 未开启").append("\n");
+    st.append("本群排行榜: ").append(rankOn ? "✅ 已开启 (含采集聊天内容供点评)" : "🔴 未开启").append("\n");
+    st.append("AI 点评命令: ").append(recapOn ? "✅ 已开启" : "🔴 未开启").append("\n");
     st.append("LLM: ").append(!hasKey ? "⚪ 未配置 key" : "✅ 已配置").append("  润色: ").append(polishOn ? "✨开" : "🔕关").append("\n");
-    st.append("统计→发「群龙榜」看今日榜; 点评→攒聊天记录后发「群聊总结」生成 AI 锐评。");
+    st.append("开排行榜=采集发言+聊天文本(仅文本/48h); 点评命令开关只管群内发「群聊总结」是否生效, 关了也能用下方「手动发起 AI 点评」(预览后确认)。");
     android.widget.TextView stv = new android.widget.TextView(ctx);
     stv.setText(st.toString());
     stv.setTextColor(_gaC("#B8BDC8"));
@@ -1404,8 +1404,8 @@ void showRankConfig(String groupId) {
     android.widget.Button rankTgl = _gaBtn(ctx, fRankOn ? "🔕 关闭本群排行榜统计" : "✅ 开启本群排行榜统计", fRankOn ? "#FF6B6B" : "#5CB6FF");
     rankTgl.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
-            if (fRankOn) { rankDisableGroup(fG); toast("已关闭本群排行榜统计 (历史保留)"); }
-            else { rankEnableGroup(fG); toast("已开启本群排行榜统计"); }
+            if (fRankOn) { rankDisableGroup(fG); toast("已关闭本群排行榜 (历史保留, 同时停止采集聊天内容)"); }
+            else { rankEnableGroup(fG); toast("已开启本群排行榜 (同时采集聊天内容供点评, 仅文本/48h)"); }
             if (dh[0] != null) dh[0].dismiss();
             showRankConfig(fG);
         }
@@ -1413,11 +1413,11 @@ void showRankConfig(String groupId) {
     root.addView(rankTgl);
     _gaSpacer(root, ctx, 6 * dp);
 
-    android.widget.Button recapTgl = _gaBtn(ctx, fRecapOn ? "🔕 关闭本群 AI 点评 (停采集聊天记录)" : "🤖 开启本群 AI 点评 (采集聊天记录)", fRecapOn ? "#FF6B6B" : "#5CB6FF");
+    android.widget.Button recapTgl = _gaBtn(ctx, fRecapOn ? "🔕 关闭 AI 点评命令 (群内『群聊总结』失效)" : "🤖 开启 AI 点评命令 (群内可发『群聊总结』)", fRecapOn ? "#FF6B6B" : "#5CB6FF");
     recapTgl.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
-            if (fRecapOn) { recapDisableGroup(fG); toast("已关闭本群 AI 点评 (停止采集聊天内容)"); }
-            else { recapEnableGroup(fG); toast("已开启本群 AI 点评 (开始采集聊天内容, 仅文本/短保留)"); }
+            if (fRecapOn) { recapDisableGroup(fG); toast("已关闭 AI 点评命令 (下方『手动发起』仍可用)"); }
+            else { recapEnableGroup(fG); toast("已开启 AI 点评命令 (群内发『群聊总结』生效; 采集随排行榜)"); }
             if (dh[0] != null) dh[0].dismiss();
             showRankConfig(fG);
         }
@@ -1447,11 +1447,11 @@ void showRankConfig(String groupId) {
     root.addView(showBtn);
     _gaSpacer(root, ctx, 6 * dp);
 
-    android.widget.Button recapBtn = _gaBtn(ctx, "🤖 看 AI 群聊锐评 (发到本群)", "#252934");
+    android.widget.Button recapBtn = _gaBtn(ctx, "🤖 手动发起 AI 点评 (预览→确认发送)", "#252934");
     recapBtn.setOnClickListener(new android.view.View.OnClickListener() {
         public void onClick(android.view.View v) {
             if (dh[0] != null) dh[0].dismiss();
-            aiRecapShow(fG, "群聊总结");
+            showRecapPreview(fG);   // 后台生成→主线程预览→确认才发群; 不受 AI点评命令开关限制
         }
     });
     root.addView(recapBtn);
@@ -1475,6 +1475,60 @@ void showRankConfig(String groupId) {
         .setNegativeButton("关闭", null)
         .create();
     dh[0].show();
+}
+
+// ----- 手动发起 AI 点评: 后台生成 → 主线程预览 → 确认才发群 (2026-06-14) -----
+//   入口 = showRankConfig 的「手动发起 AI 点评」按钮。不受 AI 点评命令开关(recap 门)限制。
+//   后台线程跑 LLM(防 ANR, RISK-ANR), 回主线程弹预览 AlertDialog; 仅「确认发送」才 HOST.sendText 到群,
+//   取消不发。无 key / 今日消息太少 → 友好 toast, 不弹空预览。今日窗口同命令路径(_rankTodayStart→now)。
+void showRecapPreview(String groupId) {
+    final Activity ctx = getTopActivity();
+    if (ctx == null) { toast("无法获取 Activity"); return; }
+    if (groupId == null || !groupId.contains("@chatroom")) { toast("无效群 (需群聊)"); return; }
+    final String fG = groupId;
+    toast("⏳ AI 点评生成中…");
+    new Thread(new Runnable() {
+        public void run() {
+            String txt = null; String err = null;
+            try {
+                if (!recapHasKey()) {
+                    err = "🤖 AI 点评需先配置大模型 key (设置 → LLM 配置)";
+                } else {
+                    txt = aiRecapText(fG, _rankTodayStart(), Long.MAX_VALUE);
+                    if (txt == null || txt.trim().length() == 0) {
+                        err = "📝 今日消息太少或没生成出来 (需先开启「排行榜」采集聊天记录并攒一些消息)";
+                    }
+                }
+            } catch (Throwable t) { err = "AI 点评生成失败"; }
+            final String fTxt = txt; final String fErr = err;
+            try {
+                ctx.runOnUiThread(new Runnable() {
+                    public void run() {
+                        if (fErr != null) { toast(fErr); return; }
+                        _showRecapConfirmDialog(ctx, fG, fTxt);
+                    }
+                });
+            } catch (Throwable t) {}
+        }
+    }).start();
+}
+
+// 预览确认弹框: 展示生成的锐评全文, 仅「✅ 确认发送」才发到群; 取消不发。
+void _showRecapConfirmDialog(Activity ctx, String groupId, String txt) {
+    final String fG = groupId; final String fTxt = txt;
+    try {
+        new AlertDialog.Builder(ctx)
+            .setTitle("🤖 AI 点评预览 (确认后才发到群)")
+            .setMessage(txt)
+            .setPositiveButton("✅ 确认发送", new android.content.DialogInterface.OnClickListener() {
+                public void onClick(android.content.DialogInterface d, int w) {
+                    try { HOST.sendText(fG, fTxt); toast("已发送到群"); }
+                    catch (Throwable t) { toast("发送失败"); }
+                }
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    } catch (Throwable t) { toast("预览弹框失败"); }
 }
 
 // WAuxiliary 设置入口 (UI 重建 2026-06-11: 改入合并主页 showMergedHome; 原直开 showConfigDialog(null) 降级为主页内「红包全局默认」按钮)。

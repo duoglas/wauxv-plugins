@@ -10,10 +10,15 @@ source("tests/_harness.bsh");
 source("tests/fakes/host_fake.bsh");
 source("src/domain/membership.bsh");
 source("src/domain/warning.bsh");
+source("src/app/chat_collect.bsh");          // recap 门 recapIsGroupEnabled/Enable/Disable (AI点评命令开关)
 
 // ---- recordSpeak 采集 stub (d1 L3 占位真调; 捕获 groupId 验证路由调用) ----
 FAKE_RECORDED = new java.util.ArrayList();   // Object[]{groupId, wxid}
 void recordSpeak(String groupId, String wxid) { FAKE_RECORDED.add(new Object[]{ groupId, wxid }); }
+
+// ---- aiRecapShow 桩 (AI 点评命令命中时调; 捕获以断言"命令门开才触发生成") ----
+FAKE_RECAP = new java.util.ArrayList();   // content
+void aiRecapShow(String groupId, String content) { FAKE_RECAP.add(content); }
 
 // ---- isGroupEnabled 闸门 stub (W6: commands._cmdGroupEnabled 改为委托真实闸门 isGroupEnabled;
 //      该真实定义在 app/enable_state.bsh, 不在本单测加载范围内。本测经 ge_<gid> 键编程启用,
@@ -157,5 +162,30 @@ reset();
 boolean r10 = routeCommand(gid, "owner1", "<appmsg>...<title>踢</title>...</appmsg>", false, noAt, "qt1", "踢");
 check("10 引用踢 消费",              r10 == true);
 check("10 引用踢 命中 kick 缝",       leafHit("kick"));
+
+// ============================================================
+// 11. AI 点评命令门 (recap 门, 2026-06-14): 关闭→管理员发「群聊总结」静默消费(无群可见输出, 不触发生成);
+//     开启→触发 aiRecapShow。采集随排行榜、与此门解耦; 此门只管命令是否生效。
+// ============================================================
+reset(); FAKE_RECAP.clear(); recapDisableGroup(gid);   // 确保 recap 门关
+boolean r11a = routeCommand(gid, "admin1", "群聊总结", true, noAt, null, null);
+check("11 点评门关 命令被消费",        r11a == true);
+check("11 点评门关 群内无可见输出",    FAKE_SENT.isEmpty());
+check("11 点评门关 不触发生成",        FAKE_RECAP.isEmpty());
+
+reset(); FAKE_RECAP.clear(); recapEnableGroup(gid);    // 开 recap 门
+boolean r11b = routeCommand(gid, "admin1", "群聊总结", true, noAt, null, null);
+check("11 点评门开 命令被消费",        r11b == true);
+check("11 点评门开 触发 aiRecapShow",  FAKE_RECAP.size() == 1);
+recapDisableGroup(gid);   // 还原, 不污染后续
+
+// ============================================================
+// 12. AI 点评命令: 非管理员发「群聊总结」→ _cmdAuthorized 静默拦截, 不触发生成(即便门开)
+// ============================================================
+reset(); FAKE_RECAP.clear(); recapEnableGroup(gid);
+boolean r12 = routeCommand(gid, "normalX", "群聊总结", true, noAt, null, null);
+check("12 非管理员点评 静默消费",      r12 == true);
+check("12 非管理员点评 不触发生成",    FAKE_RECAP.isEmpty());
+recapDisableGroup(gid);
 
 done();

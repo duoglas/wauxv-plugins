@@ -384,9 +384,12 @@ void onHandleMsgBody(Object msg) {
         }
     } catch (Throwable _rErr) {}
 
-    // ★AI 点评内容采集 (独立 recap 单群门, 默认 OFF 灰度; 仅文本; O(1) 内存 append, content 截断在 chatRecordEvent; 隐私: 短保留+不写日志)。
+    // ★AI 点评内容采集 (采集门=排行榜门 rankIsGroupEnabled, 与发言事件采集同一总闸; 开榜即采集聊天文本供点评)。
+    //   语义改动(2026-06-14): 内容采集不再由 recap(AI点评命令开关)控制, 改随排行榜联动 —— 排行榜=采集总闸,
+    //   recap 门降级为"群内点评命令是否生效"(见 commands.bsh)。仅文本; O(1) 内存 append, content 截断在 chatRecordEvent;
+    //   隐私: 短保留 48h + content 绝不写日志(C-SEC); rankIsGroupEnabled 是 60s TTL 缓存(零 FUSE, 热路径 O(1))。
     try {
-        if (isTextMsg && sender != null && !sender.isEmpty() && rawContent != null && recapIsGroupEnabled(groupId)) {
+        if (isTextMsg && sender != null && !sender.isEmpty() && rawContent != null && rankIsGroupEnabled(groupId)) {
             String _ct = rawContent.trim();
             if (_ct.length() > 0) chatRecordEvent(groupId, sender, CLOCK.now(), _ct);
         }
