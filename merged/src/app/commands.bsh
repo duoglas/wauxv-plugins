@@ -216,30 +216,32 @@ boolean routeCommand(String groupId, String sender, String content,
     }
 
     // ---- 排行榜 (独立 rank 单群门, 与群管启用解耦; 手动出榜, 默认 OFF 灰度) ----
+    //   ★所有排行榜命令仅管理员可用(_cmdAuthorized: 严格模式→群主, 否则→群管理员); 非管理员一律静默忽略。
     if (content.equals("排行榜开启") || content.equals("开启排行榜")) {
-        if (!isOwner(sender)) return true;
+        if (!_cmdAuthorized(groupId, sender)) return true;
         rankEnableGroup(groupId);
         HOST.sendText(groupId, "✅ 本群排行榜统计已开启 (从现在起记录, 发「群龙榜」看榜)");
         return true;
     }
     if (content.equals("排行榜关闭") || content.equals("关闭排行榜")) {
-        if (!isOwner(sender)) return true;
+        if (!_cmdAuthorized(groupId, sender)) return true;
         rankDisableGroup(groupId);
         HOST.sendText(groupId, "🔕 本群排行榜统计已关闭 (历史数据保留)");
         return true;
     }
     if (content.equals("群龙榜") || content.equals("排行榜") || content.equals("发言榜")) {
+        if (!_cmdAuthorized(groupId, sender)) return true;
         rankShowLeaderboard(groupId, content);
         return true;
     }
     if (content.equals("榜单润色开") || content.equals("榜单润色 开")) {
-        if (!isOwner(sender)) return true;
+        if (!_cmdAuthorized(groupId, sender)) return true;
         llmSetRankOn(true);
         HOST.sendText(groupId, "✨ 榜单 LLM 润色已开启 (需已配置 key, 失败自动回退朴素榜)");
         return true;
     }
     if (content.equals("榜单润色关") || content.equals("榜单润色 关")) {
-        if (!isOwner(sender)) return true;
+        if (!_cmdAuthorized(groupId, sender)) return true;
         llmSetRankOn(false);
         HOST.sendText(groupId, "已关闭榜单 LLM 润色 (恢复朴素榜)");
         return true;
