@@ -373,45 +373,63 @@ boolean routeCommand(String groupId, String sender, String content,
     // ---- 动作命令: 目标来自 @ (原路径) 或 引用回复 (W2) (@2347) ----
     // 取最后一个 token (动作关键字)。用 regex 拆分, 覆盖 ASCII space + U+2005 (微信 @ 全角空格) + U+00A0。
     String[] tokens = content.split("[\\s\\u2005\\u00A0]+");
-    String lastTok = tokens.length > 0 ? tokens[tokens.length - 1].trim() : "";
-
-    // v1.17.0: 仅对"管理员"动作识别尾随天数; v1.19.0: 识别"警告 <理由>"。
-    int actDays = 0;
-    String warnReason = null;
-    if (!isActionTok(lastTok) && tokens.length >= 2) {
-        String prev = tokens[tokens.length - 2].trim();
-        if (prev.equals("管理员") && _isPosIntTok(lastTok)) {
-            try { actDays = Integer.parseInt(lastTok); } catch (Throwable t) { actDays = 0; }
-            if (actDays > 0) lastTok = "管理员";   // 改写动作词为"管理员", 带 days
-        } else if ((prev.equals("白名单") || prev.equals("潜水保护") || prev.equals("保护")) && _isPosIntTok(lastTok)) {
-            // v1.20.0: 白名单/潜水保护 尾随天数 (白名单默认60, 潜水保护默认永久; 显式 N 天覆盖)
-            try { actDays = Integer.parseInt(lastTok); } catch (Throwable t) { actDays = 0; }
-            if (actDays > 0) lastTok = prev;   // 改写动作词为对应名单, 带 days
-        } else if (prev.equals("警告")) {
-            warnReason = lastTok; lastTok = "警告";   // 改写动作词为"警告", 带 reason
-        }
-    }
-    boolean isAction = isActionTok(lastTok);
-
     boolean hasAt = atList != null && atList.size() > 0;
 
     if (hasAt) {
-        // ===== @ 路径 (@2372) =====
-        if (!isAction) return false;
-        if (!_cmdAuthorized(groupId, sender)) {
-            // 反向警告(用户 2026-06-14): 无权限者却用「警告」→ 警告他本人并说明理由; 其它动作仍静默。
-            if (lastTok.equals("警告")) { try { doWarn(groupId, HOST.getLoginWxid(), sender, "无管理权限却使用警告功能, 越权操作"); } catch (Throwable t) {} }
-            return true;       // 非管理员/群主: 其它动作静默
+        // ===== @ 路径: 位置无关解析 (用户 2026-06-15: 所有 @ 命令支持语序调整 —— 命令词在 @ 前或后都认) =====
+        // 收集非 @ 词元(命令词/天数/理由); @ 提及与 @所有人 不算命令词。
+        java.util.List words = new java.util.ArrayList();
+        for (int i = 0; i < tokens.length; i++) {
+            String t = tokens[i].trim();
+            if (t.isEmpty() || t.startsWith("@") || _isAtAll(t)) continue;
+            words.add(t);
+        }
+        // 动作词 = 第一个识别的(普通动作 或 黑名单前缀命令), 不论在 @ 前还是后。
+        String actTok = "";
+        int actIdx = -1;
+        for (int i = 0; i < words.size(); i++) {
+            String w = (String) words.get(i);
+            if (isActionTok(w) || w.equals("添加黑名单") || w.equals("去除黑名单") || w.equals("解除黑名单")) { actTok = w; actIdx = i; break; }
+        }
+        if (actIdx < 0) return false;   // 无识别动作词 → 非命令(@ 闲聊), 不消费
+
+        // 尾随参数(位置无关): 管理员/白名单/潜水保护/保护 的天数 = 任意纯数字词; 警告的理由 = 除动作词外其余词拼接。
+        int actDays = 0;
+        String warnReason = null;
+        if (actTok.equals("管理员") || actTok.equals("白名单") || actTok.equals("潜水保护") || actTok.equals("保护")) {
+            for (int i = 0; i < words.size(); i++) {
+                if (i == actIdx) continue;
+                String w = (String) words.get(i);
+                if (_isPosIntTok(w)) { try { actDays = Integer.parseInt(w); } catch (Throwable t) { actDays = 0; } break; }
+            }
+        } else if (actTok.equals("警告")) {
+            StringBuilder rb = new StringBuilder();
+            for (int i = 0; i < words.size(); i++) {
+                if (i == actIdx) continue;
+                if (rb.length() > 0) rb.append(" ");
+                rb.append((String) words.get(i));
+            }
+            if (rb.length() > 0) warnReason = rb.toString().trim();
         }
 
-        // v1.17.2: 踢人若 @所有人 则拒绝 (@2381)。
-        if (lastTok.equals("踢") || lastTok.equals("请")) {
+        // 授权闸门(反向警告: 无权限却用「警告」→ 警告本人; 其它动作静默)。
+        if (!_cmdAuthorized(groupId, sender)) {
+            if (actTok.equals("警告")) { try { doWarn(groupId, HOST.getLoginWxid(), sender, "无管理权限却使用警告功能, 越权操作"); } catch (Throwable t) {} }
+            return true;
+        }
+
+        // 黑名单显式命令: 用整个 @ 列表(支持多 @), 与 "添加黑名单 @A @B" 等效。
+        if (actTok.equals("添加黑名单")) { LEAF.addBlacklistByAt(groupId, sender, atList); return true; }
+        if (actTok.equals("去除黑名单") || actTok.equals("解除黑名单")) { LEAF.removeBlacklist(groupId, sender, content, atList); return true; }
+
+        // v1.17.2: 踢人若 @所有人 则拒绝。
+        if (actTok.equals("踢") || actTok.equals("请")) {
             boolean atAll = false;
             for (int i = 0; i < atList.size(); i++) { if (_isAtAll((String) atList.get(i))) { atAll = true; break; } }
             if (atAll) { HOST.sendText(groupId, "❌ 不能对 @所有人 执行踢人"); return true; }
         }
 
-        // 取第一个非自己的 @ 作为 target (@2387)。
+        // 取第一个非自己的 @ 作为 target。
         String me = HOST.getLoginWxid();
         String target = null;
         for (int i = 0; i < atList.size(); i++) {
@@ -422,9 +440,9 @@ boolean routeCommand(String groupId, String sender, String content,
             HOST.sendText(groupId, "❌ 请 @ 你要操作的对象");
             return true;
         }
-        // v1.19.0: 带理由的警告直接走带 reason 的 doWarn (静默豁免对象); 无理由"警告"仍走 dispatchAction。
-        if (lastTok.equals("警告") && warnReason != null) { doWarn(groupId, sender, target, warnReason); return true; }
-        dispatchAction(groupId, sender, target, lastTok, actDays);
+        // v1.19.0: 带理由的警告直接走带 reason 的 doWarn; 无理由"警告"仍走 dispatchAction。
+        if (actTok.equals("警告") && warnReason != null) { doWarn(groupId, sender, target, warnReason); return true; }
+        dispatchAction(groupId, sender, target, actTok, actDays);
         return true;
     }
 

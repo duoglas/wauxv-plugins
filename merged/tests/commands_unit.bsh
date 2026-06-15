@@ -38,6 +38,7 @@ Object _mkRecLeaf() {
     void enableGroup(String groupId, String sender) { FAKE_LEAF.add(new Object[]{ "enable", groupId }); }
     void unwhitelist(String groupId, String sender, String w) { FAKE_LEAF.add(new Object[]{ "unwhitelist", w }); }
     void removeBlacklist(String groupId, String sender, String content, List atList) { FAKE_LEAF.add(new Object[]{ "removeBlacklist", content }); }
+    void addBlacklistByAt(String groupId, String sender, List atList) { FAKE_LEAF.add(new Object[]{ "addBlacklistByAt", (atList==null?-1:atList.size()) }); }
     void whitelist(String groupId, String sender, String w, int days) { FAKE_LEAF.add(new Object[]{ "whitelist", w, new Integer(days) }); }   // v1.20.0 days
     void protect(String groupId, String sender, String target, int days) { FAKE_LEAF.add(new Object[]{ "protect", target, new Integer(days) }); }   // v1.20.0 days
     return this;
@@ -239,5 +240,34 @@ check("16 @潜水保护7 命中 protect days=7", leafHit("protect") && _leafDays
 reset();
 routeCommand(gid, "owner1", "@张三 潜水保护", true, atTarget("up2"), null, null);
 check("16 @潜水保护(无天数) 命中 protect days=0", leafHit("protect") && _leafDays("protect") == 0);
+
+// ============================================================
+// 17. 自然语序 "@对方 添加黑名单"(@ 在前) → 命中 addBlacklistByAt (用户 2026-06-15)
+// ============================================================
+reset();
+boolean r17 = routeCommand(gid, "owner1", "@眼熟 添加黑名单", true, atTarget("ub2"), null, null);
+check("17 @对方 添加黑名单 消费",            r17 == true);
+check("17 @对方 添加黑名单 命中 addBlacklistByAt", leafHit("addBlacklistByAt"));
+reset();
+boolean r17b = routeCommand(gid, "owner1", "@眼熟 解除黑名单", true, atTarget("ub3"), null, null);
+check("17 @对方 解除黑名单 命中 removeBlacklist", leafHit("removeBlacklist"));
+
+// ============================================================
+// 18. 语序无关: 动作词在 @ 前也认 (用户 2026-06-15)
+// ============================================================
+reset();
+routeCommand(gid, "owner1", "踢 @张三", true, atTarget("u18a"), null, null);
+check("18 踢 @对方(动作在前) 命中 kick", leafHit("kick"));
+reset(); HOST.putString("wn_g@chatroom_u18b", "0");
+routeCommand(gid, "owner1", "警告 @张三 迟到", true, atTarget("u18b"), null, null);
+check("18 警告 @对方 迟到(动作在前+理由) → 警告 u18b", getWarn(gid, "u18b") >= 1);
+reset();
+routeCommand(gid, "owner1", "管理员 7 @张三", true, atTarget("u18c"), null, null);
+boolean ad7 = false;
+for (int i = 0; i < FAKE_LEAF.size(); i++) { Object[] e = (Object[]) FAKE_LEAF.get(i); if (e[0].equals("addAdmin") && ((Integer) e[2]).intValue() == 7) ad7 = true; }
+check("18 管理员 7 @对方(动作+天数在前) → addAdmin days=7", ad7);
+reset();
+routeCommand(gid, "owner1", "白名单 30 @张三", true, atTarget("u18d"), null, null);
+check("18 白名单 30 @对方(动作在前) 命中 whitelist days=30", leafHit("whitelist") && _leafDays("whitelist") == 30);
 
 done();
