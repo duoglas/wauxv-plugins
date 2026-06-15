@@ -17,3 +17,15 @@
 
 # Phase 2 真机灰度回滚备份 (大二进制 db/config, 本地保留)
 docs/phase2-rollback-backup/
+
+# Harness 观测归档(含真实 wxid/群id/查询, 隐私, 不入版本) — 2026-06-15 安全清理
+.harness/observations.archive/
+.harness/observations*.jsonl
+.harness/pretool-observations.jsonl
+.harness/directive-state.json
+.harness/tool-count.json
+.harness/stage-history.jsonl
+.harness/spec-gate-cache.json
+# 调试转储(锐评核对用, 不入版本)
+**/recap_dump.txt
+**/recap_input.txt

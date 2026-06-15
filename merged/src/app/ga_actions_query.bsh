@@ -64,6 +64,9 @@ void logEnabledGroupNames() {
     try {
         List enabled = getEnabledGroups();
         List groups = getGroupList();
+        // 额外探测关键词: 配置驱动(键 ga_grouplist_probe_keywords, 逗号分隔), 默认空=只记已启用群。
+        //   不在代码里写死任何真实群名(隐私; 2026-06-15 安全清理)。需要更宽探测时在 config 里设关键词。
+        List probeKw = parseCsv(HOST.getString("ga_grouplist_probe_keywords", ""));
         log("group-list probe: enabledCount=" + enabled.size() + ", groupListCount=" + (groups == null ? 0 : groups.size()));
         if (groups == null) return;
         for (int i = 0; i < groups.size(); i++) {
@@ -72,7 +75,14 @@ void logEnabledGroupNames() {
             String name = "";
             try { Object r = info.getClass().getMethod("getRoomId").invoke(info); if (r != null) rid = r.toString(); } catch (Exception e) {}
             try { Object n = info.getClass().getMethod("getName").invoke(info); if (n != null) name = n.toString(); } catch (Exception e) {}
-            if (isGroupEnabled(rid) || name.indexOf("群A") >= 0 || name.indexOf("备用") >= 0 || name.indexOf("养群") >= 0 || name.indexOf("学院") >= 0) {
+            boolean hit = isGroupEnabled(rid);
+            if (!hit && name.length() > 0) {
+                for (int k = 0; k < probeKw.size(); k++) {
+                    String kw = (String) probeKw.get(k);
+                    if (kw.length() > 0 && name.indexOf(kw) >= 0) { hit = true; break; }
+                }
+            }
+            if (hit) {
                 log("group-list probe: roomId=" + rid + ", enabled=" + isGroupEnabled(rid) + ", name=" + name);
             }
         }

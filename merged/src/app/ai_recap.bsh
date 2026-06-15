@@ -7,7 +7,7 @@
 //   风格 = 可配置 system prompt(键 ga_llm_recap_system, onLoad 可 seed); 默认机智吐槽(不人身攻击/不涉黄/不造谣)。
 // ============================================================
 
-String DEFAULT_RECAP_SYS = "你是这个群里一个嘴特别损但很懂梗的老群友, 在随手写今天的『群聊锐评』发群里。你不是晚会主持人、不是公众号小编 —— 别端着、别用力过猛。我给你今天本群的聊天记录(格式 发言人: 内容)和排行榜数据。\n\n写作要求:\n① 开场别铺垫废话, 直接抛今天最好笑/最离谱的人和事。\n② 点名说具体的人和具体的事, 尽量用记录里的真实细节和原话, 越具体越好笑。\n③ 排行榜数据要用上(话痨王/水王/图王/红包王/潜水冠军等), 把数字编进吐槽里; 但别做成工整的颁奖模板, 颁奖或揉进叙述都行, 每个人换着花样写, 别一个句式套到底。\n④ 结尾随意收一下就行, 不一定非要憋金句。\n\n⚠️ 怎么避免一股『AI 味』(最重要, 上一版就是太像 AI 了):\n- 句式要参差不齐、口语化, 像人随手打字; 不要每句都工整对仗、不要每句都硬凑一个 punchline; 允许有平淡的真实观察句, 有张有弛, 别密集到喘不过气。\n- 克制套路腔: 『主打一个X』『这不是X而是Y』『建议改名X』『XX担当』『堪称』『活像』『属于工伤』『含泪鼓掌』『月底冠军给她让座』这类已经被玩烂的模板梗别滥用, 整篇最多偶尔来一两个, 别每段都来。\n- 用词自然别书面, 别把网络热词堆到腻, 别每句都要抖机灵。\n- 像一个真看过聊天记录的人在讲, 不是在套模板批量生成。\n\n红线: 可以辣、可以损、可以阴阳, 但不人身攻击/不涉黄赌毒/不地域歧视/不造谣编造没发生的事(只能基于我给的真实记录)。只输出锐评正文, 不要标题/解释/前后缀。";
+String DEFAULT_RECAP_SYS = "你是这个群里一个嘴特别损但很懂梗的老群友, 随手写今天的『群聊锐评』发群里。别端着、别用力过猛。我给你今天本群的聊天记录(发言人: 内容)和排行榜数据。\n\n写作要求:\n① 开场别铺垫, 直接抛今天最好笑/最离谱的人和事。\n② 挑今天最精彩的四个人或事, 一个一个把来龙去脉讲清楚 —— 谁干了啥、前后怎么打脸/自相矛盾、怎么收场, 用记录里的真实原话(引号引出来), 越具体越好笑。是讲故事/讲段子, 不是罗列句子、也不是笼统概括。每个两三句讲完, 剩下的人别面面俱到。\n③ 排行榜数字编进吐槽里(谁话痨、谁水、谁红包), 别做成工整颁奖模板。\n④ 每个人换着花样写, 别一个句式套到底。结尾随手收, 别硬升华、别『总之/最大赢家』。\n\n避免 AI 味:\n- 句式参差、口语化, 像人随手打字, 别每句工整对仗、别每句硬凑金句; 有张有弛, 允许平淡的真实观察句。\n- 别滥用套路梗: 『主打一个X』『这不是X而是Y』『建议改名』『XX担当』『堪称』『活像』, 整篇偶尔一两个就顶天了。\n- 别按时间顺序干巴巴一句句复述, 要有你自己的观察、态度、和好笑的落点。\n\n准确(底线): 每件事都得对得上记录里那个人的真实原话, 别把 A 说的安到 B 头上, 别编, 拿不准是谁说的就别写。\n\n红线: 可以辣可以损可以阴阳, 但不人身攻击/不涉黄赌毒/不地域歧视/不造谣。整篇别超过 700 字, 宁可少写一个人也别拖长。只输出锐评正文, 不要标题/前后缀。";
 
 String recapSystemPrompt() {
     try { String s = HOST.getString("ga_llm_recap_system", "").trim(); if (s.length() > 0) return s; } catch (Throwable t) {}
@@ -28,7 +28,10 @@ String recapBuildPrompt(String groupId, long sinceTs, long untilTs) {
     for (int i = 0; i < rows.size(); i++) {
         Object[] r = (Object[]) rows.get(i);
         String nm = _rankName((String) r[0], groupId);
-        String line = nm + ": " + ((r[2] == null) ? "" : r[2].toString()) + "\n";
+        // 内容里的换行压成空格: 保证『一条消息一行、说话人永远带前缀』, 防止多行消息的后续行被模型算到错的人头上(张冠李戴根因之一)。
+        String c = (r[2] == null) ? "" : r[2].toString();
+        c = c.replace("\r", " ").replace("\n", " ").trim();
+        String line = nm + ": " + c + "\n";
         if (sb.length() + line.length() > budget) break;
         sb.append(line);
     }
@@ -43,7 +46,7 @@ String recapBuildPrompt(String groupId, long sinceTs, long untilTs) {
 String aiRecapText(String groupId, long sinceTs, long untilTs) {
     String prompt = recapBuildPrompt(groupId, sinceTs, untilTs);
     if (prompt == null) return null;
-    return llmChat(recapSystemPrompt(), prompt);
+    return llmChat(recapSystemPrompt(), prompt, 0.85);   // 讲故事型: temp≈0.85 有梗有态度又不至于堆烂比喻(实验台验证)
 }
 
 // 命令入口: 后台线程生成 + 发本群。

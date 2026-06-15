@@ -5,6 +5,7 @@ source("tests/_harness.bsh");
 
 String FAKE_LLM_RESULT = "🔥今日锐评🔥 群里炸开了锅";
 String llmChat(String system, String user) { return FAKE_LLM_RESULT; }
+String llmChat(String system, String user, double temperature) { return FAKE_LLM_RESULT; }   // v1.20: 锐评走带 temperature 重载
 void log(String s) {}
 
 source("tests/fakes/host_fake.bsh");        // HOST(lookupName 回 wxid) + CLOCK

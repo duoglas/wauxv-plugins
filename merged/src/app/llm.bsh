@@ -49,7 +49,9 @@ String _llmHttpPost(String urlStr, String apiKey, String jsonBody) {
 }
 
 // 一轮对话: system+user → assistant content。任何失败(未配置/网络/解析/空)返 null。
-String llmChat(String system, String user) {
+String llmChat(String system, String user) { return llmChat(system, user, -1.0); }
+// temperature>=0 时带上 temperature(锐评用较高温降 AI 味、增多样); <0 不传, 走服务端默认(榜单润色保持原样)。
+String llmChat(String system, String user, double temperature) {
     try {
         String url = HOST.getString("ga_llm_url", "").trim();
         String path = HOST.getString("ga_llm_path", "/chat/completions").trim();
@@ -74,6 +76,7 @@ String llmChat(String system, String user) {
         mu.put("role", "user"); mu.put("content", user);
         msgs.put(mu);
         body.put("messages", msgs);
+        if (temperature >= 0.0) body.put("temperature", temperature);
 
         String resp = _llmHttpPost(url + path, key, body.toString());
         if (resp == null) return null;
